@@ -14,13 +14,17 @@ public struct ChariotPaths: Sendable {
     public var identityDirectory: URL { dataDirectory.appendingPathComponent("identity") }
     public var instancesDirectory: URL { dataDirectory.appendingPathComponent("instances") }
     public var mailboxDirectory: URL { dataDirectory.appendingPathComponent("mailbox") }
+    /// Agent packs (Milestone 1): one folder per pack.
+    public var packsDirectory: URL { dataDirectory.appendingPathComponent("packs") }
+    /// Fleet index: the created agents (instance UUID → pack provenance).
+    public var agentsIndex: URL { dataDirectory.appendingPathComponent("agents.json") }
 
     public func instanceDirectory(_ id: SandboxID) -> URL {
         instancesDirectory.appendingPathComponent(id)
     }
 
     public func ensureDirectories() throws {
-        for dir in [dataDirectory, identityDirectory, instancesDirectory, mailboxDirectory] {
+        for dir in [dataDirectory, identityDirectory, instancesDirectory, mailboxDirectory, packsDirectory] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
     }
@@ -41,4 +45,8 @@ public struct InstancePaths: Sendable {
     public var accessKeyPublic: URL { directory.appendingPathComponent("access-key.pub") }
     public var sshConfig: URL { directory.appendingPathComponent("ssh_config") }
     public var knownHosts: URL { directory.appendingPathComponent("known_hosts") }
+    /// Per-agent device registry: pairing is per agent instance (Milestone 1).
+    public var deviceRegistry: URL { directory.appendingPathComponent("devices.json") }
+    /// Checksums of the last pack content installed into the guest.
+    public var packState: URL { directory.appendingPathComponent("pack-state.json") }
 }

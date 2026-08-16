@@ -2,7 +2,9 @@ import Foundation
 import CryptoKit
 import AgentLinkKit
 
-/// Registry of paired mobile devices plus the active session epoch.
+/// Registry of paired mobile devices plus the active session epoch. One per
+/// agent instance (Milestone 1): pairing is per agent, so each agent carries
+/// its own device list and epoch — the credential relationship IS the grant.
 struct DeviceRegistry: Codable {
     struct Entry: Codable {
         var identity: PublicDeviceIdentity
@@ -16,9 +18,10 @@ struct DeviceRegistry: Codable {
 }
 
 /// Central Mac-side coordinator: owns the Mac identity, pairing sessions, the
-/// tailnet node, the WebSocket transport service, and the VM/agent bridge.
-/// Both the SwiftUI app and the headless daemon drive everything through this
-/// type.
+/// tailnet node, the WebSocket transport service, and the agent fleet — a
+/// registry of { instance UUID → VM/bridge } contexts, each with its own
+/// device registry, epoch, guest bridge, and Codex login state. Both the
+/// SwiftUI app and the headless daemon drive everything through this type.
 ///
 /// Transport layout: a loopback-only HTTP/WebSocket service carries pairing
 /// and the encrypted message protocol. In production the bundled agent-tailnet
@@ -26,6 +29,9 @@ struct DeviceRegistry: Codable {
 /// proxies to loopback; the development harness connects to loopback directly.
 /// Admin/diagnostic endpoints live on a second, never-proxied loopback server.
 public final class ChariotHub: @unchecked Sendable {
+    /// Context key for the pre-fleet single-VM/loopback development flow.
+    static let legacyContextKey = "default"
+
     public let paths: ChariotPaths
     public let backend: VirtualMachineBackend
     let mailbox: MailboxStore
@@ -36,8 +42,13 @@ public final class ChariotHub: @unchecked Sendable {
 
     let identity: DeviceIdentity
     public var macDisplayName: String
-    private var registry: DeviceRegistry
+    /// Base image used when creating agents (and the legacy instance).
+    public var defaultBaseImagePath: String?
     private let lock = NSRecursiveLock()
+
+    // Fleet: canonical context key (instance UUID or "default") → context.
+    private var contexts: [String: AgentContext] = [:]
+    private var agentIndex: [AgentRecord] = []
 
     /// Feature flag `tailscale_transport`: when true (the default), pairing QR
     /// codes carry the tailnet service URL and require the embedded node to be
@@ -47,10 +58,13 @@ public final class ChariotHub: @unchecked Sendable {
         (ProcessInfo.processInfo.environment["CHARIOT_TAILSCALE"] ?? "1") != "0"
     public private(set) var tailnet: TailnetSupervisor?
 
-    // Pairing sessions keyed by single-use pairing ID.
+    // Pairing sessions keyed by single-use pairing ID. Each session targets
+    // exactly one agent context: scanning the QR binds the device to THAT
+    // instance only.
     private struct PairingSession {
         let payload: PairingPayload
         let ephemeralKey: Curve25519.KeyAgreement.PrivateKey
+        let targetContextKey: String
         var state: String  // "waiting" | "responded" | "consumed" | "expired"
         var pairingKey: SymmetricKey?
         var encryptedCredential: Data?
@@ -81,7 +95,8 @@ public final class ChariotHub: @unchecked Sendable {
         let connection: WebSocketConnection
         let nonce: String
         var deviceID: String?
-        var instanceID: String?
+        var instanceID: String?      // as sent by the phone (signed)
+        var contextKey: String?      // resolved agent context
         init(connection: WebSocketConnection, nonce: String) {
             self.connection = connection
             self.nonce = nonce
@@ -91,31 +106,27 @@ public final class ChariotHub: @unchecked Sendable {
     private var wsByDevice: [String: ObjectIdentifier] = [:]
     private var statusTimer: DispatchSourceTimer?
 
-    // Active VM/bridge.
+    // Legacy single-VM instance (pre-pack flow, kept for the dev harness).
     public private(set) var activeInstance: SandboxID?
-    private var bridge: BridgeClient?
-    private var developerAccess: DeveloperAccess?
-    public private(set) var lastGuestStatus: (state: String, kernel: String, hostname: String)?
 
-    // Codex agent state + brokered login (design §3.1).
-    public private(set) var agentStatus: AgentRuntimeStatus?
-    private var loginTunnel: VsockPortForwarder?
+    // Codex brokered login (design §3.1): the OAuth callback tunnel listens
+    // on the fixed localhost:1455 redirect, so one sign-in runs at a time
+    // across the fleet ("one broker dance per agent").
     private var pendingAuthURLWaiters: [(String) -> Void] = []
     /// UI hook: called with the auth URL so the app can open the browser.
     public var onOAuthRequest: (@Sendable (String) -> Void)?
 
-    // Streaming state: conversation → destination phone + batching buffer.
+    // Streaming state: request → destination phone + owning agent + buffer.
     private struct Stream {
         var recipientDeviceID: String
+        var contextKey: String
+        var conversationID: String
         var buffer: String = ""
         var flushScheduled = false
     }
     private var streams: [String: Stream] = [:]  // key: requestID
-    private var replayWindows: [String: ReplayWindow] = [:]
     private var localStreams: [String: (@Sendable (String) -> Void, @Sendable (Int) -> Void)] = [:]
     private let flushQueue = DispatchQueue(label: "chariot.hub.flush")
-
-    private var registryURL: URL { paths.identityDirectory.appendingPathComponent("devices.json") }
 
     public init(paths: ChariotPaths, displayName: String = Host.current().localizedName ?? "Mac") throws {
         self.paths = paths
@@ -140,37 +151,298 @@ public final class ChariotHub: @unchecked Sendable {
             self.identity = created
         }
 
-        let registryFile = paths.identityDirectory.appendingPathComponent("devices.json")
-        if let data = try? Data(contentsOf: registryFile),
-           let loaded = try? CanonicalCoding.decoder().decode(DeviceRegistry.self, from: data) {
-            self.registry = loaded
-        } else {
-            self.registry = DeviceRegistry()
+        // Fleet index: recreate a context per created agent.
+        if let data = try? Data(contentsOf: paths.agentsIndex),
+           let loaded = try? decoder().decode([AgentRecord].self, from: data) {
+            agentIndex = loaded
+        }
+        for record in agentIndex {
+            let instance = InstancePaths(directory: paths.instanceDirectory(record.instanceID))
+            contexts[record.instanceID] = AgentContext(key: record.instanceID,
+                                                       record: record,
+                                                       vmInstanceID: record.instanceID,
+                                                       registryURL: instance.deviceRegistry,
+                                                       packStateURL: instance.packState)
         }
 
         // Phone-bound envelopes stay durably queued here until acknowledged;
         // a live WebSocket session gets them pushed immediately on deposit.
-        mailbox.onDeposit = { [weak self] envelope in
-            self?.pushEnvelopeIfConnected(envelope)
+        mailbox.onDeposit = { [weak self] envelope, instanceID in
+            self?.pushEnvelopeIfConnected(envelope, instanceID: instanceID)
         }
     }
 
-    private func persistRegistry() {
+    private func decoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return decoder
+    }
+
+    /// Scoped locking usable from async contexts (NSRecursiveLock's raw
+    /// lock/unlock are compile-time-restricted to synchronous code).
+    private func synchronized<T>(_ body: () -> T) -> T {
         lock.lock(); defer { lock.unlock() }
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        if let data = try? encoder.encode(registry) {
-            try? data.write(to: registryURL, options: .atomic)
-        }
+        return body()
     }
 
     public var macPublicIdentity: PublicDeviceIdentity { identity.publicIdentity }
-    public var currentEpoch: UInt32 { registry.epoch }
 
-    public func pairedDevices() -> [(id: String, name: String, pairedAt: Date, revoked: Bool, fingerprint: String)] {
+    // MARK: Agent contexts
+
+    /// The legacy pre-fleet context ("default"): loopback development pairing
+    /// and the single-VM flow. Its device registry stays at the pre-fleet
+    /// location so existing installs keep their pairings.
+    private func legacyContext() -> AgentContext {
         lock.lock(); defer { lock.unlock() }
-        return registry.devices.map {
-            ($0.identity.deviceID, $0.displayName, $0.pairedAt, $0.revokedAt != nil, $0.identity.fingerprint)
+        if let existing = contexts[Self.legacyContextKey] { return existing }
+        let context = AgentContext(key: Self.legacyContextKey,
+                                   record: nil,
+                                   vmInstanceID: activeInstance,
+                                   registryURL: paths.identityDirectory.appendingPathComponent("devices.json"),
+                                   packStateURL: nil)
+        contexts[Self.legacyContextKey] = context
+        return context
+    }
+
+    private func context(forKey key: String) -> AgentContext? {
+        lock.lock(); defer { lock.unlock() }
+        return contexts[key]
+    }
+
+    /// Resolve the context a phone-supplied instance ID refers to: an agent's
+    /// instance UUID, or the legacy context under its historical names.
+    private func resolveContext(instanceID: String) -> AgentContext? {
+        lock.lock(); defer { lock.unlock() }
+        if let context = contexts[instanceID], context.record != nil { return context }
+        if instanceID == Self.legacyContextKey || instanceID == currentInstanceID {
+            return legacyContext()
+        }
+        return nil
+    }
+
+    /// Context for public API calls: nil targets the legacy context.
+    private func requireContext(_ instanceID: String?) throws -> AgentContext {
+        guard let instanceID, instanceID != Self.legacyContextKey else { return legacyContext() }
+        lock.lock(); defer { lock.unlock() }
+        if let context = contexts[instanceID] { return context }
+        if instanceID == activeInstance { return legacyContext() }
+        throw ChariotError.instanceNotFound(instanceID)
+    }
+
+    private func persistRegistry(_ context: AgentContext) {
+        lock.lock(); defer { lock.unlock() }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        if let data = try? encoder.encode(context.registry) {
+            try? data.write(to: context.registryURL, options: .atomic)
+        }
+    }
+
+    private func persistAgentIndex() {
+        lock.lock(); defer { lock.unlock() }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(agentIndex) {
+            try? data.write(to: paths.agentsIndex, options: .atomic)
+        }
+    }
+
+    // MARK: Fleet lifecycle (Milestone 1)
+
+    /// Create an agent from a pack: mint the instance UUID (the durable
+    /// identity), clone the base image with the pack's VM sizing, and record
+    /// it in the fleet index. The VM is not started here.
+    public func createAgent(fromPackDirectory packDirectoryName: String,
+                            displayName: String? = nil) async throws -> AgentRecord {
+        guard let baseImage = defaultBaseImagePath, !baseImage.isEmpty else {
+            throw ChariotError.invalidState("no base image configured")
+        }
+        let pack = try PackLoader.load(at: paths.packsDirectory.appendingPathComponent(packDirectoryName))
+        let instanceID = UUID().uuidString.lowercased()
+        _ = try await backend.createInstance(configuration: pack.configuration(baseImagePath: baseImage),
+                                             id: instanceID)
+        let record = AgentRecord(instanceID: instanceID,
+                                 packID: pack.manifest.id,
+                                 displayName: displayName ?? pack.manifest.name,
+                                 packDirectoryName: packDirectoryName,
+                                 createdAt: Date())
+        let instance = InstancePaths(directory: paths.instanceDirectory(instanceID))
+        synchronized {
+            agentIndex.append(record)
+            contexts[instanceID] = AgentContext(key: instanceID,
+                                                record: record,
+                                                vmInstanceID: instanceID,
+                                                registryURL: instance.deviceRegistry,
+                                                packStateURL: instance.packState)
+        }
+        persistAgentIndex()
+        event("agent \(record.displayName) created from \(packDirectoryName) (instance \(instanceID.prefix(8)))")
+        return record
+    }
+
+    public func agentRecords() -> [AgentRecord] {
+        lock.lock(); defer { lock.unlock() }
+        return agentIndex
+    }
+
+    public func agentSummaries() -> [AgentSummary] {
+        lock.lock(); defer { lock.unlock() }
+        return agentIndex.compactMap { record in
+            guard let context = contexts[record.instanceID] else { return nil }
+            return AgentSummary(record: record,
+                                vmState: vmState(of: record.instanceID),
+                                bridgeConnected: context.bridge != nil,
+                                agentStatus: context.agentStatus,
+                                epoch: context.registry.epoch,
+                                pairedDeviceCount: context.registry.devices.filter { $0.revokedAt == nil }.count)
+        }
+    }
+
+    public func startAgent(_ instanceID: String) async throws {
+        let context = try requireContext(instanceID)
+        try await start(context)
+    }
+
+    public func stopAgent(_ instanceID: String) async throws {
+        let context = try requireContext(instanceID)
+        try await stop(context)
+    }
+
+    public func resetAgent(_ instanceID: String) async throws {
+        let context = try requireContext(instanceID)
+        try await reset(context)
+    }
+
+    public func vmState(of instanceID: String) -> SandboxState {
+        guard let context = try? requireContext(instanceID),
+              let vm = context.vmInstanceID else { return .notCreated }
+        return backend.state(of: vm)
+    }
+
+    public func agentStatus(of instanceID: String) -> AgentRuntimeStatus? {
+        (try? requireContext(instanceID))?.agentStatus
+    }
+
+    public func bridgeConnected(of instanceID: String) -> Bool {
+        (try? requireContext(instanceID))?.bridge != nil
+    }
+
+    private func start(_ context: AgentContext) async throws {
+        guard let vm = context.vmInstanceID else { throw ChariotError.invalidState("no instance") }
+        try await backend.start(vm)
+        try await connectBridge(context)
+        await syncPack(context)
+    }
+
+    private func stop(_ context: AgentContext) async throws {
+        guard let vm = context.vmInstanceID else { return }
+        synchronized { disconnectRuntime(context) }
+        try await backend.stop(vm)
+    }
+
+    private func reset(_ context: AgentContext) async throws {
+        guard let vm = context.vmInstanceID else { throw ChariotError.invalidState("no instance") }
+        synchronized {
+            disconnectRuntime(context)
+            context.agentStatus = nil    // Reset wipes the disk: Codex returns signed out.
+            context.packInstalled = [:]  // Full pack replay on the next boot.
+        }
+        try await backend.reset(vm)
+    }
+
+    /// Caller holds the lock.
+    private func disconnectRuntime(_ context: AgentContext) {
+        context.bridge?.close()
+        context.bridge = nil
+        context.developerAccess?.disable()
+        context.developerAccess = nil
+        context.loginTunnel?.stop()
+        context.loginTunnel = nil
+    }
+
+    private func connectBridge(_ context: AgentContext) async throws {
+        guard let vm = context.vmInstanceID else { throw ChariotError.invalidState("no instance") }
+        let controller = try backend.controller(for: vm)
+        event("\(displayName(of: context)): waiting for guest bridge…")
+        let connection = try await controller.connectSocket(port: 1024)
+        let bridge = BridgeClient(connection: connection) { [weak self, weak context] event in
+            guard let self, let context else { return }
+            self.handleBridgeEvent(context, event)
+        }
+        synchronized { context.bridge = bridge }
+        event("\(displayName(of: context)): guest bridge connected")
+    }
+
+    private func displayName(of context: AgentContext) -> String {
+        context.record?.displayName ?? "sandbox"
+    }
+
+    // MARK: Pack populate + hot re-push (Milestone 1)
+
+    /// Install the pack's workspace content into the guest: everything whose
+    /// checksum differs from what this instance last received. Runs after
+    /// boot and before every turn, so pack edits land on the next turn with
+    /// no rebuild; after Reset the install state is empty and the whole
+    /// workspace replays. Seed-only files are pushed with `if_absent`, so the
+    /// guest never overwrites one that already exists.
+    func syncPack(_ context: AgentContext) async {
+        let (record, bridge, installed) = synchronized {
+            (context.record, context.bridge, context.packInstalled)
+        }
+        guard let record, let bridge else { return }
+        do {
+            let pack = try PackLoader.load(
+                at: paths.packsDirectory.appendingPathComponent(record.packDirectoryName))
+            var pushed = 0
+            for file in try pack.workspaceFiles() {
+                let data = try Data(contentsOf: file.source)
+                let sum = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                if installed[file.destination] == sum { continue }
+                let written = try await bridge.putFile(path: file.destination,
+                                                       contents: data,
+                                                       mode: file.executable ? 0o755 : 0o644,
+                                                       ifAbsent: file.seedOnly)
+                if written { pushed += 1 }
+                synchronized { context.packInstalled[file.destination] = sum }
+            }
+            persistPackState(context)
+            if pushed > 0 {
+                event("\(record.displayName): installed \(pushed) pack file(s) into /workspace")
+            }
+        } catch {
+            event("\(record.displayName): pack sync failed: \(error)")
+        }
+    }
+
+    private func persistPackState(_ context: AgentContext) {
+        let (url, state) = synchronized {
+            (context.packStateURL, PackInstallState(checksums: context.packInstalled))
+        }
+        guard let url else { return }
+        if let data = try? JSONEncoder().encode(state) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    /// One agent turn: hot-sync pack edits, then hand the prompt to the
+    /// guest. `failure` fires instead of the normal completion path when the
+    /// bridge is gone or the send fails.
+    private func dispatchTurn(_ context: AgentContext, requestID: String, conversationID: String,
+                              text: String, failure: @escaping @Sendable (String) -> Void) {
+        Task { [weak self] in
+            guard let self else { return }
+            await self.syncPack(context)
+            guard let bridge = self.synchronized({ context.bridge }) else {
+                failure("sandbox is not running")
+                return
+            }
+            do {
+                try bridge.sendConversation(requestID: requestID,
+                                            conversationID: conversationID, text: text)
+            } catch {
+                failure("\(error)")
+            }
         }
     }
 
@@ -201,43 +473,36 @@ public final class ChariotHub: @unchecked Sendable {
 
     public var tailnetStatus: TailnetStatus { tailnet?.status ?? .stopped }
 
-    // MARK: VM lifecycle
+    // MARK: Legacy single-VM lifecycle (pre-pack dev flow)
 
+    /// Adopt or create the legacy non-agent instance. Agent instances are
+    /// excluded: they belong to their own contexts.
     public func ensureInstance(configuration: SandboxConfiguration) async throws -> SandboxID {
-        if let existing = backend.existingInstanceIDs().first {
+        let agentIDs = synchronized { Set(agentIndex.map(\.instanceID)) }
+        if let existing = backend.existingInstanceIDs().first(where: { !agentIDs.contains($0) }) {
             activeInstance = existing
+            legacyContext().vmInstanceID = existing
             return existing
         }
         let id = try await backend.create(configuration: configuration)
         activeInstance = id
+        legacyContext().vmInstanceID = id
         return id
     }
 
     public func startVM() async throws {
-        guard let id = activeInstance else { throw ChariotError.invalidState("no instance") }
-        try await backend.start(id)
-        try await connectBridge()
+        guard activeInstance != nil else { throw ChariotError.invalidState("no instance") }
+        try await start(legacyContext())
     }
 
     public func stopVM() async throws {
-        guard let id = activeInstance else { return }
-        bridge?.close()
-        bridge = nil
-        developerAccess?.disable()
-        loginTunnel?.stop()
-        loginTunnel = nil
-        try await backend.stop(id)
+        guard activeInstance != nil else { return }
+        try await stop(legacyContext())
     }
 
     public func resetVM() async throws {
-        guard let id = activeInstance else { throw ChariotError.invalidState("no instance") }
-        bridge?.close()
-        bridge = nil
-        developerAccess?.disable()
-        loginTunnel?.stop()
-        loginTunnel = nil
-        agentStatus = nil  // Reset wipes the disk: Codex returns signed out.
-        try await backend.reset(id)
+        guard activeInstance != nil else { throw ChariotError.invalidState("no instance") }
+        try await reset(legacyContext())
     }
 
     public func restartVM() async throws {
@@ -250,39 +515,53 @@ public final class ChariotHub: @unchecked Sendable {
         return backend.state(of: id)
     }
 
-    public var bridgeConnected: Bool { bridge != nil }
-
-    private func connectBridge() async throws {
-        guard let id = activeInstance else { throw ChariotError.invalidState("no instance") }
-        let controller = try backend.controller(for: id)
-        event("waiting for guest bridge…")
-        let connection = try await controller.connectSocket(port: 1024)
-        bridge = BridgeClient(connection: connection) { [weak self] event in
-            self?.handleBridgeEvent(event)
-        }
-        event("guest bridge connected")
+    public var bridgeConnected: Bool { legacyContext().bridge != nil }
+    public var agentStatus: AgentRuntimeStatus? { legacyContext().agentStatus }
+    public var lastGuestStatus: (state: String, kernel: String, hostname: String)? {
+        legacyContext().lastGuestStatus
     }
+    public var currentEpoch: UInt32 { legacyContext().registry.epoch }
 
     // MARK: Codex sign-in (design §3.1 brokered browser flow)
 
     /// Start the guest's `codex login` and the localhost:1455 → vsock:1022
-    /// callback tunnel. The auth URL arrives via `.oauthRequested`.
-    public func startCodexLogin() throws {
+    /// callback tunnel. The auth URL arrives via `.oauthRequested`. Sign-in
+    /// is per agent (each guest holds its own credential), but only one
+    /// brokered dance runs at a time: the OAuth redirect port is fixed.
+    public func startCodexLogin(instanceID: String? = nil) throws {
+        let context = try requireContext(instanceID)
+        lock.lock()
+        let bridge = context.bridge
+        let busy = contexts.values.contains { $0 !== context && $0.loginTunnel != nil }
+        lock.unlock()
         guard let bridge else { throw ChariotError.bridgeUnavailable("sandbox not running") }
-        guard let id = activeInstance else { throw ChariotError.invalidState("no instance") }
-        if loginTunnel == nil {
-            let controller = try backend.controller(for: id)
-            loginTunnel = VsockPortForwarder(controller: controller, listenPort: 1455, vsockPort: 1022)
+        guard !busy else {
+            throw ChariotError.invalidState("another agent's Codex sign-in is in progress — finish or cancel it first")
         }
-        try loginTunnel?.start()
+        guard let vm = context.vmInstanceID else { throw ChariotError.invalidState("no instance") }
+        lock.lock()
+        if context.loginTunnel == nil {
+            if let controller = try? backend.controller(for: vm) {
+                context.loginTunnel = VsockPortForwarder(controller: controller,
+                                                         listenPort: 1455, vsockPort: 1022)
+            }
+        }
+        let tunnel = context.loginTunnel
+        lock.unlock()
+        try tunnel?.start()
         try bridge.startLogin()
-        event("codex sign-in started; waiting for auth URL from guest")
+        event("\(displayName(of: context)): codex sign-in started; waiting for auth URL from guest")
     }
 
-    public func cancelCodexLogin() {
+    public func cancelCodexLogin(instanceID: String? = nil) {
+        guard let context = try? requireContext(instanceID) else { return }
+        lock.lock()
+        let bridge = context.bridge
+        let tunnel = context.loginTunnel
+        context.loginTunnel = nil
+        lock.unlock()
         try? bridge?.cancelLogin()
-        loginTunnel?.stop()
-        loginTunnel = nil
+        tunnel?.stop()
     }
 
     /// Await the next auth URL (admin/testing convenience).
@@ -303,46 +582,83 @@ public final class ChariotHub: @unchecked Sendable {
 
     // MARK: Developer access (design §1.5)
 
-    public func enableDeveloperAccess() throws -> (port: UInt16, command: String, instructions: String) {
-        guard let id = activeInstance else { throw ChariotError.invalidState("no instance") }
-        let controller = try backend.controller(for: id)
-        let instance = InstancePaths(directory: paths.instanceDirectory(id))
-        if developerAccess == nil {
-            developerAccess = DeveloperAccess(controller: controller, instance: instance)
+    public func enableDeveloperAccess(instanceID: String? = nil) throws -> (port: UInt16, command: String, instructions: String) {
+        let context = try requireContext(instanceID)
+        guard let vm = context.vmInstanceID else { throw ChariotError.invalidState("no instance") }
+        let controller = try backend.controller(for: vm)
+        let instance = InstancePaths(directory: paths.instanceDirectory(vm))
+        lock.lock()
+        if context.developerAccess == nil {
+            context.developerAccess = DeveloperAccess(controller: controller, instance: instance)
         }
-        let info = try developerAccess!.enable()
-        event("developer access unlocked on 127.0.0.1:\(info.port)")
+        let access = context.developerAccess!
+        lock.unlock()
+        let info = try access.enable()
+        event("\(displayName(of: context)): developer access unlocked on 127.0.0.1:\(info.port)")
         return (info.port, info.command, info.codexInstructions)
     }
 
-    public func disableDeveloperAccess() {
-        developerAccess?.disable()
-        developerAccess = nil
+    public func disableDeveloperAccess(instanceID: String? = nil) {
+        guard let context = try? requireContext(instanceID) else { return }
+        lock.lock()
+        let access = context.developerAccess
+        context.developerAccess = nil
+        lock.unlock()
+        access?.disable()
     }
 
     // MARK: Local conversation (Mac UI → agent)
 
-    public func sendLocalPrompt(_ text: String, conversationID: String = "local",
+    public func sendLocalPrompt(_ text: String, instanceID: String? = nil,
+                                conversationID: String = "local",
                                 onDelta: @escaping @Sendable (String) -> Void,
                                 onCompleted: @escaping @Sendable (Int) -> Void) throws {
-        guard let bridge else { throw ChariotError.bridgeUnavailable("not connected") }
+        let context = try requireContext(instanceID)
+        lock.lock()
+        let hasBridge = context.bridge != nil
+        lock.unlock()
+        guard hasBridge else { throw ChariotError.bridgeUnavailable("not connected") }
         let requestID = UUID().uuidString.lowercased()
         lock.lock()
         localStreams[requestID] = (onDelta, onCompleted)
         lock.unlock()
-        try bridge.sendConversation(requestID: requestID, conversationID: conversationID, text: text)
+        dispatchTurn(context, requestID: requestID, conversationID: conversationID,
+                     text: text) { [weak self] message in
+            guard let self else { return }
+            self.lock.lock()
+            let handlers = self.localStreams.removeValue(forKey: requestID)
+            self.lock.unlock()
+            handlers?.0(message + "\n")
+            handlers?.1(-1)
+        }
     }
 
-    public func cancelConversation(_ conversationID: String) {
+    public func cancelConversation(_ conversationID: String, instanceID: String? = nil) {
+        guard let context = try? requireContext(instanceID) else { return }
+        lock.lock()
+        let bridge = context.bridge
+        lock.unlock()
         try? bridge?.cancel(conversationID: conversationID)
     }
 
     // MARK: Pairing
 
-    public var currentInstanceID: String { activeInstance ?? "default" }
+    public var currentInstanceID: String { activeInstance ?? Self.legacyContextKey }
 
-    public func startPairingSession() throws -> PairingPayload {
+    public func pairedDevices(instanceID: String? = nil) -> [(id: String, name: String, pairedAt: Date, revoked: Bool, fingerprint: String)] {
+        guard let context = try? requireContext(instanceID) else { return [] }
+        lock.lock(); defer { lock.unlock() }
+        return context.registry.devices.map {
+            ($0.identity.deviceID, $0.displayName, $0.pairedAt, $0.revokedAt != nil, $0.identity.fingerprint)
+        }
+    }
+
+    /// Mint a pairing QR for one agent. The payload's instance ID is the
+    /// agent's instance UUID — the phone signs it into its transport hello,
+    /// and the resulting credential lives in that agent's registry only.
+    public func startPairingSession(instanceID: String? = nil) throws -> PairingPayload {
         guard transportPort != 0 else { throw ChariotError.invalidState("transport not started") }
+        let context = try requireContext(instanceID)
 
         let serviceURL: String
         let tlsPin: String?
@@ -362,14 +678,15 @@ public final class ChariotHub: @unchecked Sendable {
             tlsPin = nil
         }
 
+        let advertisedInstanceID = context.record?.instanceID ?? currentInstanceID
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
         var secret = Data(count: 32)
         secret.withUnsafeMutableBytes { _ = SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
         let payload = PairingPayload(
             serviceURL: serviceURL,
-            instanceID: currentInstanceID,
+            instanceID: advertisedInstanceID,
             macDeviceID: identity.deviceID,
-            macDisplayName: macDisplayName,
+            macDisplayName: context.record.map { "\($0.displayName) — \(macDisplayName)" } ?? macDisplayName,
             macSigningPublicKey: identity.signingKey.publicKey.rawRepresentation,
             macPairingPublicKey: ephemeral.publicKey.rawRepresentation,
             tlsPublicKeyHash: tlsPin,
@@ -378,9 +695,10 @@ public final class ChariotHub: @unchecked Sendable {
             expiresAt: Date().addingTimeInterval(120)
         )
         lock.lock()
-        pairingSessions[payload.pairingID] = PairingSession(payload: payload, ephemeralKey: ephemeral, state: "waiting")
+        pairingSessions[payload.pairingID] = PairingSession(payload: payload, ephemeralKey: ephemeral,
+                                                            targetContextKey: context.key, state: "waiting")
         lock.unlock()
-        event("pairing session \(payload.pairingID.prefix(8)) created (\(serviceURL))")
+        event("pairing session \(payload.pairingID.prefix(8)) created for \(displayName(of: context)) (\(serviceURL))")
         return payload
     }
 
@@ -478,6 +796,12 @@ public final class ChariotHub: @unchecked Sendable {
             event("pairing rejected by user")
             return
         }
+        guard let context = contexts[session.targetContextKey] else {
+            session.state = "consumed"
+            pairingSessions[pairingID] = session
+            event("pairing target agent no longer exists")
+            return
+        }
         var credential = DeviceCredential(mac: identity.publicIdentity, mobile: response.mobile)
         do {
             try credential.sign(with: identity.signingKey)
@@ -489,95 +813,119 @@ public final class ChariotHub: @unchecked Sendable {
         session.state = "consumed"
         pairingSessions[pairingID] = session
 
-        registry.devices.removeAll { $0.identity.deviceID == response.mobile.deviceID }
-        registry.devices.append(DeviceRegistry.Entry(identity: response.mobile,
-                                                     displayName: response.mobileDisplayName,
-                                                     pairedAt: Date(),
-                                                     revokedAt: nil,
-                                                     lastOutboundSequence: 0))
-        persistRegistry()
-        event("paired device \(response.mobileDisplayName) (\(response.mobile.fingerprint))")
+        context.registry.devices.removeAll { $0.identity.deviceID == response.mobile.deviceID }
+        context.registry.devices.append(DeviceRegistry.Entry(identity: response.mobile,
+                                                             displayName: response.mobileDisplayName,
+                                                             pairedAt: Date(),
+                                                             revokedAt: nil,
+                                                             lastOutboundSequence: 0))
+        persistRegistry(context)
+        event("paired device \(response.mobileDisplayName) (\(response.mobile.fingerprint)) to \(displayName(of: context))")
     }
 
-    /// Revoke a device: reject its credential and advance the session epoch so
-    /// it cannot decrypt future envelopes (design §8.1). A signed
+    /// Revoke a device: reject its credential and advance the agent's session
+    /// epoch so it cannot decrypt future envelopes (design §8.1). A signed
     /// `device.revoked` notice is sealed with the *old* epoch first — the last
     /// message the revoked device can still read — then any live WebSocket
-    /// session is told and closed.
-    public func revokeDevice(_ deviceID: String) {
+    /// session is told and closed. Revocation is per agent; with no instance
+    /// given, every agent that knows the device revokes it.
+    public func revokeDevice(_ deviceID: String, instanceID: String? = nil) {
         lock.lock()
-        guard let index = registry.devices.firstIndex(where: { $0.identity.deviceID == deviceID }) else {
+        let targets: [AgentContext]
+        if let instanceID, let context = contexts[instanceID] {
+            targets = [context]
+        } else {
+            targets = contexts.values.filter { context in
+                context.registry.devices.contains { $0.identity.deviceID == deviceID }
+            }
+        }
+        lock.unlock()
+        for context in targets {
+            revoke(deviceID, in: context)
+        }
+    }
+
+    private func revoke(_ deviceID: String, in context: AgentContext) {
+        lock.lock()
+        guard let index = context.registry.devices.firstIndex(where: { $0.identity.deviceID == deviceID }),
+              context.registry.devices[index].revokedAt == nil else {
             lock.unlock()
             return
         }
-        let peer = registry.devices[index].identity
-        registry.devices[index].lastOutboundSequence += 1
-        let sequence = registry.devices[index].lastOutboundSequence
-        let oldEpoch = registry.epoch
-        registry.devices[index].revokedAt = Date()
-        registry.epoch += 1
+        let peer = context.registry.devices[index].identity
+        context.registry.devices[index].lastOutboundSequence += 1
+        let sequence = context.registry.devices[index].lastOutboundSequence
+        let oldEpoch = context.registry.epoch
+        context.registry.devices[index].revokedAt = Date()
+        context.registry.epoch += 1
+        let newEpoch = context.registry.epoch
         lock.unlock()
-        persistRegistry()
+        persistRegistry(context)
         do {
             let notice = AgentMessage(conversationID: "control", senderDeviceID: identity.deviceID,
                                       sequence: sequence, type: .deviceRevoked,
                                       body: .object(["reason": .string("revoked by Mac user")]))
             let session = try SessionCrypto(localIdentity: identity, peerPublicIdentity: peer, epoch: oldEpoch)
-            deliver(envelope: try session.seal(notice))
+            deliver(envelope: try session.seal(notice), from: context)
         } catch {
             event("revocation notice failed: \(error)")
         }
         // Tell the live session (if any) and drop it.
         lock.lock()
         let sessionID = wsByDevice[deviceID]
-        let ws = sessionID.flatMap { wsSessions[$0]?.connection }
+        let ws = sessionID.flatMap { wsSessions[$0] }
+        let connection = (ws?.contextKey == context.key) ? ws?.connection : nil
         lock.unlock()
-        if let ws {
-            sendFrame(TransportFrame(type: .revoked), over: ws)
-            ws.close()
+        if let connection {
+            sendFrame(TransportFrame(type: .revoked), over: connection)
+            connection.close()
         }
         broadcastStatus()
-        event("revoked device \(deviceID.prefix(8)); epoch advanced to \(registry.epoch)")
+        event("revoked device \(deviceID.prefix(8)) on \(displayName(of: context)); epoch advanced to \(newEpoch)")
     }
 
     /// Queue an outbound envelope durably; a live session gets it immediately.
     /// Envelopes stay in the mailbox until the recipient acknowledges them.
-    func deliver(envelope: EncryptedEnvelope) {
-        mailbox.deposit(envelope)
+    func deliver(envelope: EncryptedEnvelope, from context: AgentContext) {
+        mailbox.deposit(envelope, instanceID: context.record != nil ? context.key : nil)
     }
 
-    private func deviceEntry(_ deviceID: String) -> DeviceRegistry.Entry? {
+    private func deviceEntry(_ deviceID: String, in context: AgentContext) -> DeviceRegistry.Entry? {
         lock.lock(); defer { lock.unlock() }
-        return registry.devices.first { $0.identity.deviceID == deviceID }
+        return context.registry.devices.first { $0.identity.deviceID == deviceID }
     }
 
     // MARK: Envelope handling (phone → Mac)
 
-    /// Decrypt, replay-check, and dispatch an inbound envelope. Returns true
-    /// when the envelope should be acknowledged to the sender (processed now
-    /// or a duplicate of something already processed).
+    /// Decrypt, replay-check, and dispatch an inbound envelope within one
+    /// agent's context. Returns true when the envelope should be acknowledged
+    /// to the sender (processed now or a duplicate of something already
+    /// processed).
     @discardableResult
-    func processInboundEnvelope(_ envelope: EncryptedEnvelope) -> Bool {
+    func processInboundEnvelope(_ envelope: EncryptedEnvelope, context: AgentContext) -> Bool {
         guard envelope.recipientDeviceID == identity.deviceID else { return false }
-        guard let entry = deviceEntry(envelope.senderDeviceID), entry.revokedAt == nil else {
-            event("dropped envelope from unknown/revoked device")
+        guard let entry = deviceEntry(envelope.senderDeviceID, in: context), entry.revokedAt == nil else {
+            event("dropped envelope from device not paired to \(displayName(of: context))")
             return false
         }
+        lock.lock()
+        let epoch = context.registry.epoch
+        lock.unlock()
         do {
             let session = try SessionCrypto(localIdentity: identity, peerPublicIdentity: entry.identity,
-                                            epoch: registry.epoch)
+                                            epoch: epoch)
             let message = try session.open(envelope)
             lock.lock()
-            var window = replayWindows[envelope.senderDeviceID] ?? ReplayWindow()
+            var window = context.replayWindows[envelope.senderDeviceID] ?? ReplayWindow()
             do {
                 try window.accept(messageID: message.messageID, sequence: message.sequence)
             } catch AgentLinkError.replayDetected {
                 lock.unlock()
                 return true  // duplicate delivery — ack again, don't reprocess
             }
-            replayWindows[envelope.senderDeviceID] = window
+            context.replayWindows[envelope.senderDeviceID] = window
             lock.unlock()
-            try handleAgentMessage(message, from: entry)
+            try handleAgentMessage(message, from: entry, context: context)
             return true
         } catch {
             event("envelope rejected: \(error)")
@@ -585,33 +933,55 @@ public final class ChariotHub: @unchecked Sendable {
         }
     }
 
-    private func handleAgentMessage(_ message: AgentMessage, from entry: DeviceRegistry.Entry) throws {
+    private func handleAgentMessage(_ message: AgentMessage, from entry: DeviceRegistry.Entry,
+                                    context: AgentContext) throws {
         switch message.type {
         case .conversationSend:
             let text = message.body["text"]?.stringValue ?? ""
-            event("prompt from \(entry.displayName): \(text.prefix(80))")
-            guard let bridge else {
-                try sendToDevice(entry.identity.deviceID, type: .outputCompleted,
+            event("prompt from \(entry.displayName) → \(displayName(of: context)): \(text.prefix(80))")
+            lock.lock()
+            let hasBridge = context.bridge != nil
+            lock.unlock()
+            guard hasBridge else {
+                try sendToDevice(entry.identity.deviceID, context: context, type: .outputCompleted,
                                  conversationID: message.conversationID,
                                  body: .object(["exit_code": .number(-1),
                                                 "error": .string("sandbox is not running")]))
                 return
             }
             lock.lock()
-            streams[message.messageID] = Stream(recipientDeviceID: entry.identity.deviceID)
+            streams[message.messageID] = Stream(recipientDeviceID: entry.identity.deviceID,
+                                                contextKey: context.key,
+                                                conversationID: message.conversationID)
             lock.unlock()
-            try bridge.sendConversation(requestID: message.messageID,
-                                        conversationID: message.conversationID,
-                                        text: text)
+            dispatchTurn(context, requestID: message.messageID,
+                         conversationID: message.conversationID, text: text) { [weak self] error in
+                guard let self else { return }
+                self.lock.lock()
+                let stream = self.streams.removeValue(forKey: message.messageID)
+                self.lock.unlock()
+                guard let stream else { return }
+                try? self.sendToDevice(stream.recipientDeviceID, context: context, type: .outputCompleted,
+                                       conversationID: message.conversationID,
+                                       body: .object(["exit_code": .number(-1),
+                                                      "error": .string(error)]))
+            }
         case .conversationCancel:
+            lock.lock()
+            let bridge = context.bridge
+            lock.unlock()
             try? bridge?.cancel(conversationID: message.conversationID)
         case .sandboxStatus:
-            let status = lastGuestStatus
-            try sendToDevice(entry.identity.deviceID, type: .sandboxStatus,
+            lock.lock()
+            let status = context.lastGuestStatus
+            let bridgeUp = context.bridge != nil
+            lock.unlock()
+            let state = context.vmInstanceID.map { backend.state(of: $0) } ?? .notCreated
+            try sendToDevice(entry.identity.deviceID, context: context, type: .sandboxStatus,
                              conversationID: message.conversationID,
                              body: .object([
-                                "state": .string(vmState.rawValue),
-                                "bridge": .bool(bridgeConnected),
+                                "state": .string(state.rawValue),
+                                "bridge": .bool(bridgeUp),
                                 "kernel": .string(status?.kernel ?? ""),
                                 "hostname": .string(status?.hostname ?? "")
                              ]))
@@ -620,44 +990,46 @@ public final class ChariotHub: @unchecked Sendable {
         }
     }
 
-    /// Seal and queue an outbound message for a paired device.
-    func sendToDevice(_ deviceID: String, type: AgentMessageType, conversationID: String,
-                      body: JSONValue) throws {
+    /// Seal and queue an outbound message for a device paired to one agent.
+    func sendToDevice(_ deviceID: String, context: AgentContext, type: AgentMessageType,
+                      conversationID: String, body: JSONValue) throws {
         lock.lock()
-        guard let index = registry.devices.firstIndex(where: { $0.identity.deviceID == deviceID }),
-              registry.devices[index].revokedAt == nil else {
+        guard let index = context.registry.devices.firstIndex(where: { $0.identity.deviceID == deviceID }),
+              context.registry.devices[index].revokedAt == nil else {
             lock.unlock()
             throw ChariotError.notPaired
         }
-        registry.devices[index].lastOutboundSequence += 1
-        let sequence = registry.devices[index].lastOutboundSequence
-        let peer = registry.devices[index].identity
-        let epoch = registry.epoch
+        context.registry.devices[index].lastOutboundSequence += 1
+        let sequence = context.registry.devices[index].lastOutboundSequence
+        let peer = context.registry.devices[index].identity
+        let epoch = context.registry.epoch
         lock.unlock()
-        persistRegistry()
+        persistRegistry(context)
 
         let message = AgentMessage(conversationID: conversationID,
                                    senderDeviceID: identity.deviceID,
                                    sequence: sequence, type: type, body: body)
         let session = try SessionCrypto(localIdentity: identity, peerPublicIdentity: peer, epoch: epoch)
-        deliver(envelope: try session.seal(message))
+        deliver(envelope: try session.seal(message), from: context)
     }
 
     // MARK: Bridge events → streams
 
-    private func handleBridgeEvent(_ bridgeEvent: BridgeEvent) {
+    private func handleBridgeEvent(_ context: AgentContext, _ bridgeEvent: BridgeEvent) {
         switch bridgeEvent {
         case .status(let state, _, let kernel, let hostname, let agent):
-            lastGuestStatus = (state, kernel, hostname)
+            lock.lock()
+            context.lastGuestStatus = (state, kernel, hostname)
+            if let agent { context.agentStatus = agent }
+            lock.unlock()
             if let agent {
-                agentStatus = agent
-                event("agent: \(agent.name) \(agent.version ?? "?") installed=\(agent.installed) signedIn=\(agent.loggedIn)")
+                event("\(displayName(of: context)): \(agent.name) \(agent.version ?? "?") installed=\(agent.installed) signedIn=\(agent.loggedIn)")
             } else {
-                event("guest status: \(state), kernel \(kernel)")
+                event("\(displayName(of: context)): guest status \(state), kernel \(kernel)")
             }
             broadcastStatus()
         case .oauthRequested(let provider, let purpose, let authURL):
-            event("oauth requested by guest (\(provider)): \(purpose)")
+            event("oauth requested by \(displayName(of: context)) (\(provider)): \(purpose)")
             lock.lock()
             let waiters = pendingAuthURLWaiters
             pendingAuthURLWaiters = []
@@ -665,11 +1037,15 @@ public final class ChariotHub: @unchecked Sendable {
             waiters.forEach { $0(authURL) }
             onOAuthRequest?(authURL)
         case .oauthCompleted(let success, let message):
-            event("codex sign-in \(success ? "succeeded" : "failed"): \(message)")
+            event("\(displayName(of: context)): codex sign-in \(success ? "succeeded" : "failed"): \(message)")
+            lock.lock()
+            let tunnel = context.loginTunnel
+            if success { context.loginTunnel = nil }
+            let bridge = context.bridge
+            lock.unlock()
             if success {
                 // Callback served; the tunnel has no further purpose.
-                loginTunnel?.stop()
-                loginTunnel = nil
+                tunnel?.stop()
             }
             try? bridge?.requestStatus()
         case .outputDelta(let requestID, _, let text):
@@ -703,24 +1079,28 @@ public final class ChariotHub: @unchecked Sendable {
             lock.unlock()
             flushStream(requestID: requestID, final: true)
             lock.lock()
-            let recipient = streams.removeValue(forKey: requestID)?.recipientDeviceID
+            let stream = streams.removeValue(forKey: requestID)
             lock.unlock()
-            if let recipient {
-                try? sendToDevice(recipient, type: .outputCompleted, conversationID: conversationID,
+            if let stream, let streamContext = self.context(forKey: stream.contextKey) {
+                try? sendToDevice(stream.recipientDeviceID, context: streamContext,
+                                  type: .outputCompleted, conversationID: conversationID,
                                   body: .object(["exit_code": .number(Double(exitCode)),
                                                  "request_id": .string(requestID)]))
             }
         case .pong:
             break
         case .error(let message):
-            event("bridge error: \(message)")
+            event("\(displayName(of: context)): bridge error: \(message)")
         case .disconnected(let reason):
-            event("bridge disconnected: \(reason)")
-            bridge = nil
+            event("\(displayName(of: context)): bridge disconnected: \(reason)")
+            lock.lock()
+            context.bridge = nil
+            lock.unlock()
             // Reconnect while the VM is still running (e.g. guest service restart).
-            if vmState == .running {
-                Task { [weak self] in
-                    try? await self?.connectBridge()
+            if let vm = context.vmInstanceID, backend.state(of: vm) == .running {
+                Task { [weak self, weak context] in
+                    guard let self, let context else { return }
+                    try? await self.connectBridge(context)
                 }
             }
         }
@@ -735,7 +1115,9 @@ public final class ChariotHub: @unchecked Sendable {
         streams[requestID] = stream
         lock.unlock()
         guard !text.isEmpty else { return }
-        try? sendToDevice(stream.recipientDeviceID, type: .outputDelta, conversationID: "default",
+        guard let context = context(forKey: stream.contextKey) else { return }
+        try? sendToDevice(stream.recipientDeviceID, context: context, type: .outputDelta,
+                          conversationID: stream.conversationID,
                           body: .object(["text": .string(text), "request_id": .string(requestID)]))
     }
 
@@ -779,6 +1161,7 @@ public final class ChariotHub: @unchecked Sendable {
         lock.lock()
         guard let session = wsSessions[id] else { lock.unlock(); return }
         let authenticatedDevice = session.deviceID
+        let contextKey = session.contextKey
         lock.unlock()
 
         guard let frame = try? TransportFrame.decode(Data(text.utf8)) else {
@@ -789,8 +1172,9 @@ public final class ChariotHub: @unchecked Sendable {
         }
 
         // Tailnet membership is transport only — nothing is served before the
-        // device proves possession of a paired signing key.
-        guard let deviceID = authenticatedDevice else {
+        // device proves possession of a key paired to the target agent.
+        guard let deviceID = authenticatedDevice,
+              let contextKey, let context = context(forKey: contextKey) else {
             handleWSHello(frame, session: sessionFor(connection), connection: connection)
             return
         }
@@ -798,7 +1182,7 @@ public final class ChariotHub: @unchecked Sendable {
         switch frame.type {
         case .envelope:
             guard let envelope = frame.envelope, envelope.senderDeviceID == deviceID else { return }
-            if processInboundEnvelope(envelope) {
+            if processInboundEnvelope(envelope, context: context) {
                 var ack = TransportFrame(type: .ack)
                 ack.messageIDs = [envelope.messageID]
                 sendFrame(ack, over: connection)
@@ -828,10 +1212,18 @@ public final class ChariotHub: @unchecked Sendable {
             connection.close()
             return
         }
-        guard let entry = deviceEntry(deviceID), entry.revokedAt == nil else {
+        // The instance ID names the agent this session talks to — and only
+        // devices paired to THAT agent get in. A device paired to a different
+        // agent is indistinguishable from an unpaired one here.
+        guard let context = resolveContext(instanceID: instanceID) else {
+            sendFrame(TransportFrame(type: .denied), over: connection)
+            connection.close()
+            return
+        }
+        guard let entry = deviceEntry(deviceID, in: context), entry.revokedAt == nil else {
             // Revoked and unknown devices are distinguishable on purpose: the
-            // phone shows "revoked" only when this Mac actually revoked it.
-            if deviceEntry(deviceID) != nil {
+            // phone shows "revoked" only when this agent actually revoked it.
+            if deviceEntry(deviceID, in: context) != nil {
                 sendFrame(TransportFrame(type: .revoked), over: connection)
             } else {
                 sendFrame(TransportFrame(type: .denied), over: connection)
@@ -851,25 +1243,27 @@ public final class ChariotHub: @unchecked Sendable {
         lock.lock()
         session.deviceID = deviceID
         session.instanceID = instanceID
+        session.contextKey = context.key
         // One live session per device: a reconnect supersedes the old socket.
         if let previous = wsByDevice[deviceID], previous != ObjectIdentifier(connection),
            let stale = wsSessions[previous]?.connection {
             stale.close()
         }
         wsByDevice[deviceID] = ObjectIdentifier(connection)
-        let epoch = registry.epoch
+        let epoch = context.registry.epoch
         lock.unlock()
 
         var welcome = TransportFrame(type: .welcome)
         welcome.epoch = epoch
         welcome.macDeviceID = identity.deviceID
         sendFrame(welcome, over: connection)
-        sendStatusFrame(over: connection)
-        event("device \(entry.displayName) connected (instance \(instanceID))")
+        sendStatusFrame(over: connection, context: context)
+        event("device \(entry.displayName) connected to \(displayName(of: context))")
 
-        // Replay everything still queued for this device; the phone acks and
+        // Replay this agent's queued mail for the device; the phone acks and
         // deduplicates via its replay window.
-        for stored in mailbox.fetch(recipient: deviceID, after: 0, limit: 500) {
+        let scope = context.record != nil ? context.key : nil
+        for stored in mailbox.fetch(recipient: deviceID, instanceID: scope, after: 0, limit: 500) {
             var envelopeFrame = TransportFrame(type: .envelope)
             envelopeFrame.envelope = stored.envelope
             sendFrame(envelopeFrame, over: connection)
@@ -877,9 +1271,11 @@ public final class ChariotHub: @unchecked Sendable {
         startStatusTimerIfNeeded()
     }
 
-    private func pushEnvelopeIfConnected(_ envelope: EncryptedEnvelope) {
+    private func pushEnvelopeIfConnected(_ envelope: EncryptedEnvelope, instanceID: String?) {
         lock.lock()
-        let connection = wsByDevice[envelope.recipientDeviceID].flatMap { wsSessions[$0]?.connection }
+        let session = wsByDevice[envelope.recipientDeviceID].flatMap { wsSessions[$0] }
+        // Only the session bound to the owning agent gets the live push.
+        let connection = (instanceID == nil || session?.contextKey == instanceID) ? session?.connection : nil
         lock.unlock()
         guard let connection else { return }
         var frame = TransportFrame(type: .envelope)
@@ -893,22 +1289,31 @@ public final class ChariotHub: @unchecked Sendable {
         }
     }
 
-    private func sendStatusFrame(over connection: WebSocketConnection) {
+    private func sendStatusFrame(over connection: WebSocketConnection, context: AgentContext) {
         var status = TransportFrame(type: .status)
-        status.vmState = vmState.rawValue
-        status.bridgeConnected = bridgeConnected
+        let state = context.vmInstanceID.map { backend.state(of: $0) } ?? .notCreated
+        status.vmState = state.rawValue
         lock.lock()
-        status.epoch = registry.epoch
+        status.bridgeConnected = context.bridge != nil
+        status.epoch = context.registry.epoch
         lock.unlock()
         sendFrame(status, over: connection)
     }
 
-    /// Push current sandbox status to every authenticated session.
+    /// Push current sandbox status to every authenticated session, each in
+    /// terms of its own agent.
     func broadcastStatus() {
         lock.lock()
-        let connections = wsByDevice.values.compactMap { wsSessions[$0]?.connection }
+        let live = wsByDevice.values.compactMap { wsSessions[$0] }
+            .compactMap { session -> (WebSocketConnection, String)? in
+                guard let key = session.contextKey else { return nil }
+                return (session.connection, key)
+            }
         lock.unlock()
-        connections.forEach { sendStatusFrame(over: $0) }
+        for (connection, key) in live {
+            guard let context = context(forKey: key) else { continue }
+            sendStatusFrame(over: connection, context: context)
+        }
     }
 
     private func startStatusTimerIfNeeded() {
@@ -960,8 +1365,9 @@ public final class ChariotHub: @unchecked Sendable {
                 "mac_display_name": macDisplayName,
                 "vm_state": vmState.rawValue,
                 "bridge_connected": bridgeConnected,
-                "epoch": Int(registry.epoch),
+                "epoch": Int(currentEpoch),
                 "instance_id": currentInstanceID,
+                "agents": agentRecords().count,
                 "mode": tailscaleEnabled ? "tailscale" : "local"
             ])
         case ("GET", "v2") where parts.count == 2 && parts[1] == "ws":
@@ -989,12 +1395,29 @@ public final class ChariotHub: @unchecked Sendable {
             case .failure(let code): return .error(code.status, code.message)
             }
         case ("GET", "pairing") where parts.count == 3 && parts[2] == "credential":
-            guard let session = pairingSessions[parts[1]] else { return .error(404, "unknown pairing id") }
+            lock.lock()
+            let session = pairingSessions[parts[1]]
+            let epoch = session.flatMap { contexts[$0.targetContextKey]?.registry.epoch } ?? 1
+            lock.unlock()
+            guard let session else { return .error(404, "unknown pairing id") }
             guard let credential = session.encryptedCredential else { return .error(404, "not issued yet") }
-            return .json(["ciphertext": Base64URL.encode(credential), "epoch": Int(registry.epoch)])
+            return .json(["ciphertext": Base64URL.encode(credential), "epoch": Int(epoch)])
         default:
             return .error(404, "not found")
         }
+    }
+
+    /// Synchronously run an async lifecycle operation for an admin route.
+    private func runBlocking(timeout: TimeInterval = 300,
+                             _ operation: @escaping @Sendable () async -> String) -> String {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = OutputCollector()
+        Task {
+            box.append(await operation())
+            semaphore.signal()
+        }
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut { return "error: timed out" }
+        return box.text
     }
 
     /// Local-only admin endpoints used by the E2E harness and the GUI. This
@@ -1004,6 +1427,54 @@ public final class ChariotHub: @unchecked Sendable {
         guard parts.first == "admin" else { return .error(404, "not found") }
         let rest = Array(parts.dropFirst())
         switch (request.method, rest.first ?? "") {
+        case ("GET", "packs"):
+            let packs = PackLoader.availablePacks(in: paths.packsDirectory).map { pack -> [String: Any] in
+                ["dir": pack.directoryName, "id": pack.manifest.id,
+                 "name": pack.manifest.name, "version": pack.manifest.version]
+            }
+            return .json(["packs": packs])
+        case ("POST", "agents") where rest.count == 1:
+            guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
+                  let packDir = object["pack_dir"] else { return .error(400, "pack_dir required") }
+            let name = object["name"]
+            let collector = OutputCollector()
+            let result = runBlocking { [weak self] in
+                guard let self else { return "error: hub gone" }
+                do {
+                    let record = try await self.createAgent(fromPackDirectory: packDir, displayName: name)
+                    collector.append(record.instanceID)
+                    return "ok"
+                } catch {
+                    return "error: \(error)"
+                }
+            }
+            guard result == "ok" else { return .error(500, result) }
+            return .json(["instance_id": collector.text])
+        case ("GET", "agents"):
+            let agents = agentSummaries().map { summary -> [String: Any] in
+                var payload: [String: Any] = [
+                    "instance_id": summary.record.instanceID,
+                    "pack_id": summary.record.packID,
+                    "name": summary.record.displayName,
+                    "pack_dir": summary.record.packDirectoryName,
+                    "vm_state": summary.vmState.rawValue,
+                    "bridge_connected": summary.bridgeConnected,
+                    "epoch": Int(summary.epoch),
+                    "devices": pairedDevices(instanceID: summary.record.instanceID).map { device -> [String: Any] in
+                        ["id": device.id, "name": device.name, "revoked": device.revoked,
+                         "fingerprint": device.fingerprint]
+                    }
+                ]
+                if let status = summary.agentStatus {
+                    payload["codex_installed"] = status.installed
+                    payload["codex_logged_in"] = status.loggedIn
+                    payload["codex_version"] = status.version ?? ""
+                }
+                return payload
+            }
+            return .json(["agents": agents])
+        case (_, "agents") where rest.count == 3:
+            return routeAgentAdmin(request, instanceID: rest[1], action: rest[2])
         case ("POST", "pairing"):
             do {
                 let payload = try startPairingSession()
@@ -1019,15 +1490,16 @@ public final class ChariotHub: @unchecked Sendable {
             return .json([
                 "vm_state": vmState.rawValue,
                 "bridge_connected": bridgeConnected,
-                "epoch": Int(registry.epoch),
+                "epoch": Int(currentEpoch),
                 "devices": devices,
+                "agents": agentRecords().count,
                 "mac_fingerprint": identity.publicIdentity.fingerprint,
                 "tailnet": tailnetStatus.label
             ])
         case ("POST", "revoke"):
             guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
                   let deviceID = object["device_id"] else { return .error(400, "device_id required") }
-            revokeDevice(deviceID)
+            revokeDevice(deviceID, instanceID: object["instance_id"])
             return .json(["revoked": deviceID])
         case ("GET", "events"):
             return .json(["events": eventBuffer.recent()])
@@ -1064,27 +1536,26 @@ public final class ChariotHub: @unchecked Sendable {
             return .json(["status": tailnetStatus.label])
         case ("POST", "vm") where rest.count == 2:
             let action = rest[1]
-            let semaphore = DispatchSemaphore(value: 0)
-            let box = OutputCollector()
-            Task {
+            let baseImage = defaultBaseImagePath
+                ?? ProcessInfo.processInfo.environment["CHARIOT_BASE_IMAGE"] ?? ""
+            let result = runBlocking { [weak self] in
+                guard let self else { return "error: hub gone" }
                 do {
                     switch action {
                     case "start":
-                        _ = try await ensureInstance(configuration: SandboxConfiguration(
-                            baseImagePath: ProcessInfo.processInfo.environment["CHARIOT_BASE_IMAGE"] ?? ""))
-                        try await startVM()
-                    case "stop": try await stopVM()
-                    case "reset": try await resetVM()
-                    default: box.append("unknown action")
+                        _ = try await self.ensureInstance(configuration: SandboxConfiguration(
+                            baseImagePath: baseImage))
+                        try await self.startVM()
+                    case "stop": try await self.stopVM()
+                    case "reset": try await self.resetVM()
+                    default: return "unknown action"
                     }
-                    box.append("ok")
+                    return "ok"
                 } catch {
-                    box.append("error: \(error)")
+                    return "error: \(error)"
                 }
-                semaphore.signal()
             }
-            _ = semaphore.wait(timeout: .now() + 300)
-            return .json(["result": box.text, "vm_state": vmState.rawValue])
+            return .json(["result": result, "vm_state": vmState.rawValue])
         case ("GET", "agent"):
             return .json([
                 "installed": agentStatus?.installed ?? false,
@@ -1093,54 +1564,103 @@ public final class ChariotHub: @unchecked Sendable {
                 "install_error": agentStatus?.installError ?? ""
             ])
         case ("POST", "agent") where rest.count == 2 && rest[1] == "login":
-            let semaphore = DispatchSemaphore(value: 0)
-            let box = OutputCollector()
-            waitForAuthURL(timeout: 25) { url in
-                box.append(url ?? "")
-                semaphore.signal()
-            }
-            do {
-                try startCodexLogin()
-            } catch {
-                return .error(503, "\(error)")
-            }
-            _ = semaphore.wait(timeout: .now() + 30)
-            return box.text.isEmpty ? .error(504, "no auth URL from guest")
-                                    : .json(["auth_url": box.text])
+            return startLoginAndAwaitURL(instanceID: nil)
         case ("POST", "devaccess"):
             guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
                   let action = object["action"] else { return .error(400, "action required") }
             if action == "enable" {
                 do {
-                    let info = try enableDeveloperAccess()
+                    let info = try enableDeveloperAccess(instanceID: object["instance_id"])
                     return .json(["port": Int(info.port), "command": info.command,
                                   "instructions": info.instructions])
                 } catch {
                     return .error(500, "\(error)")
                 }
             } else {
-                disableDeveloperAccess()
+                disableDeveloperAccess(instanceID: object["instance_id"])
                 return .json(["disabled": true])
             }
         case ("POST", "conversation"):
-            // Synchronous local prompt for testing the bridge path.
-            guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
-                  let text = object["text"] else { return .error(400, "text required") }
-            let semaphore = DispatchSemaphore(value: 0)
-            let collector = OutputCollector()
-            do {
-                try sendLocalPrompt(text, onDelta: { collector.append($0) },
-                                    onCompleted: { code in collector.finish(code); semaphore.signal() })
-            } catch {
-                return .error(503, "\(error)")
-            }
-            if semaphore.wait(timeout: .now() + 120) == .timedOut {
-                return .error(504, "agent timed out")
-            }
-            return .json(["output": collector.text, "exit_code": collector.exitCode])
+            return runConversation(request, instanceID: nil)
         default:
             return .error(404, "not found")
         }
+    }
+
+    /// Per-agent admin: /admin/agents/<instance-uuid>/<action>.
+    private func routeAgentAdmin(_ request: HTTPServer.Request, instanceID: String,
+                                 action: String) -> HTTPServer.Response {
+        guard let _ = try? requireContext(instanceID) else { return .error(404, "unknown agent") }
+        switch (request.method, action) {
+        case ("POST", "vm"):
+            guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
+                  let vmAction = object["action"] else { return .error(400, "action required") }
+            let result = runBlocking { [weak self] in
+                guard let self else { return "error: hub gone" }
+                do {
+                    switch vmAction {
+                    case "start": try await self.startAgent(instanceID)
+                    case "stop": try await self.stopAgent(instanceID)
+                    case "reset": try await self.resetAgent(instanceID)
+                    default: return "unknown action"
+                    }
+                    return "ok"
+                } catch {
+                    return "error: \(error)"
+                }
+            }
+            return .json(["result": result, "vm_state": vmState(of: instanceID).rawValue])
+        case ("POST", "pairing"):
+            do {
+                let payload = try startPairingSession(instanceID: instanceID)
+                return .data(try CanonicalCoding.encode(payload))
+            } catch {
+                return .error(500, "\(error)")
+            }
+        case ("POST", "conversation"):
+            return runConversation(request, instanceID: instanceID)
+        case ("POST", "login"):
+            return startLoginAndAwaitURL(instanceID: instanceID)
+        default:
+            return .error(404, "not found")
+        }
+    }
+
+    /// Synchronous local prompt for testing the bridge path.
+    private func runConversation(_ request: HTTPServer.Request, instanceID: String?) -> HTTPServer.Response {
+        guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
+              let text = object["text"] else { return .error(400, "text required") }
+        let conversationID = object["conversation_id"] ?? "local"
+        let semaphore = DispatchSemaphore(value: 0)
+        let collector = OutputCollector()
+        do {
+            try sendLocalPrompt(text, instanceID: instanceID, conversationID: conversationID,
+                                onDelta: { collector.append($0) },
+                                onCompleted: { code in collector.finish(code); semaphore.signal() })
+        } catch {
+            return .error(503, "\(error)")
+        }
+        if semaphore.wait(timeout: .now() + 180) == .timedOut {
+            return .error(504, "agent timed out")
+        }
+        return .json(["output": collector.text, "exit_code": collector.exitCode])
+    }
+
+    private func startLoginAndAwaitURL(instanceID: String?) -> HTTPServer.Response {
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = OutputCollector()
+        waitForAuthURL(timeout: 25) { url in
+            box.append(url ?? "")
+            semaphore.signal()
+        }
+        do {
+            try startCodexLogin(instanceID: instanceID)
+        } catch {
+            return .error(503, "\(error)")
+        }
+        _ = semaphore.wait(timeout: .now() + 30)
+        return box.text.isEmpty ? .error(504, "no auth URL from guest")
+                                : .json(["auth_url": box.text])
     }
 }
 

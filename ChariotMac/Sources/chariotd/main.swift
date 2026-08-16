@@ -48,6 +48,7 @@ do {
         fflush(stdout)
     }
     if !tailscale { hub.tailscaleEnabled = false }
+    hub.defaultBaseImagePath = baseImage
     try hub.startTransportServer(port: port)
     print("[chariotd] mac device: \(hub.macPublicIdentity.deviceID) fingerprint \(hub.macPublicIdentity.fingerprint)")
     print("[chariotd] transport 127.0.0.1:\(hub.transportPort), admin 127.0.0.1:\(hub.adminPort)")
@@ -67,15 +68,25 @@ do {
         }
     }
 
+    // Agent fleet (Milestone 1): created agents are listed at startup and
+    // driven through the admin surface (/admin/packs, /admin/agents, …).
+    let agents = hub.agentRecords()
+    for agent in agents {
+        print("[chariotd] agent \(agent.displayName) (\(agent.packID)) instance \(agent.instanceID)")
+    }
+
     let runLoopTask = Task {
-        if startVM {
+        if !startVM {
+            print("[chariotd] --no-vm: transport only")
+        } else if agents.isEmpty {
+            // Legacy single-VM flow, kept while no agents exist.
             let configuration = SandboxConfiguration(baseImagePath: baseImage)
             let id = try await hub.ensureInstance(configuration: configuration)
             print("[chariotd] instance \(id) — starting VM")
             try await hub.startVM()
             print("[chariotd] VM running; bridge connected")
         } else {
-            print("[chariotd] --no-vm: transport only")
+            print("[chariotd] \(agents.count) agent(s) — start them via POST /admin/agents/<id>/vm")
         }
     }
 
@@ -88,6 +99,9 @@ do {
         runLoopTask.cancel()
         hub.tailnet?.stop()
         Task {
+            for agent in hub.agentRecords() {
+                try? await hub.stopAgent(agent.instanceID)
+            }
             try? await hub.stopVM()
             exit(0)
         }

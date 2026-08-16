@@ -133,18 +133,26 @@ final class VMController: NSObject, VZVirtualMachineDelegate, @unchecked Sendabl
                     else { cont.resume() }
                 }
                 if vm.canRequestStop {
-                    // Graceful ACPI shutdown with a forced-stop fallback.
+                    // Graceful ACPI shutdown with a forced-stop fallback. The
+                    // pending completion is the single-resume token: whoever
+                    // takes it (the delegate when the guest powers off, or
+                    // this fallback) owns the continuation. Both run on
+                    // `queue`, so taking it is atomic — without this, a guest
+                    // finishing its ACPI shutdown right as the fallback force-
+                    // stops resumed the continuation twice and crashed.
                     try? vm.requestStop()
+                    self.pendingStopCompletion = finish
                     self.queue.asyncAfter(deadline: .now() + 15) {
+                        guard let pending = self.pendingStopCompletion else { return }
+                        self.pendingStopCompletion = nil
                         if let vm = self.machine, vm.state != .stopped, vm.canStop {
-                            vm.stop { _ in finish(nil) }
-                        } else if self.machine != nil {
-                            finish(nil)
+                            vm.stop { _ in pending(nil) }
+                        } else {
+                            // Owning the token means the delegate never fired;
+                            // resume rather than leak the continuation.
+                            pending(nil)
                         }
                     }
-                    // If the guest powers off before the deadline the delegate
-                    // fires; finish there.
-                    self.pendingStopCompletion = finish
                 } else if vm.canStop {
                     vm.stop { error in finish(error) }
                 } else {

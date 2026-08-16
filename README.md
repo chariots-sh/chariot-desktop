@@ -24,6 +24,10 @@ Current state:
 - The same transport service also listens on loopback, which is what the
   dev/E2E harness (`chariotd`, simulator) connects to directly with
   `CHARIOT_TAILSCALE=0` — same protocol, no tailnet required.
+- **Agent packs (Guardian on Chariot, Milestone 1)**: drop a pack folder into
+  the packs directory → create a dedicated Codex VM per agent, populated from
+  the pack's markdown/skills/scripts. Multiple agents run concurrently in
+  separate VMs; pairing is per agent. See [Agent packs](#agent-packs) below.
 
 ## What's here
 
@@ -35,7 +39,8 @@ Current state:
 | `chariotd` | `ChariotMac/Sources/chariotd/` | Headless daemon used by the E2E harness. |
 | Chariot Desktop.app | `ChariotMac/Sources/ChariotDesktopApp/` | SwiftUI app: sandbox lifecycle, conversation, Tailscale panel (sign-in/reauth/disconnect/reset), QR pairing sheet with device approval, revocation, developer access. |
 | ChariotMobile.app | `ChariotMobile/` | iPhone app: Welcome/Scanner/Conversation/Connection screens, persistent WSS with backoff+jitter reconnect, durable outbox, revocation handling. |
-| Guest assets | `guest/` | `bridge.py` (vsock agent bridge + SSH tunnel) and the cloud-init `user-data` template. |
+| Guest assets | `guest/` | `bridge.py` (vsock agent bridge + SSH tunnel + `file.put` pack installer) and the cloud-init `user-data` template. |
+| Sample packs | `packs/` | `guardian.pack` (health companion) and `scribe.pack` (note-taker): pack format v1 examples with personas, seeds, and tools. |
 | Scripts | `scripts/` | Build/run/E2E helpers. |
 | Docs | `docs/tailscale.md` | Tailnet onboarding, HTTPS, Grants policy examples, key expiry, troubleshooting. |
 
@@ -61,11 +66,13 @@ scripts/run-desktop.sh      # launches it with defaults for this checkout
 ```
 
 In the app: **Tailscale → Sign in to Tailscale** authenticates the embedded
-node (one browser login; the identity persists). **Sandbox → Start** boots the
-VM (first boot ~40 s while cloud-init provisions the bridge). **Conversation**
-talks to the agent — prefix a message with `!` to run a shell command inside
-the guest. **Devices → Pair new device** shows the QR code; approval is
-interactive in the GUI.
+node (one browser login; the identity persists). The sidebar lists your
+agents — **New Agent** creates one from a pack (see [Agent packs](#agent-packs));
+each agent's page has **Start** (first boot ~40 s while cloud-init provisions
+the bridge), a per-agent chat (prefix a message with `!` to run a shell
+command inside that agent's guest), **Show pairing QR**, Codex sign-in,
+developer access, and **Reset**. Approval of pairing requests is interactive
+in the GUI.
 
 iPhone: install the official Tailscale app, join the same tailnet, then scan
 the QR with ChariotMobile. Mac and phone restarts don't require rescanning.
@@ -83,6 +90,43 @@ The simulator has no camera and no tailnet: run the Mac side with
 scanner screen. On a real device the same screen scans the QR live via
 `DataScannerViewController`.
 
+## Agent packs
+
+A **pack** is a folder of content — no code runs on the Mac — that defines an
+agent: persona markdown, skills, and tool scripts that run *inside* the VM
+(no new capability: Codex already runs an unsandboxed shell there). Packs
+live in `<data-dir>/packs/`, one folder each (see [`packs/`](packs/) for the
+two samples):
+
+```
+guardian.pack/
+  pack.json          { id, name, version, vm { cpus, memoryMB, diskGB },
+                       workspace: [ { src, dest, seedOnly? } ] }
+  AGENTS.md          persona/instructions → /workspace/AGENTS.md
+  SOUL.md            voice → /workspace/SOUL.md
+  MEMORY.seed.md     seedOnly → /workspace/MEMORY.md (written once; the agent
+                     owns it afterwards — never overwritten on re-populate)
+  skills/…  tools/…  directories are pushed recursively
+```
+
+- **Create** an agent from a pack (GUI sidebar → New Agent, or
+  `POST /admin/agents`): it gets a fresh **instance UUID** — the durable
+  identity and routing key — and its own APFS-cloned VM sized per `vm{}`.
+  Pack id/name are cosmetic labels; nothing durable binds to them.
+- **Populate**: the hub pushes workspace files over the bridge's `file.put`
+  op (path-restricted to /workspace, atomic) on first boot and re-pushes
+  edited files before every turn — edit `guardian.pack/AGENTS.md` and the
+  next turn sees it, no rebuild. `Reset` re-clones the disk and replays the
+  whole workspace, re-seeding MEMORY.md.
+- **Pairing is per agent**: each agent is its own pairing endpoint (the QR
+  carries its instance UUID) with its own device registry and epoch. A phone
+  paired to guardian is, to scribe, indistinguishable from an unpaired one.
+  The credential IS the grant — there is no hub-wide agent ACL.
+- **Codex sign-in is per VM** (auth lives in each guest, erased by that
+  agent's Reset); one brokered browser dance per agent.
+- A `data` field in pack.json is reserved for Milestone 2 (phone data
+  providers) and ignored by this loader.
+
 ## Headless daemon + end-to-end test
 
 ```bash
@@ -96,7 +140,9 @@ ChariotMac/.build/arm64-apple-macosx/debug/chariotd \
 
 `chariotd` serves the transport (pairing + WebSocket) on `127.0.0.1:8787` and
 local admin endpoints on `127.0.0.1:8788` (`/admin/pairing`, `/admin/summary`,
-`/admin/conversation`, `/admin/revoke`, `/admin/devaccess`, `/admin/tailnet`).
+`/admin/conversation`, `/admin/revoke`, `/admin/devaccess`, `/admin/tailnet`,
+plus the fleet surface: `GET /admin/packs`, `GET|POST /admin/agents`, and
+per-agent `POST /admin/agents/<uuid>/{vm,pairing,conversation,login}`).
 The admin surface is never reachable through the tailnet proxy. The GUI and
 daemon share the same data dir and ports, so run one at a time
 (`pkill -TERM -f chariotd`).
@@ -105,6 +151,15 @@ Automated transport E2E (no tailnet or VM needed):
 
 ```bash
 scripts/e2e-transport.sh    # 16 checks: pairing, WS auth, roundtrip, dedup, offline replay, revocation
+```
+
+Automated agent-pack E2E (boots two real VMs — local only):
+
+```bash
+scripts/e2e-packs.sh        # Milestone 1 acceptance: 2 concurrent agent VMs, per-pack
+                            # workspaces, per-agent pairing, hot pack edits, pack tools,
+                            # reset + reseed. Add CHARIOT_E2E_CODEX_AUTH=<auth.json> for
+                            # real Codex persona turns.
 ```
 
 ## Tests & CI
@@ -199,3 +254,10 @@ Official Tailscale iOS app provides the VPN         ▼
 7. Revocation: Mac closes the session with a `revoked` frame and advances the
    epoch; phone shows the revoked screen; reconnection is refused;
    re-pairing restores service.
+8. Agent packs (`scripts/e2e-packs.sh`, 28 checks against real VMs): two
+   packs → two concurrently running VMs with per-pack workspaces and sizing;
+   pack tools execute in-guest; files and sessions never cross VMs; per-agent
+   pairing admits a device to its own agent and denies it on the other;
+   editing a pack lands on the agent's next turn with no rebuild; reset
+   re-clones the disk, replays the workspace, and re-seeds MEMORY.md while
+   the other agent runs undisturbed.
