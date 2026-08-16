@@ -220,4 +220,62 @@ final class FleetTests: XCTestCase {
         XCTAssertTrue(hub.pairedDevices(instanceID: guardian.instanceID)[0].revoked)
         XCTAssertFalse(hub.pairedDevices(instanceID: scribe.instanceID)[0].revoked)
     }
+
+    /// file.write envelopes (phone → workspace): deflated contents decode
+    /// and route to the bridge (whose absence is reported honestly), and
+    /// path traversal is rejected outright. The two distinct errors prove
+    /// where each request got to.
+    func testFileWriteEnvelopeDecodesDeflateAndGuardsPaths() async throws {
+        let guardian = try await hub.createAgent(fromPackDirectory: "guardian.pack")
+        try hub.startTransportServer(port: 0, adminPort: 0)
+        let transportBase = "http://127.0.0.1:\(hub.transportPort)"
+
+        let phone = DeviceIdentity()
+        let payload = try hub.startPairingSession(instanceID: guardian.instanceID)
+        try await pair(identity: phone, payload: payload, transportBase: transportBase)
+        let ws = WSProbe(url: "ws://127.0.0.1:\(hub.transportPort)/v2/ws")
+        let welcome = try await hello(ws, identity: phone, instanceID: guardian.instanceID)
+        XCTAssertEqual(welcome?.type, .welcome)
+        defer { ws.close() }
+
+        var session = try SessionCrypto(localIdentity: phone,
+                                        peerPublicIdentity: hub.macPublicIdentity, epoch: 1)
+        func sendFileWrite(sequence: UInt64, body: JSONValue) async throws -> AgentMessage? {
+            let message = AgentMessage(conversationID: "guardian", senderDeviceID: phone.deviceID,
+                                       sequence: sequence, type: .fileWrite, body: body)
+            var frame = TransportFrame(type: .envelope)
+            frame.envelope = try session.seal(message)
+            try await ws.send(frame)
+            for _ in 0..<6 {
+                guard let reply = await ws.next() else { break }
+                if reply.type == .envelope, let envelope = reply.envelope,
+                   let opened = try? session.open(envelope), opened.type == .fileWriteResult,
+                   opened.body["request_id"]?.stringValue == message.messageID {
+                    return opened
+                }
+            }
+            return nil
+        }
+
+        // Deflated contents for a valid path decode fine and make it all the
+        // way to the (absent) bridge — a decode failure would surface as
+        // "invalid path or contents" instead.
+        let raw = Data(String(repeating: "phone data ", count: 4096).utf8)
+        let deflated = try (raw as NSData).compressed(using: .zlib) as Data
+        let accepted = try await sendFileWrite(sequence: 1, body: .object([
+            "path": .string("/workspace/data/archive.json"),
+            "contents_b64": .string(deflated.base64EncodedString()),
+            "encoding": .string("deflate")
+        ]))
+        XCTAssertEqual(accepted?.body["ok"]?.boolValue, false)
+        XCTAssertEqual(accepted?.body["error"]?.stringValue, "sandbox is not running")
+
+        // Path traversal out of /workspace is refused before any bridge work.
+        let rejected = try await sendFileWrite(sequence: 2, body: .object([
+            "path": .string("/workspace/../etc/passwd"),
+            "contents_b64": .string(Data("nope".utf8).base64EncodedString())
+        ]))
+        XCTAssertEqual(rejected?.body["ok"]?.boolValue, false)
+        XCTAssertEqual(rejected?.body["error"]?.stringValue, "invalid path or contents")
+    }
 }
