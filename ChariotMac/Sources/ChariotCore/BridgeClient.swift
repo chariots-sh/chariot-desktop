@@ -30,6 +30,9 @@ final class BridgeClient: @unchecked Sendable {
     private let writeLock = NSLock()
     private let handler: @Sendable (BridgeEvent) -> Void
     private var readerThread: Thread?
+    // file.put replies correlated by request ID (Milestone 1: pack pushes).
+    private let putLock = NSLock()
+    private var pendingFilePuts: [String: @Sendable (Result<Bool, ChariotError>) -> Void] = [:]
 
     init(connection: VZVirtioSocketConnection, handler: @escaping @Sendable (BridgeEvent) -> Void) {
         self.connection = connection
@@ -94,6 +97,57 @@ final class BridgeClient: @unchecked Sendable {
         try sendObject(["type": "ping"])
     }
 
+    /// Install one file into the guest workspace via the bridge's `file.put`
+    /// op. Returns true when the file was written, false when `ifAbsent` was
+    /// set and the guest already had it (seed-only semantics).
+    func putFile(path: String, contents: Data, mode: Int = 0o644,
+                 ifAbsent: Bool = false, timeout: TimeInterval = 30) async throws -> Bool {
+        let requestID = UUID().uuidString.lowercased()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Bool, Error>) in
+            putLock.lock()
+            pendingFilePuts[requestID] = { cont.resume(with: $0) }
+            putLock.unlock()
+            do {
+                try sendObject([
+                    "type": "file.put",
+                    "request_id": requestID,
+                    "path": path,
+                    "content_b64": contents.base64EncodedString(),
+                    "mode": mode,
+                    "if_absent": ifAbsent
+                ])
+            } catch {
+                resolveFilePut(requestID: requestID,
+                               result: .failure(.bridgeUnavailable("file.put send failed: \(error)")))
+                return
+            }
+            // An old guest bridge (pre-file.put) answers with an untyped error
+            // and no request ID; the timeout keeps the host from hanging.
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
+                self?.resolveFilePut(requestID: requestID,
+                                     result: .failure(.bridgeUnavailable(
+                                        "file.put timed out — guest bridge may predate pack support (Reset the agent)")))
+            }
+        }
+    }
+
+    /// Resolution is exactly-once: whichever of reply / send-failure / timeout
+    /// removes the pending entry first gets to resume the continuation.
+    private func resolveFilePut(requestID: String, result: Result<Bool, ChariotError>) {
+        putLock.lock()
+        let completion = pendingFilePuts.removeValue(forKey: requestID)
+        putLock.unlock()
+        completion?(result)
+    }
+
+    private func failAllFilePuts(_ reason: String) {
+        putLock.lock()
+        let pending = pendingFilePuts.values
+        pendingFilePuts.removeAll()
+        putLock.unlock()
+        pending.forEach { $0(.failure(.bridgeUnavailable(reason))) }
+    }
+
     // MARK: Receiving
 
     private func readLoop() {
@@ -102,6 +156,7 @@ final class BridgeClient: @unchecked Sendable {
         while true {
             let count = read(fd, &chunk, chunk.count)
             if count <= 0 {
+                failAllFilePuts("bridge disconnected")
                 handler(.disconnected(count == 0 ? "eof" : String(cString: strerror(errno))))
                 return
             }
@@ -155,6 +210,14 @@ final class BridgeClient: @unchecked Sendable {
             handler(.outputCompleted(requestID: object["request_id"] as? String ?? "",
                                      conversationID: object["conversation_id"] as? String ?? "",
                                      exitCode: object["exit_code"] as? Int ?? 0))
+        case "file.put.result":
+            let requestID = object["request_id"] as? String ?? ""
+            if object["ok"] as? Bool == true {
+                resolveFilePut(requestID: requestID, result: .success(object["written"] as? Bool ?? true))
+            } else {
+                resolveFilePut(requestID: requestID,
+                               result: .failure(.io(object["error"] as? String ?? "file.put failed")))
+            }
         case "pong":
             handler(.pong)
         case "error":

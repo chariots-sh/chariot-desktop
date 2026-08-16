@@ -1,0 +1,13 @@
+{
+  "id": "com.protocols.guardian",
+  "name": "Guardian",
+  "version": "1.0.0",
+  "vm": { "cpus": 2, "memoryMB": 2048, "diskGB": 8 },
+  "workspace": [
+    { "src": "AGENTS.md", "dest": "/workspace/AGENTS.md" },
+    { "src": "SOUL.md", "dest": "/workspace/SOUL.md" },
+    { "src": "MEMORY.seed.md", "dest": "/workspace/MEMORY.md", "seedOnly": true },
+    { "src": "skills", "dest": "/workspace/skills" },
+    { "src": "tools", "dest": "/workspace/tools" }
+  ]
+}

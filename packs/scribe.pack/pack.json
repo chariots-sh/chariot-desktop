@@ -1,0 +1,11 @@
+{
+  "id": "com.protocols.scribe",
+  "name": "Scribe",
+  "version": "1.0.0",
+  "vm": { "cpus": 2, "memoryMB": 2048, "diskGB": 8 },
+  "workspace": [
+    { "src": "AGENTS.md", "dest": "/workspace/AGENTS.md" },
+    { "src": "MEMORY.seed.md", "dest": "/workspace/MEMORY.md", "seedOnly": true },
+    { "src": "tools", "dest": "/workspace/tools" }
+  ]
+}

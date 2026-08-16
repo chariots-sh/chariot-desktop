@@ -46,8 +46,18 @@ public final class VirtualMachineBackend: SandboxBackend, @unchecked Sendable {
     // MARK: SandboxBackend
 
     public func create(configuration: SandboxConfiguration) async throws -> SandboxID {
-        let id = String(UUID().uuidString.prefix(8)).lowercased()
+        try await createInstance(configuration: configuration,
+                                 id: String(UUID().uuidString.prefix(8)).lowercased())
+    }
+
+    /// Create with a caller-chosen instance ID. Agents pass their full UUID:
+    /// the instance UUID minted at agent creation is the durable identity and
+    /// routing key (Milestone 1), so it names the on-disk instance too.
+    public func createInstance(configuration: SandboxConfiguration, id: SandboxID) async throws -> SandboxID {
         let instance = InstancePaths(directory: paths.instanceDirectory(id))
+        guard !FileManager.default.fileExists(atPath: instance.configuration.path) else {
+            throw ChariotError.invalidState("instance \(id) already exists")
+        }
         try FileManager.default.createDirectory(at: instance.directory, withIntermediateDirectories: true)
         try JSONEncoder().encode(configuration).write(to: instance.configuration)
 
@@ -93,7 +103,10 @@ public final class VirtualMachineBackend: SandboxBackend, @unchecked Sendable {
             throw ChariotError.instanceNotFound(id)
         }
         for stale in [instance.writableDisk, instance.efiVariableStore, instance.seedISO,
-                      instance.accessKey, instance.accessKeyPublic, instance.knownHosts] {
+                      instance.accessKey, instance.accessKeyPublic, instance.knownHosts,
+                      instance.packState] {
+            // pack-state.json goes too: the re-cloned disk has no pack
+            // content, so the next boot must replay the full workspace.
             try? FileManager.default.removeItem(at: stale)
         }
         try SeedBuilder.createWritableDisk(base: URL(fileURLWithPath: configuration.baseImagePath),

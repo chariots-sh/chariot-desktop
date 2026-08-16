@@ -1,10 +1,11 @@
 import SwiftUI
 import AppKit
+import ChariotCore
 import CoreImage.CIFilterBuiltins
 
 struct ContentView: View {
     @EnvironmentObject var model: AppModel
-    @State private var selection: String? = "sandbox"
+    @State private var selection: String?
 
     var body: some View {
         if let fatal = model.fatalError {
@@ -36,27 +37,41 @@ struct ContentView: View {
                     .padding(.bottom, 10)
 
                     List(selection: $selection) {
-                        SidebarRow(icon: "shippingbox", title: "Sandbox").tag("sandbox")
-                        SidebarRow(icon: "bubble.left.and.bubble.right", title: "Conversation").tag("chat")
-                        SidebarRow(icon: "network", title: "Tailscale").tag("tailscale")
-                        SidebarRow(icon: "iphone", title: "Devices").tag("devices")
-                        SidebarRow(icon: "terminal", title: "Developer Access").tag("dev")
-                        SidebarRow(icon: "list.bullet.rectangle", title: "Activity").tag("log")
+                        Section("agents") {
+                            ForEach(model.agents) { agent in
+                                AgentSidebarRow(agent: agent).tag("agent:\(agent.id)")
+                            }
+                            Button {
+                                model.refresh()
+                                model.showCreateSheet = true
+                            } label: {
+                                Label {
+                                    Text("New Agent").font(.system(size: 13))
+                                } icon: {
+                                    Image(systemName: "plus.circle").foregroundStyle(Theme.accent)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .padding(.vertical, 2)
+                        }
+                        Section("system") {
+                            SidebarRow(icon: "network", title: "Tailscale").tag("tailscale")
+                            SidebarRow(icon: "list.bullet.rectangle", title: "Activity").tag("log")
+                        }
                     }
                     .listStyle(.sidebar)
                     .scrollContentBackground(.hidden)
                 }
                 .background(Theme.sidebar)
-                .navigationSplitViewColumnWidth(min: 190, ideal: 210)
+                .navigationSplitViewColumnWidth(min: 210, ideal: 240)
             } detail: {
                 Group {
                     switch selection {
-                    case "chat": ConversationView()
                     case "tailscale": TailscaleView()
-                    case "devices": DevicesView()
-                    case "dev": DeveloperAccessView()
                     case "log": ActivityView()
-                    default: SandboxView()
+                    case .some(let tag) where tag.hasPrefix("agent:"):
+                        AgentDetailView(agentID: String(tag.dropFirst("agent:".count)))
+                    default: FleetHomeView()
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -67,6 +82,9 @@ struct ContentView: View {
             .sheet(isPresented: Binding(get: { model.pairingPayloadJSON != nil },
                                         set: { if !$0 { model.pairingPayloadJSON = nil } })) {
                 PairingSheet()
+            }
+            .sheet(isPresented: $model.showCreateSheet) {
+                CreateAgentSheet()
             }
             .alert("Pair new device?", isPresented: Binding(get: { model.approvalRequest != nil },
                                                             set: { _ in })) {
@@ -80,6 +98,12 @@ struct ContentView: View {
                 }
             } message: {
                 Text("\(model.approvalRequest?.name ?? "") wants to pair.\nFingerprint: \(model.approvalRequest?.fingerprint ?? "")\n\nApprove only if this matches the phone's fingerprint.")
+            }
+            .alert("Something went wrong", isPresented: Binding(get: { model.errorMessage != nil },
+                                                                set: { if !$0 { model.errorMessage = nil } })) {
+                Button("OK") { model.errorMessage = nil }
+            } message: {
+                Text(model.errorMessage ?? "")
             }
             .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
                 model.refresh()
@@ -97,6 +121,35 @@ struct SidebarRow: View {
             Text(title).font(.system(size: 13))
         } icon: {
             Image(systemName: icon).foregroundStyle(Theme.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+struct AgentSidebarRow: View {
+    let agent: AgentViewState
+
+    var stateColor: Color {
+        switch agent.vmState {
+        case .running: return Theme.green
+        case .starting, .stopping: return Theme.amber
+        case .failed: return Theme.red
+        default: return Theme.secondary
+        }
+    }
+
+    var subtitle: String {
+        guard agent.vmState == .running else { return agent.vmState.rawValue }
+        return agent.codexSignedIn ? "codex signed in" : "codex signed out"
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle().fill(stateColor).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(agent.name).font(.system(size: 13, weight: .medium))
+                Text(subtitle).font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+            }
         }
         .padding(.vertical, 2)
     }
@@ -128,13 +181,110 @@ struct Page<Content: View>: View {
     }
 }
 
-// MARK: - Sandbox
+// MARK: - Fleet home (no agent selected)
 
-struct SandboxView: View {
+struct FleetHomeView: View {
     @EnvironmentObject var model: AppModel
 
+    var body: some View {
+        Page(hash: "agents", title: "Agents") {
+            Card(title: "your agents", subtitle: "Each agent runs its own disposable Linux VM, populated from a pack") {
+                VStack(alignment: .leading, spacing: 8) {
+                    if model.agents.isEmpty {
+                        Text("No agents yet. Drop a pack folder into the packs directory and create one.")
+                            .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                    } else {
+                        ForEach(model.agents) { agent in
+                            HStack {
+                                AgentSidebarRow(agent: agent)
+                                Spacer()
+                                Text(agent.packID).font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                            }
+                        }
+                    }
+                    HStack {
+                        Button("New Agent") {
+                            model.refresh()
+                            model.showCreateSheet = true
+                        }
+                        .buttonStyle(AccentButtonStyle())
+                        Spacer()
+                        Text(model.statusLine).font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                    }
+                    .padding(.top, 6)
+                }
+            }
+            Card(title: "packs directory") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(model.hub?.paths.packsDirectory.path ?? "—")
+                        .font(Theme.mono(11)).foregroundStyle(Theme.green)
+                        .textSelection(.enabled)
+                    Text("A pack is a folder with pack.json, markdown (AGENTS.md, SOUL.md, MEMORY.seed.md), skills/, and tools/. Editing a pack updates its agents on their next turn.")
+                        .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                }
+            }
+        }
+    }
+}
+
+struct CreateAgentSheet: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SectionHash(title: "new agent")
+            Text("Create an agent from a pack")
+                .font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.text)
+            if model.packs.isEmpty {
+                Text("No packs found in\n\(model.hub?.paths.packsDirectory.path ?? "-")\n\nDrop a pack folder (e.g. guardian.pack) there and reopen this sheet.")
+                    .font(Theme.mono(11)).foregroundStyle(Theme.secondary)
+            } else {
+                ForEach(model.packs) { pack in
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(pack.name).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
+                            Text("\(pack.packID) · v\(pack.version) · \(pack.dir)")
+                                .font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                        }
+                        Spacer()
+                        Button("Create") {
+                            model.createAgent(fromPack: pack.dir)
+                            model.showCreateSheet = false
+                        }
+                        .buttonStyle(AccentButtonStyle())
+                    }
+                    .padding(.vertical, 4)
+                    if pack.id != model.packs.last?.id {
+                        Divider().overlay(Theme.border)
+                    }
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Close") { model.showCreateSheet = false }
+                    .buttonStyle(OutlineButtonStyle())
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+        .background(Theme.bg)
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Agent detail
+
+struct AgentDetailView: View {
+    @EnvironmentObject var model: AppModel
+    let agentID: String
+    @State private var draft = ""
+    @State private var showControls = false
+
+    var agent: AgentViewState? { model.agent(agentID) }
+
     var stateColor: Color {
-        switch model.vmState {
+        switch agent?.vmState {
         case .running: return Theme.green
         case .starting, .stopping: return Theme.amber
         case .failed: return Theme.red
@@ -143,113 +293,175 @@ struct SandboxView: View {
     }
 
     var body: some View {
-        Page(hash: "sandbox", title: "Sandbox") {
-            Card(title: "chariot sandbox", subtitle: "Disposable Debian VM · Virtualization.framework") {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        Chip(text: model.vmState.rawValue, color: stateColor)
-                        if model.bridgeConnected { Chip(text: "bridge connected", color: Theme.green) }
-                        Spacer()
-                        if model.busy { ProgressView().controlSize(.small) }
+        if let agent {
+            VStack(spacing: 0) {
+                header(agent)
+                Divider().overlay(Theme.border)
+                if showControls {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            controlsCard(agent)
+                            devicesCard(agent)
+                            developerCard(agent)
+                        }
+                        .padding(20)
+                        .frame(maxWidth: 760, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    KVRow(key: "kernel", value: model.guestKernel.isEmpty ? "—" : model.guestKernel)
-                    KVRow(key: "transport", value: model.transportMode)
-                    KVRow(key: "fingerprint", value: model.macFingerprint)
-                    KVRow(key: "status", value: model.statusLine, valueColor: Theme.secondary)
-                    HStack(spacing: 8) {
-                        Button("Start") { model.startSandbox() }
+                } else {
+                    chat(agent)
+                }
+            }
+            .background(Theme.bg)
+        } else {
+            Text("Agent not found").foregroundStyle(Theme.secondary)
+        }
+    }
+
+    private func header(_ agent: AgentViewState) -> some View {
+        HStack(spacing: 10) {
+            SectionHash(title: agent.name.lowercased())
+            Chip(text: agent.vmState.rawValue, color: stateColor)
+            if agent.bridgeConnected {
+                Chip(text: agent.codexSignedIn ? "codex signed in" : "codex signed out",
+                     color: agent.codexSignedIn ? Theme.green : Theme.amber)
+            }
+            if model.busyAgents.contains(agent.id) { ProgressView().controlSize(.small) }
+            Spacer()
+            Picker("", selection: $showControls) {
+                Text("Chat").tag(false)
+                Text("Manage").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 170)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
+    private func controlsCard(_ agent: AgentViewState) -> some View {
+        Card(title: "sandbox", subtitle: "Pack \(agent.packID) · instance \(agent.id.prefix(8))") {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Button("Start") { model.startAgent(agent.id) }
+                        .buttonStyle(AccentButtonStyle())
+                        .disabled(model.busyAgents.contains(agent.id) || agent.vmState == .running)
+                    Button("Stop") { model.stopAgent(agent.id) }
+                        .buttonStyle(OutlineButtonStyle())
+                        .disabled(model.busyAgents.contains(agent.id) || agent.vmState != .running)
+                    Spacer()
+                    Button("Reset") { model.resetAgent(agent.id) }
+                        .buttonStyle(AccentButtonStyle(danger: true))
+                        .disabled(model.busyAgents.contains(agent.id))
+                        .help("Re-clone the disk and repopulate the workspace from the pack")
+                }
+                Divider().overlay(Theme.border)
+                HStack(spacing: 8) {
+                    if agent.codexSignedIn {
+                        Chip(text: "codex \(agent.codexVersion)", color: Theme.green)
+                    } else if model.signInProgress.contains(agent.id) {
+                        ProgressView().controlSize(.small)
+                        Button("Cancel sign-in") { model.cancelSignIn(agent.id) }
+                            .buttonStyle(OutlineButtonStyle())
+                    } else {
+                        Button("Sign in Codex") { model.signInCodex(agent.id) }
                             .buttonStyle(AccentButtonStyle())
-                            .disabled(model.busy || model.vmState == .running)
-                        Button("Stop") { model.stopSandbox() }
-                            .buttonStyle(OutlineButtonStyle())
-                            .disabled(model.busy || model.vmState != .running)
-                        Button("Restart") { model.restartSandbox() }
-                            .buttonStyle(OutlineButtonStyle())
-                            .disabled(model.busy || model.vmState != .running)
-                        Spacer()
-                        Button("Reset") { model.resetSandbox() }
-                            .buttonStyle(AccentButtonStyle(danger: true))
-                            .disabled(model.busy)
-                            .help("Discard all guest changes and credentials")
+                            .disabled(!agent.codexInstalled || !agent.bridgeConnected)
                     }
-                    .padding(.top, 6)
+                    Spacer()
                 }
+                Text("Sign-in uses your ChatGPT account via the browser; the session lives only inside this agent's sandbox and is erased by Reset.")
+                    .font(.system(size: 11)).foregroundStyle(Theme.secondary)
             }
+        }
+    }
 
-            Card(title: "agent — codex", subtitle: "Runs inside the sandbox as user `agent` in /workspace") {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        if model.agentSignedIn {
-                            Chip(text: "signed in", color: Theme.green)
-                        } else if model.agentInstalled {
-                            Chip(text: "signed out", color: Theme.amber)
-                        } else {
-                            Chip(text: model.vmState == .running ? "installing…" : "sandbox stopped",
-                                 color: Theme.secondary)
-                        }
-                        if !model.agentVersion.isEmpty {
-                            Text(model.agentVersion)
-                                .font(Theme.mono(11)).foregroundStyle(Theme.secondary)
-                        }
-                        Spacer()
-                        if model.signInInProgress && !model.agentSignedIn {
-                            ProgressView().controlSize(.small)
-                            Button("Cancel") {
-                                model.hub?.cancelCodexLogin()
-                                model.signInInProgress = false
+    private func devicesCard(_ agent: AgentViewState) -> some View {
+        Card(title: "paired devices", subtitle: "Pairing is per agent — scanning this QR binds a phone to \(agent.name) only") {
+            VStack(alignment: .leading, spacing: 10) {
+                if agent.devices.isEmpty {
+                    Text("No paired devices yet.")
+                        .font(Theme.mono(12)).foregroundStyle(Theme.secondary)
+                } else {
+                    ForEach(agent.devices) { device in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 8) {
+                                    Text(device.name)
+                                        .font(.system(size: 13, weight: .semibold))
+                                        .foregroundStyle(Theme.text)
+                                        .strikethrough(device.revoked)
+                                    if device.revoked { Chip(text: "revoked", color: Theme.red) }
+                                }
+                                Text("\(device.fingerprint) · paired \(device.pairedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(Theme.mono(10)).foregroundStyle(Theme.secondary)
                             }
-                            .buttonStyle(OutlineButtonStyle())
-                        } else if !model.agentSignedIn {
-                            Button("Sign in Codex") { model.signInCodex() }
-                                .buttonStyle(AccentButtonStyle())
-                                .disabled(!model.agentInstalled || !model.bridgeConnected)
+                            Spacer()
+                            if !device.revoked {
+                                Button("Revoke") { model.revoke(device.id, agentID: agent.id) }
+                                    .buttonStyle(AccentButtonStyle(danger: true))
+                            }
+                        }
+                        .padding(.vertical, 4)
+                        if device.id != agent.devices.last?.id {
+                            Divider().overlay(Theme.border)
                         }
                     }
-                    Text("Sign-in uses your ChatGPT account via the browser; the session lives only inside the sandbox and is erased by Reset.")
-                        .font(.system(size: 11)).foregroundStyle(Theme.secondary)
                 }
+                Button("Show pairing QR") { model.startPairing(agent.id) }
+                    .buttonStyle(AccentButtonStyle())
+                    .padding(.top, 6)
             }
+        }
+    }
 
-            Card(title: "about this sandbox") {
-                VStack(alignment: .leading, spacing: 6) {
-                    bullet("Separate Linux kernel; no host filesystem share.")
-                    bullet("Outbound NAT internet only — nothing exposed on your network.")
-                    bullet("Stop preserves the disk. Reset discards every guest change.")
-                    bullet("Messages to paired devices are end-to-end encrypted.")
+    private func developerCard(_ agent: AgentViewState) -> some View {
+        Card(title: "developer access", subtitle: "Localhost-only SSH, tunneled over virtio — never exposed to your network") {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Chip(text: model.devAccess[agent.id] == nil ? "locked" : "unlocked",
+                         color: model.devAccess[agent.id] == nil ? Theme.secondary : Theme.amber)
+                    Spacer()
+                    Toggle("", isOn: Binding(get: { model.devAccess[agent.id] != nil },
+                                             set: { _ in model.toggleDeveloperAccess(agent.id) }))
+                        .toggleStyle(.switch)
+                        .disabled(agent.vmState != .running)
+                }
+                Text("Unlocking SSH grants full control of this sandbox — including any credentials inside it — and bypasses agent tool approvals.")
+                    .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                if let info = model.devAccess[agent.id] {
+                    Divider().overlay(Theme.border)
+                    Text(info.command)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.green)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Theme.bg)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    HStack {
+                        Button("Copy SSH command") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(info.command, forType: .string)
+                        }
+                        .buttonStyle(OutlineButtonStyle())
+                        Button("Copy instructions for Codex") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(info.instructions, forType: .string)
+                        }
+                        .buttonStyle(OutlineButtonStyle())
+                    }
                 }
             }
         }
     }
 
-    private func bullet(_ text: String) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            Text("·").font(Theme.mono(12)).foregroundStyle(Theme.accent)
-            Text(text).font(.system(size: 12)).foregroundStyle(Theme.secondary)
-        }
-    }
-}
-
-// MARK: - Conversation
-
-struct ConversationView: View {
-    @EnvironmentObject var model: AppModel
-    @State private var draft = ""
-
-    var body: some View {
+    private func chat(_ agent: AgentViewState) -> some View {
         VStack(spacing: 0) {
-            HStack {
-                SectionHash(title: "conversation")
-                Spacer()
-                Chip(text: model.agentSignedIn ? "codex" : "agent offline",
-                     color: model.agentSignedIn ? Theme.green : Theme.amber)
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-            Divider().overlay(Theme.border)
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 10) {
-                        ForEach(model.chat) { line in
+                        ForEach(model.chats[agent.id] ?? []) { line in
                             HStack(alignment: .top) {
                                 if line.role == "user" { Spacer(minLength: 80) }
                                 Text(line.text.isEmpty ? "…" : line.text)
@@ -268,13 +480,15 @@ struct ConversationView: View {
                         }
                     }.padding(16)
                 }
-                .onChange(of: model.chat.last?.text) {
-                    if let last = model.chat.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                .onChange(of: (model.chats[agent.id] ?? []).last?.text) {
+                    if let last = (model.chats[agent.id] ?? []).last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
                 }
             }
             Divider().overlay(Theme.border)
             HStack(spacing: 8) {
-                TextField("Message Codex — ! runs a raw command", text: $draft, axis: .vertical)
+                TextField("Message \(agent.name) — ! runs a raw command", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(Theme.mono(12))
                     .foregroundStyle(Theme.text)
@@ -286,18 +500,17 @@ struct ConversationView: View {
                 Button("Send", action: send)
                     .buttonStyle(AccentButtonStyle())
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(draft.isEmpty || model.streaming)
+                    .disabled(draft.isEmpty || model.streamingAgents.contains(agent.id))
             }
             .padding(12)
         }
-        .background(Theme.bg)
     }
 
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         draft = ""
-        model.sendPrompt(text)
+        model.sendPrompt(text, to: agentID)
     }
 }
 
@@ -327,8 +540,10 @@ struct TailscaleView: View {
                     }
                     KVRow(key: "machine name", value: model.tailnetInfo?.dnsName ?? "—")
                     KVRow(key: "tailnet", value: model.tailnetInfo?.tailnet ?? "—")
+                    KVRow(key: "transport", value: model.transportMode)
                     KVRow(key: "tls", value: tlsDescription)
                     KVRow(key: "key expires", value: keyExpiryDescription)
+                    KVRow(key: "mac fingerprint", value: model.macFingerprint)
 
                     if case .needsLogin = model.tailnetStatus {
                         Text("This Mac needs to join your tailnet. Sign in with the same Tailscale account your iPhone uses.")
@@ -366,7 +581,7 @@ struct TailscaleView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     bullet("Install the official Tailscale app on your iPhone and sign in to the same tailnet.")
                     bullet("The agent service is reachable only inside your tailnet on TCP 443 — never on your LAN or the public internet.")
-                    bullet("Tailnet access is transport only: phones still pair by QR code, and every message stays end-to-end encrypted.")
+                    bullet("Tailnet access is transport only: phones still pair by QR code — per agent — and every message stays end-to-end encrypted.")
                     bullet("Tailscale is free for personal use (up to 6 users); commercial deployments need a paid plan.")
                 }
             }
@@ -396,59 +611,6 @@ struct TailscaleView: View {
         HStack(alignment: .top, spacing: 8) {
             Text("·").font(Theme.mono(12)).foregroundStyle(Theme.accent)
             Text(text).font(.system(size: 12)).foregroundStyle(Theme.secondary)
-        }
-    }
-}
-
-// MARK: - Devices
-
-struct DevicesView: View {
-    @EnvironmentObject var model: AppModel
-
-    var body: some View {
-        Page(hash: "paired devices", title: "Devices") {
-            Card(title: "paired devices", subtitle: "Each device holds its own keys and can be revoked independently") {
-                VStack(alignment: .leading, spacing: 10) {
-                    if model.devices.isEmpty {
-                        Text("No paired devices yet.")
-                            .font(Theme.mono(12)).foregroundStyle(Theme.secondary)
-                    } else {
-                        ForEach(model.devices, id: \.id) { device in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    HStack(spacing: 8) {
-                                        Text(device.name)
-                                            .font(.system(size: 13, weight: .semibold))
-                                            .foregroundStyle(Theme.text)
-                                            .strikethrough(device.revoked)
-                                        if device.revoked { Chip(text: "revoked", color: Theme.red) }
-                                    }
-                                    Text("\(device.fingerprint) · paired \(device.pairedAt.formatted(date: .abbreviated, time: .shortened))")
-                                        .font(Theme.mono(10)).foregroundStyle(Theme.secondary)
-                                }
-                                Spacer()
-                                if !device.revoked {
-                                    Button("Revoke") { model.revoke(device.id) }
-                                        .buttonStyle(AccentButtonStyle(danger: true))
-                                }
-                            }
-                            .padding(.vertical, 4)
-                            if device.id != model.devices.last?.id {
-                                Divider().overlay(Theme.border)
-                            }
-                        }
-                    }
-                    Button("Pair new device") { model.startPairing() }
-                        .buttonStyle(AccentButtonStyle())
-                        .padding(.top, 6)
-                }
-            }
-        }
-        .alert("Can't pair right now", isPresented: Binding(get: { model.pairingErrorMessage != nil },
-                                                            set: { if !$0 { model.pairingErrorMessage = nil } })) {
-            Button("OK") { model.pairingErrorMessage = nil }
-        } message: {
-            Text(model.pairingErrorMessage ?? "")
         }
     }
 }
@@ -484,7 +646,7 @@ struct PairingSheet: View {
                     .background(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
             }
-            Text("Expires in 2 minutes · single use\nMac fingerprint \(model.macFingerprint)")
+            Text("Expires in 2 minutes · single use · pairs to this agent only\nMac fingerprint \(model.macFingerprint)")
                 .font(Theme.mono(11))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(Theme.secondary)
@@ -503,55 +665,6 @@ struct PairingSheet: View {
         .frame(width: 360)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
-    }
-}
-
-// MARK: - Developer access
-
-struct DeveloperAccessView: View {
-    @EnvironmentObject var model: AppModel
-
-    var body: some View {
-        Page(hash: "developer access", title: "Developer Access") {
-            Card(title: "ssh + scp", subtitle: "Localhost-only, tunneled over virtio — never exposed to your network") {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Chip(text: model.developerAccessInfo == nil ? "locked" : "unlocked",
-                             color: model.developerAccessInfo == nil ? Theme.secondary : Theme.amber)
-                        Spacer()
-                        Toggle("", isOn: Binding(get: { model.developerAccessInfo != nil },
-                                                 set: { _ in model.toggleDeveloperAccess() }))
-                            .toggleStyle(.switch)
-                            .disabled(model.vmState != .running)
-                    }
-                    Text("Unlocking SSH grants full control of the sandbox — including any credentials inside it — and bypasses agent tool approvals.")
-                        .font(.system(size: 11)).foregroundStyle(Theme.secondary)
-                    if let info = model.developerAccessInfo {
-                        Divider().overlay(Theme.border)
-                        Text(info.command)
-                            .font(Theme.mono(11))
-                            .foregroundStyle(Theme.green)
-                            .textSelection(.enabled)
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Theme.bg)
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                        HStack {
-                            Button("Copy SSH command") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(info.command, forType: .string)
-                            }
-                            .buttonStyle(OutlineButtonStyle())
-                            Button("Copy instructions for Codex") {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(info.instructions, forType: .string)
-                            }
-                            .buttonStyle(OutlineButtonStyle())
-                        }
-                    }
-                }
-            }
-        }
     }
 }
 

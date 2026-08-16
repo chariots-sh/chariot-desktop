@@ -12,6 +12,7 @@ Port 1022: OAuth-callback tunnel → Codex login server (127.0.0.1:1455), used
            while the host browser completes the ChatGPT sign-in (design §3.1).
 """
 
+import base64
 import json
 import os
 import pwd
@@ -288,6 +289,53 @@ def run_shell_debug(command, conversation_id, delta, completed):
     completed(proc.returncode or 0)
 
 
+def handle_file_put(conn_file, write_lock, request):
+    """Install one file into the workspace (Milestone 1: agent packs).
+
+    The host pushes pack content (markdown, skills, tool scripts) through this
+    op. Paths are restricted to /workspace, parent directories are created and
+    handed to the agent user, and the write is atomic (temp file + rename).
+    `if_absent` skips files that already exist, which is how seed-only content
+    (e.g. MEMORY.md) survives re-populates without being overwritten.
+    """
+    request_id = request.get("request_id", "")
+
+    def result(ok, error=None, written=True):
+        with write_lock:
+            send(conn_file, {"type": "file.put.result", "version": PROTOCOL_VERSION,
+                             "request_id": request_id, "ok": ok,
+                             "written": ok and written, "error": error})
+
+    path = os.path.normpath(request.get("path", ""))
+    if not path.startswith(WORKSPACE + "/"):
+        result(False, f"path must be under {WORKSPACE}")
+        return
+    try:
+        content = base64.b64decode(request.get("content_b64", ""), validate=True)
+    except (ValueError, TypeError) as e:
+        result(False, f"invalid base64 body: {e}")
+        return
+    if request.get("if_absent") and os.path.lexists(path):
+        result(True, written=False)
+        return
+    try:
+        info = pwd.getpwnam(AGENT_USER)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        parent = os.path.dirname(path)
+        while parent != WORKSPACE and parent.startswith(WORKSPACE):
+            os.chown(parent, info.pw_uid, info.pw_gid)
+            parent = os.path.dirname(parent)
+        tmp = path + ".chariot-put"
+        with open(tmp, "wb") as f:
+            f.write(content)
+        os.chmod(tmp, int(request.get("mode", 0o644)))
+        os.chown(tmp, info.pw_uid, info.pw_gid)
+        os.replace(tmp, path)
+        result(True)
+    except OSError as e:
+        result(False, str(e))
+
+
 def cancel_conversation(conversation_id):
     with state_lock:
         proc = cancel_procs.get(conversation_id)
@@ -406,6 +454,10 @@ def handle_agent_connection(conn):
                 elif rtype == "sandbox.status":
                     with write_lock:
                         send(conn_file, sandbox_status())
+                elif rtype == "file.put":
+                    # Inline (not threaded): pack pushes stay ordered ahead of
+                    # any conversation.send that follows them.
+                    handle_file_put(conn_file, write_lock, request)
                 elif rtype == "oauth.start":
                     threading.Thread(target=start_login,
                                      args=(conn_file, write_lock), daemon=True).start()

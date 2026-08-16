@@ -12,7 +12,7 @@ struct ChariotApp: App {
         WindowGroup("Chariot Desktop") {
             ContentView()
                 .environmentObject(model)
-                .frame(minWidth: 900, minHeight: 600)
+                .frame(minWidth: 960, minHeight: 620)
         }
     }
 }
@@ -32,27 +32,54 @@ struct ChatLine: Identifiable {
     var text: String
 }
 
+struct DeviceRow: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let fingerprint: String
+    let pairedAt: Date
+    let revoked: Bool
+}
+
+/// One agent in the sidebar/detail: fleet summary plus GUI-only state.
+struct AgentViewState: Identifiable, Equatable {
+    let id: String            // instance UUID
+    var name: String
+    var packID: String
+    var packDir: String
+    var vmState: SandboxState
+    var bridgeConnected: Bool
+    var codexInstalled: Bool
+    var codexSignedIn: Bool
+    var codexVersion: String
+    var devices: [DeviceRow]
+}
+
+struct PackRow: Identifiable, Equatable {
+    var id: String { dir }
+    let dir: String
+    let packID: String
+    let name: String
+    let version: String
+}
+
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var vmState: SandboxState = .notCreated
-    @Published var bridgeConnected = false
-    @Published var guestKernel = ""
-    @Published var busy = false
+    @Published var agents: [AgentViewState] = []
+    @Published var packs: [PackRow] = []
+    @Published var chats: [String: [ChatLine]] = [:]      // agent id → transcript
+    @Published var streamingAgents: Set<String> = []
+    @Published var busyAgents: Set<String> = []
+    @Published var signInProgress: Set<String> = []
+    @Published var devAccess: [String: (port: UInt16, command: String, instructions: String)] = [:]
     @Published var statusLine = "Starting…"
-    @Published var chat: [ChatLine] = []
-    @Published var streaming = false
     @Published var pairingPayloadJSON: String?
-    @Published var devices: [(id: String, name: String, pairedAt: Date, revoked: Bool, fingerprint: String)] = []
     @Published var approvalRequest: (name: String, fingerprint: String, respond: @Sendable (Bool) -> Void)?
-    @Published var developerAccessInfo: (port: UInt16, command: String, instructions: String)?
-    @Published var agentInstalled = false
-    @Published var agentVersion = ""
-    @Published var agentSignedIn = false
-    @Published var signInInProgress = false
     @Published var eventLog: [String] = []
     @Published var fatalError: String?
+    @Published var errorMessage: String?
     @Published var tailnetStatus: TailnetStatus = .stopped
     @Published var tailnetInfo: TailnetInfo?
+    @Published var showCreateSheet = false
 
     private(set) var hub: ChariotHub?
 
@@ -85,12 +112,13 @@ final class AppModel: ObservableObject {
 
             let hub = try ChariotHub(paths: ChariotPaths(dataDirectory: dataDir, guestResources: guestResources))
             hub.autoApprovePairing = false
+            hub.defaultBaseImagePath = baseImagePath
             self.hub = hub
             hub.onEvent = { [weak self] message in
                 Task { @MainActor in
                     self?.eventLog.append(message)
                     if self!.eventLog.count > 200 { self!.eventLog.removeFirst() }
-                    self?.refreshDevices()
+                    self?.refresh()
                 }
             }
             hub.onDeviceApprovalRequest = { [weak self] response, respond in
@@ -123,20 +151,8 @@ final class AppModel: ObservableObject {
                 }
             }
 
-            refreshDevices()
-            statusLine = "Transport on 127.0.0.1:\(hub.transportPort). Sandbox stopped."
-            vmState = hub.vmState
-            // Adopt an existing instance so the UI reflects it before Start.
-            if !hub.backend.existingInstanceIDs().isEmpty {
-                let imagePath = baseImagePath
-                Task {
-                    _ = try? await hub.ensureInstance(configuration: SandboxConfiguration(baseImagePath: imagePath))
-                    await MainActor.run {
-                        self.refresh()
-                        self.statusLine = "Sandbox ready — press Start to boot it."
-                    }
-                }
-            }
+            refresh()
+            statusLine = "Transport on 127.0.0.1:\(hub.transportPort)."
         } catch {
             fatalError = "Failed to start Chariot core: \(error)"
         }
@@ -167,21 +183,158 @@ final class AppModel: ObservableObject {
 
     func refresh() {
         guard let hub else { return }
-        vmState = hub.vmState
-        bridgeConnected = hub.bridgeConnected
-        guestKernel = hub.lastGuestStatus?.kernel ?? ""
         tailnetStatus = hub.tailnetStatus
         tailnetInfo = hub.tailnet?.info
-        if let agent = hub.agentStatus {
-            agentInstalled = agent.installed
-            agentVersion = agent.version ?? ""
-            agentSignedIn = agent.loggedIn
-            if agent.loggedIn { signInInProgress = false }
-        } else {
-            agentInstalled = false
-            agentSignedIn = false
+        agents = hub.agentSummaries().map { summary in
+            AgentViewState(id: summary.record.instanceID,
+                           name: summary.record.displayName,
+                           packID: summary.record.packID,
+                           packDir: summary.record.packDirectoryName,
+                           vmState: summary.vmState,
+                           bridgeConnected: summary.bridgeConnected,
+                           codexInstalled: summary.agentStatus?.installed ?? false,
+                           codexSignedIn: summary.agentStatus?.loggedIn ?? false,
+                           codexVersion: summary.agentStatus?.version ?? "",
+                           devices: hub.pairedDevices(instanceID: summary.record.instanceID).map {
+                               DeviceRow(id: $0.id, name: $0.name, fingerprint: $0.fingerprint,
+                                         pairedAt: $0.pairedAt, revoked: $0.revoked)
+                           })
         }
-        refreshDevices()
+        for agent in agents where agent.codexSignedIn {
+            signInProgress.remove(agent.id)
+        }
+        packs = PackLoader.availablePacks(in: hub.paths.packsDirectory).map {
+            PackRow(dir: $0.directoryName, packID: $0.manifest.id,
+                    name: $0.manifest.name, version: $0.manifest.version)
+        }
+    }
+
+    func agent(_ id: String) -> AgentViewState? {
+        agents.first { $0.id == id }
+    }
+
+    // MARK: Fleet actions
+
+    func createAgent(fromPack dir: String) {
+        guard let hub else { return }
+        statusLine = "Creating agent from \(dir)…"
+        Task {
+            do {
+                let record = try await hub.createAgent(fromPackDirectory: dir)
+                await MainActor.run {
+                    self.statusLine = "\(record.displayName) created — press Start to boot it."
+                    self.refresh()
+                }
+            } catch {
+                await MainActor.run { self.errorMessage = "Create failed: \(error)" }
+            }
+        }
+    }
+
+    func startAgent(_ id: String) {
+        lifecycle(id, "Booting") { try await $0.startAgent(id) }
+    }
+
+    func stopAgent(_ id: String) {
+        lifecycle(id, "Stopping") { try await $0.stopAgent(id) }
+    }
+
+    func resetAgent(_ id: String) {
+        lifecycle(id, "Resetting (discarding all guest changes)") { try await $0.resetAgent(id) }
+    }
+
+    private func lifecycle(_ id: String, _ label: String,
+                           _ operation: @escaping @Sendable (ChariotHub) async throws -> Void) {
+        guard let hub else { return }
+        busyAgents.insert(id)
+        let name = agent(id)?.name ?? "agent"
+        statusLine = "\(label) \(name)…"
+        Task {
+            do {
+                try await operation(hub)
+                await MainActor.run { self.statusLine = "\(name): done." }
+            } catch {
+                await MainActor.run { self.statusLine = "\(name): \(label.lowercased()) failed: \(error)" }
+            }
+            await MainActor.run {
+                self.busyAgents.remove(id)
+                self.refresh()
+            }
+        }
+    }
+
+    func sendPrompt(_ text: String, to agentID: String) {
+        guard let hub else { return }
+        chats[agentID, default: []].append(ChatLine(role: "user", text: text))
+        chats[agentID, default: []].append(ChatLine(role: "agent", text: ""))
+        let agentLineIndex = chats[agentID]!.count - 1
+        streamingAgents.insert(agentID)
+        do {
+            try hub.sendLocalPrompt(text, instanceID: agentID, onDelta: { [weak self] delta in
+                Task { @MainActor in
+                    guard let self, self.chats[agentID]?.indices.contains(agentLineIndex) == true else { return }
+                    self.chats[agentID]![agentLineIndex].text += delta
+                }
+            }, onCompleted: { [weak self] code in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.streamingAgents.remove(agentID)
+                    if code != 0, self.chats[agentID]?.indices.contains(agentLineIndex) == true {
+                        self.chats[agentID]![agentLineIndex].text += "\n[exit code \(code)]"
+                    }
+                }
+            })
+        } catch {
+            chats[agentID]![agentLineIndex] = ChatLine(role: "system",
+                                                       text: "Sandbox not running: press Start first.")
+            streamingAgents.remove(agentID)
+        }
+    }
+
+    func signInCodex(_ agentID: String) {
+        guard let hub else { return }
+        do {
+            try hub.startCodexLogin(instanceID: agentID)
+            signInProgress.insert(agentID)
+            statusLine = "Complete the ChatGPT sign-in in your browser…"
+        } catch {
+            errorMessage = "Sign-in failed to start: \(error)"
+        }
+    }
+
+    func cancelSignIn(_ agentID: String) {
+        hub?.cancelCodexLogin(instanceID: agentID)
+        signInProgress.remove(agentID)
+    }
+
+    func startPairing(_ agentID: String) {
+        guard let hub else { return }
+        do {
+            let payload = try hub.startPairingSession(instanceID: agentID)
+            let json = try CanonicalCoding.encode(payload)
+            pairingPayloadJSON = String(data: json, encoding: .utf8)
+        } catch {
+            errorMessage = "\(error)"
+        }
+    }
+
+    func revoke(_ deviceID: String, agentID: String) {
+        hub?.revokeDevice(deviceID, instanceID: agentID)
+        refresh()
+    }
+
+    func toggleDeveloperAccess(_ agentID: String) {
+        guard let hub else { return }
+        if devAccess[agentID] != nil {
+            hub.disableDeveloperAccess(instanceID: agentID)
+            devAccess[agentID] = nil
+        } else {
+            do {
+                devAccess[agentID] = try hub.enableDeveloperAccess(instanceID: agentID)
+            } catch {
+                errorMessage = "Developer access failed: \(error)"
+            }
+        }
     }
 
     // MARK: Tailscale controls
@@ -228,127 +381,5 @@ final class AppModel: ObservableObject {
 
     func openTailscaleAdmin() {
         NSWorkspace.shared.open(URL(string: "https://login.tailscale.com/admin/machines")!)
-    }
-
-    func signInCodex() {
-        guard let hub else { return }
-        do {
-            try hub.startCodexLogin()
-            signInInProgress = true
-            statusLine = "Complete the ChatGPT sign-in in your browser…"
-        } catch {
-            statusLine = "Sign-in failed to start: \(error)"
-        }
-    }
-
-    func refreshDevices() {
-        devices = hub?.pairedDevices() ?? []
-    }
-
-    func startSandbox() {
-        guard let hub else { return }
-        busy = true
-        statusLine = "Preparing sandbox…"
-        Task {
-            do {
-                _ = try await hub.ensureInstance(configuration: SandboxConfiguration(baseImagePath: baseImagePath))
-                await MainActor.run { self.statusLine = "Booting Linux VM…"; self.vmState = .starting }
-                try await hub.startVM()
-                await MainActor.run {
-                    self.statusLine = "Sandbox running."
-                    self.refresh()
-                }
-            } catch {
-                await MainActor.run { self.statusLine = "Start failed: \(error)" }
-            }
-            await MainActor.run { self.busy = false; self.refresh() }
-        }
-    }
-
-    func stopSandbox() {
-        lifecycle("Stopping…") { try await $0.stopVM() }
-    }
-
-    func restartSandbox() {
-        lifecycle("Restarting…") { try await $0.restartVM() }
-    }
-
-    func resetSandbox() {
-        lifecycle("Resetting sandbox (discarding all guest changes)…") { try await $0.resetVM() }
-    }
-
-    private func lifecycle(_ label: String, _ operation: @escaping @Sendable (ChariotHub) async throws -> Void) {
-        guard let hub else { return }
-        busy = true
-        statusLine = label
-        Task {
-            do {
-                try await operation(hub)
-                await MainActor.run { self.statusLine = "Done." }
-            } catch {
-                await MainActor.run { self.statusLine = "\(label) failed: \(error)" }
-            }
-            await MainActor.run { self.busy = false; self.refresh() }
-        }
-    }
-
-    func sendPrompt(_ text: String) {
-        guard let hub else { return }
-        chat.append(ChatLine(role: "user", text: text))
-        let agentLineIndex = chat.count
-        chat.append(ChatLine(role: "agent", text: ""))
-        streaming = true
-        do {
-            try hub.sendLocalPrompt(text, onDelta: { [weak self] delta in
-                Task { @MainActor in
-                    guard let self, self.chat.indices.contains(agentLineIndex) else { return }
-                    self.chat[agentLineIndex].text += delta
-                }
-            }, onCompleted: { [weak self] code in
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.streaming = false
-                    if code != 0, self.chat.indices.contains(agentLineIndex) {
-                        self.chat[agentLineIndex].text += "\n[exit code \(code)]"
-                    }
-                }
-            })
-        } catch {
-            chat[agentLineIndex] = ChatLine(role: "system", text: "Sandbox not running: start it from the Sandbox tab.")
-            streaming = false
-        }
-    }
-
-    @Published var pairingErrorMessage: String?
-
-    func startPairing() {
-        guard let hub else { return }
-        do {
-            let payload = try hub.startPairingSession()
-            let json = try CanonicalCoding.encode(payload)
-            pairingPayloadJSON = String(data: json, encoding: .utf8)
-        } catch {
-            pairingErrorMessage = "\(error)"
-        }
-    }
-
-    func revoke(_ deviceID: String) {
-        hub?.revokeDevice(deviceID)
-        refreshDevices()
-    }
-
-    func toggleDeveloperAccess() {
-        guard let hub else { return }
-        if developerAccessInfo != nil {
-            hub.disableDeveloperAccess()
-            developerAccessInfo = nil
-        } else {
-            do {
-                let info = try hub.enableDeveloperAccess()
-                developerAccessInfo = info
-            } catch {
-                statusLine = "Developer access failed: \(error)"
-            }
-        }
     }
 }

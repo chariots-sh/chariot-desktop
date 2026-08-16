@@ -108,10 +108,30 @@ final class MailboxStoreTests: XCTestCase {
     func testOnDepositFiresForNewEnvelopesOnly() throws {
         let store = MailboxStore(directory: directory)
         var seen: [String] = []
-        store.onDeposit = { seen.append($0.messageID) }
+        store.onDeposit = { envelope, _ in seen.append(envelope.messageID) }
         let env = try envelope(sequence: 1)
         store.deposit(env)
         store.deposit(env)  // duplicate: no callback
         XCTAssertEqual(seen, [env.messageID])
+    }
+
+    func testInstanceScopedFetch() throws {
+        // Per-agent sessions replay only their own agent's mail; envelopes
+        // stored before the fleet existed (no instance) match any scope.
+        let store = MailboxStore(directory: directory)
+        let guardianMail = try envelope(sequence: 1)
+        let scribeMail = try envelope(sequence: 2)
+        let legacyMail = try envelope(sequence: 3)
+        store.deposit(guardianMail, instanceID: "guardian-uuid")
+        store.deposit(scribeMail, instanceID: "scribe-uuid")
+        store.deposit(legacyMail)
+
+        let guardianView = store.fetch(recipient: phone.deviceID, instanceID: "guardian-uuid", after: 0)
+        XCTAssertEqual(guardianView.map(\.envelope.messageID).sorted(),
+                       [guardianMail.messageID, legacyMail.messageID].sorted())
+        let scribeView = store.fetch(recipient: phone.deviceID, instanceID: "scribe-uuid", after: 0)
+        XCTAssertFalse(scribeView.contains { $0.envelope.messageID == guardianMail.messageID })
+        // Unscoped fetch (legacy sessions) sees everything.
+        XCTAssertEqual(store.fetch(recipient: phone.deviceID, after: 0).count, 3)
     }
 }

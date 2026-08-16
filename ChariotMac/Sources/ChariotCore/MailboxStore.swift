@@ -9,6 +9,16 @@ public final class MailboxStore: @unchecked Sendable {
     public struct StoredEnvelope: Codable {
         public let serial: UInt64
         public let envelope: EncryptedEnvelope
+        /// Which agent instance queued this envelope (Milestone 1: per-agent
+        /// sessions replay only their own instance's mail). Optional so
+        /// mailboxes written before the fleet existed still decode.
+        public let instanceID: String?
+
+        init(serial: UInt64, envelope: EncryptedEnvelope, instanceID: String? = nil) {
+            self.serial = serial
+            self.envelope = envelope
+            self.instanceID = instanceID
+        }
     }
 
     private struct State: Codable {
@@ -19,7 +29,7 @@ public final class MailboxStore: @unchecked Sendable {
     private var state = State()
     private let lock = NSLock()
     private let fileURL: URL
-    public var onDeposit: (@Sendable (EncryptedEnvelope) -> Void)?
+    public var onDeposit: (@Sendable (EncryptedEnvelope, String?) -> Void)?
 
     public init(directory: URL) {
         self.fileURL = directory.appendingPathComponent("mailbox.json")
@@ -38,7 +48,7 @@ public final class MailboxStore: @unchecked Sendable {
     }
 
     @discardableResult
-    public func deposit(_ envelope: EncryptedEnvelope) -> UInt64 {
+    public func deposit(_ envelope: EncryptedEnvelope, instanceID: String? = nil) -> UInt64 {
         lock.lock()
         // Deduplicate by message ID (design §4.6).
         if let existing = state.envelopes.first(where: { $0.envelope.messageID == envelope.messageID }) {
@@ -47,18 +57,23 @@ public final class MailboxStore: @unchecked Sendable {
         }
         let serial = state.nextSerial
         state.nextSerial += 1
-        state.envelopes.append(StoredEnvelope(serial: serial, envelope: envelope))
+        state.envelopes.append(StoredEnvelope(serial: serial, envelope: envelope, instanceID: instanceID))
         persistLocked()
         lock.unlock()
-        onDeposit?(envelope)
+        onDeposit?(envelope, instanceID)
         return serial
     }
 
-    public func fetch(recipient: String, after serial: UInt64, limit: Int = 50) -> [StoredEnvelope] {
+    /// Envelopes queued for a recipient. `instanceID` scopes the replay to
+    /// one agent's mail; envelopes stored without an instance (pre-fleet)
+    /// match any instance.
+    public func fetch(recipient: String, instanceID: String? = nil,
+                      after serial: UInt64, limit: Int = 50) -> [StoredEnvelope] {
         lock.lock(); defer { lock.unlock() }
         let now = Date()
         return state.envelopes
             .filter { $0.envelope.recipientDeviceID == recipient && $0.serial > serial && $0.envelope.expiresAt > now }
+            .filter { instanceID == nil || $0.instanceID == nil || $0.instanceID == instanceID }
             .sorted { $0.serial < $1.serial }
             .prefix(limit)
             .map { $0 }
