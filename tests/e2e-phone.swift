@@ -171,7 +171,7 @@ struct E2E {
         badWS.close()
 
         // Reconnect the real session (the impostor handshake may have raced).
-        var session = try SessionCrypto(localIdentity: identity,
+        let session = try SessionCrypto(localIdentity: identity,
                                         peerPublicIdentity: credential.mac, epoch: epoch)
 
         // 6. Message roundtrip: conversation.send → ack + output.completed

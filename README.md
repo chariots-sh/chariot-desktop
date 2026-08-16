@@ -31,7 +31,7 @@ Current state:
 |---|---|---|
 | `AgentLinkKit` | `AgentLinkKit/` | Shared Swift package: protocol models, QR v2 payload validation, Ed25519/X25519 envelope crypto, WebSocket frame protocol + session auth, replay protection, device credentials. 23 unit tests. |
 | `agent-tailnet` | `agent-tailnet/` | Bundled Go helper: persistent `tsnet` node, NDJSON control protocol over stdio, TLS (Tailscale-issued or pinned self-signed), tailnet→loopback proxy. |
-| `ChariotCore` | `ChariotMac/Sources/ChariotCore/` | VM supervisor (`SandboxBackend` over Virtualization.framework), vsock bridge client, transport service (HTTP + WebSocket), tailnet supervisor, pairing/session hub, developer access (SSH over virtio tunnel). |
+| `ChariotCore` | `ChariotMac/Sources/ChariotCore/` | VM supervisor (`SandboxBackend` over Virtualization.framework), vsock bridge client, transport service (HTTP + WebSocket), tailnet supervisor, pairing/session hub, developer access (SSH over virtio tunnel). Unit/integration tests in `ChariotMac/Tests`. |
 | `chariotd` | `ChariotMac/Sources/chariotd/` | Headless daemon used by the E2E harness. |
 | Chariot Desktop.app | `ChariotMac/Sources/ChariotDesktopApp/` | SwiftUI app: sandbox lifecycle, conversation, Tailscale panel (sign-in/reauth/disconnect/reset), QR pairing sheet with device approval, revocation, developer access. |
 | ChariotMobile.app | `ChariotMobile/` | iPhone app: Welcome/Scanner/Conversation/Connection screens, persistent WSS with backoff+jitter reconnect, durable outbox, revocation handling. |
@@ -106,6 +106,20 @@ Automated transport E2E (no tailnet or VM needed):
 ```bash
 scripts/e2e-transport.sh    # 16 checks: pairing, WS auth, roundtrip, dedup, offline replay, revocation
 ```
+
+## Tests & CI
+
+```bash
+swift test --package-path AgentLinkKit   # protocol, QR validation, envelope crypto, replay
+swift test --package-path ChariotMac     # mailbox durability, HTTP/WebSocket transport, paths
+```
+
+GitHub Actions ([ci.yml](.github/workflows/ci.yml)) runs on every push to
+`main` and every PR: both Swift test suites, the loopback transport E2E
+above, an iOS simulator build of ChariotMobile, and `go vet` plus a
+universal build of the `agent-tailnet` helper. The VM-backed flows (guest
+boot, Codex, developer access) stay local-only — GitHub's macOS runners are
+themselves VMs and can't host Virtualization.framework guests.
 
 Developer access (design §1.5): `POST /admin/devaccess {"action":"enable"}`
 (or the GUI panel) starts a localhost-only listener forwarded over virtio to

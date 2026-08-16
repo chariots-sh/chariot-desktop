@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift-tests:
+    name: Swift tests (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+      - name: AgentLinkKit tests
+        run: swift test --package-path AgentLinkKit
+      - name: ChariotCore tests
+        run: swift test --package-path ChariotMac
+      - name: Build chariotd and desktop app executables
+        run: swift build --package-path ChariotMac
+      - name: Loopback transport E2E (pairing, WS auth, replay, revocation)
+        run: scripts/e2e-transport.sh
+
+  ios-build:
+    name: iOS simulator build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+      - name: Build ChariotMobile.app
+        run: scripts/build-ios.sh
+
+  agent-tailnet:
+    name: agent-tailnet (Go)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent-tailnet/go.mod
+          cache-dependency-path: agent-tailnet/go.sum
+      - name: go vet
+        run: go vet ./...
+        working-directory: agent-tailnet
+      - name: Build universal helper binary
+        run: scripts/build-helper.sh build/agent-tailnet

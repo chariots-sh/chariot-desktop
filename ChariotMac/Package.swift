@@ -22,6 +22,10 @@ let package = Package(
         .executableTarget(
             name: "ChariotDesktopApp",
             dependencies: ["ChariotCore", "AgentLinkKit"]
+        ),
+        .testTarget(
+            name: "ChariotCoreTests",
+            dependencies: ["ChariotCore", "AgentLinkKit"]
         )
     ]
 )
