@@ -1,7 +1,6 @@
 import Foundation
 import CryptoKit
 import AgentLinkKit
-import AgentLinkCloudKit
 
 /// Registry of paired mobile devices plus the active session epoch.
 struct DeviceRegistry: Codable {
@@ -16,22 +15,39 @@ struct DeviceRegistry: Codable {
     var devices: [Entry] = []
 }
 
-/// Central Mac-side coordinator: owns the Mac identity, pairing sessions,
-/// the mailbox, and the VM/agent bridge. Both the SwiftUI app and the headless
-/// daemon drive everything through this type.
+/// Central Mac-side coordinator: owns the Mac identity, pairing sessions, the
+/// tailnet node, the WebSocket transport service, and the VM/agent bridge.
+/// Both the SwiftUI app and the headless daemon drive everything through this
+/// type.
+///
+/// Transport layout: a loopback-only HTTP/WebSocket service carries pairing
+/// and the encrypted message protocol. In production the bundled agent-tailnet
+/// helper exposes that service on the Mac's Tailscale node (TCP 443, TLS) and
+/// proxies to loopback; the development harness connects to loopback directly.
+/// Admin/diagnostic endpoints live on a second, never-proxied loopback server.
 public final class ChariotHub: @unchecked Sendable {
     public let paths: ChariotPaths
     public let backend: VirtualMachineBackend
     let mailbox: MailboxStore
-    private var httpServer: HTTPServer?
-    public private(set) var mailboxPort: UInt16 = 0
+    private var transportServer: HTTPServer?
+    private var adminServer: HTTPServer?
+    public private(set) var transportPort: UInt16 = 0
+    public private(set) var adminPort: UInt16 = 0
 
     let identity: DeviceIdentity
     public var macDisplayName: String
     private var registry: DeviceRegistry
     private let lock = NSRecursiveLock()
 
-    // Pairing sessions keyed by rendezvous ID.
+    /// Feature flag `tailscale_transport`: when true (the default), pairing QR
+    /// codes carry the tailnet service URL and require the embedded node to be
+    /// authenticated. When false the hub runs in loopback development mode.
+    /// Temporary migration/rollback control (env `CHARIOT_TAILSCALE=0`).
+    public var tailscaleEnabled: Bool =
+        (ProcessInfo.processInfo.environment["CHARIOT_TAILSCALE"] ?? "1") != "0"
+    public private(set) var tailnet: TailnetSupervisor?
+
+    // Pairing sessions keyed by single-use pairing ID.
     private struct PairingSession {
         let payload: PairingPayload
         let ephemeralKey: Curve25519.KeyAgreement.PrivateKey
@@ -55,30 +71,25 @@ public final class ChariotHub: @unchecked Sendable {
         onEvent?(message)
     }
 
-    /// External diagnostics (e.g. the app delegate's APNs callbacks).
+    /// External diagnostics (e.g. tailnet status changes surfaced by the app).
     public func note(_ message: String) {
         event(message)
     }
 
-    // CloudKit transport state (see ChariotHubCloudKit.swift).
-    var cloudMailbox: CloudKitMailbox?
-    var cloudContainerID: String?
-    var syncInbox: CloudKitSyncInbox?
-    var cloudReconcileTask: Task<Void, Never>?
-    /// Set when a CloudKit container is configured but not yet connected;
-    /// pairing must not mint localhost QR codes in that window.
-    public var cloudDesired = false
-
-    func setCloudKit(mailbox: CloudKitMailbox, containerID: String) {
-        lock.lock(); defer { lock.unlock() }
-        cloudMailbox = mailbox
-        cloudContainerID = containerID
+    // Live WebSocket sessions, one per authenticated device.
+    private final class WSSession {
+        let connection: WebSocketConnection
+        let nonce: String
+        var deviceID: String?
+        var instanceID: String?
+        init(connection: WebSocketConnection, nonce: String) {
+            self.connection = connection
+            self.nonce = nonce
+        }
     }
-
-    func pendingCloudPairingIDs() -> [String] {
-        lock.lock(); defer { lock.unlock() }
-        return pairingSessions.filter { $0.value.state == "waiting" }.map(\.key)
-    }
+    private var wsSessions: [ObjectIdentifier: WSSession] = [:]
+    private var wsByDevice: [String: ObjectIdentifier] = [:]
+    private var statusTimer: DispatchSourceTimer?
 
     // Active VM/bridge.
     public private(set) var activeInstance: SandboxID?
@@ -137,8 +148,10 @@ public final class ChariotHub: @unchecked Sendable {
             self.registry = DeviceRegistry()
         }
 
+        // Phone-bound envelopes stay durably queued here until acknowledged;
+        // a live WebSocket session gets them pushed immediately on deposit.
         mailbox.onDeposit = { [weak self] envelope in
-            self?.handleDeposit(envelope)
+            self?.pushEnvelopeIfConnected(envelope)
         }
     }
 
@@ -160,6 +173,33 @@ public final class ChariotHub: @unchecked Sendable {
             ($0.identity.deviceID, $0.displayName, $0.pairedAt, $0.revokedAt != nil, $0.identity.fingerprint)
         }
     }
+
+    // MARK: Tailscale node
+
+    /// Start supervising the bundled agent-tailnet helper. One node per app
+    /// installation; all sandbox instances share it.
+    public func enableTailscale(helperURL: URL) {
+        guard tailscaleEnabled else {
+            event("tailscale_transport flag off — loopback development mode")
+            return
+        }
+        guard transportPort != 0 else {
+            event("transport server must start before the tailnet helper")
+            return
+        }
+        let supervisor = TailnetSupervisor(helperURL: helperURL,
+                                           dataDirectory: paths.dataDirectory,
+                                           identityDirectory: paths.identityDirectory,
+                                           upstreamPort: transportPort)
+        supervisor.onEvent = { [weak self] message in self?.event(message) }
+        supervisor.onStatusChange = { [weak self] status in
+            self?.event("tailnet: \(status.label)")
+        }
+        tailnet = supervisor
+        supervisor.start()
+    }
+
+    public var tailnetStatus: TailnetStatus { tailnet?.status ?? .stopped }
 
     // MARK: VM lifecycle
 
@@ -299,65 +339,54 @@ public final class ChariotHub: @unchecked Sendable {
 
     // MARK: Pairing
 
+    public var currentInstanceID: String { activeInstance ?? "default" }
+
     public func startPairingSession() throws -> PairingPayload {
-        guard mailboxPort != 0 || cloudMailbox != nil else { throw ChariotError.invalidState("no transport started") }
-        if cloudDesired && cloudMailbox == nil {
-            throw ChariotError.invalidState("CloudKit is still connecting — wait for the transport to show ready, then try again")
+        guard transportPort != 0 else { throw ChariotError.invalidState("transport not started") }
+
+        let serviceURL: String
+        let tlsPin: String?
+        if tailscaleEnabled {
+            guard let info = tailnet?.info else {
+                throw ChariotError.invalidState(
+                    "Tailscale is not connected yet — sign in to Tailscale first, then pair")
+            }
+            // The MagicDNS name comes from authenticated Tailscale state only.
+            serviceURL = info.serviceURL
+            tlsPin = info.tailscaleTLS ? nil : info.tlsPublicKeyHash
+            if !info.tailscaleTLS && tlsPin == nil {
+                throw ChariotError.invalidState("tailnet TLS not ready — try again in a moment")
+            }
+        } else {
+            serviceURL = "http://127.0.0.1:\(transportPort)"
+            tlsPin = nil
         }
+
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
         var secret = Data(count: 32)
         secret.withUnsafeMutableBytes { _ = SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
-        let mailbox = cloudContainerID.map { "cloudkit:\($0)" } ?? "http://127.0.0.1:\(mailboxPort)"
         let payload = PairingPayload(
-            rendezvousID: UUID().uuidString.lowercased(),
+            serviceURL: serviceURL,
+            instanceID: currentInstanceID,
             macDeviceID: identity.deviceID,
             macDisplayName: macDisplayName,
             macSigningPublicKey: identity.signingKey.publicKey.rawRepresentation,
             macPairingPublicKey: ephemeral.publicKey.rawRepresentation,
+            tlsPublicKeyHash: tlsPin,
+            pairingID: UUID().uuidString.lowercased(),
             pairingSecret: secret,
-            expiresAt: Date().addingTimeInterval(120),
-            mailbox: mailbox
+            expiresAt: Date().addingTimeInterval(120)
         )
         lock.lock()
-        pairingSessions[payload.rendezvousID] = PairingSession(payload: payload, ephemeralKey: ephemeral, state: "waiting")
+        pairingSessions[payload.pairingID] = PairingSession(payload: payload, ephemeralKey: ephemeral, state: "waiting")
         lock.unlock()
-        if let cloud = cloudMailbox {
-            let epoch = registry.epoch
-            let rendezvousID = payload.rendezvousID
-            let expiresAt = payload.expiresAt
-            Task {
-                do {
-                    try await cloud.createPairingSession(from: payload, epoch: epoch)
-                    self.event("pairing rendezvous published to CloudKit")
-                } catch {
-                    self.event("cloudkit pairing record failed: \(error)")
-                    return
-                }
-                // Bounded handshake watcher: while this QR is valid, nudge the
-                // sync loop every few seconds so the approval prompt appears
-                // even if the wake push is late. Ends with the session — part
-                // of the handshake, not steady-state polling.
-                while Date() < expiresAt {
-                    if self.pairingSessionState(rendezvousID) != "waiting" { return }
-                    self.pokeCloudPoll()
-                    try? await Task.sleep(nanoseconds: 3_000_000_000)
-                }
-            }
-        }
-        event("pairing session \(payload.rendezvousID.prefix(8)) created")
+        event("pairing session \(payload.pairingID.prefix(8)) created (\(serviceURL))")
         return payload
     }
 
-    func pairingSessionState(_ rendezvousID: String) -> String {
+    func pairingSessionState(_ pairingID: String) -> String {
         lock.lock(); defer { lock.unlock() }
-        return pairingSessions[rendezvousID]?.state ?? "unknown"
-    }
-
-    private func handlePairingResponse(rendezvousID: String, phoneEphemeral: Data, ciphertext: Data) -> HTTPServer.Response {
-        switch acceptPairingResponse(rendezvousID: rendezvousID, phoneEphemeral: phoneEphemeral, ciphertext: ciphertext) {
-        case .success: return .json(["state": "responded"])
-        case .failure(let code): return .error(code.status, code.message)
-        }
+        return pairingSessions[pairingID]?.state ?? "unknown"
     }
 
     enum PairingRejection: Error {
@@ -372,7 +401,7 @@ public final class ChariotHub: @unchecked Sendable {
         }
         var message: String {
             switch self {
-            case .unknown: return "unknown rendezvous"
+            case .unknown: return "unknown pairing id"
             case .replay: return "pairing session already claimed"
             case .expired: return "pairing session expired"
             case .invalid: return "invalid pairing response"
@@ -380,11 +409,13 @@ public final class ChariotHub: @unchecked Sendable {
         }
     }
 
-    /// Shared pairing-response validation used by both transports.
-    func acceptPairingResponse(rendezvousID: String, phoneEphemeral: Data,
+    /// Validate a phone's pairing response. Claiming the single-use pairing ID
+    /// is atomic: the session leaves `waiting` under the lock before any
+    /// crypto runs, so a second claim — or a replayed QR — always fails.
+    func acceptPairingResponse(pairingID: String, phoneEphemeral: Data,
                                ciphertext: Data) -> Result<Void, PairingRejection> {
         lock.lock()
-        guard var session = pairingSessions[rendezvousID] else {
+        guard var session = pairingSessions[pairingID] else {
             lock.unlock()
             return .failure(.unknown)
         }
@@ -393,10 +424,13 @@ public final class ChariotHub: @unchecked Sendable {
             return .failure(.replay)  // QR replay rejection
         }
         guard session.payload.expiresAt > Date() else {
-            pairingSessions[rendezvousID]?.state = "expired"
+            pairingSessions[pairingID]?.state = "expired"
             lock.unlock()
             return .failure(.expired)
         }
+        // Atomic consume: no other claim can proceed past this point.
+        session.state = "responded"
+        pairingSessions[pairingID] = session
         lock.unlock()
 
         do {
@@ -408,14 +442,13 @@ public final class ChariotHub: @unchecked Sendable {
             guard response.mobileEphemeralPublicKey == phoneEphemeral else {
                 throw AgentLinkError.signatureInvalid  // outer/inner ephemeral mismatch
             }
-            session.state = "responded"
             session.pairingKey = key
             lock.lock()
-            pairingSessions[rendezvousID] = session
+            pairingSessions[pairingID] = session
             lock.unlock()
 
             let approve: @Sendable (Bool) -> Void = { [weak self] approved in
-                self?.completePairing(rendezvousID: rendezvousID, response: response, approved: approved)
+                self?.completePairing(pairingID: pairingID, response: response, approved: approved)
             }
             event("pairing response from \(response.mobileDisplayName) accepted; awaiting approval")
             if autoApprovePairing {
@@ -427,21 +460,22 @@ public final class ChariotHub: @unchecked Sendable {
             }
             return .success(())
         } catch {
+            // The single-use ID stays burned even on a bad response.
+            lock.lock()
+            pairingSessions[pairingID]?.state = "consumed"
+            lock.unlock()
             event("pairing response rejected: \(error)")
             return .failure(.invalid)
         }
     }
 
-    private func completePairing(rendezvousID: String, response: PairingResponse, approved: Bool) {
+    private func completePairing(pairingID: String, response: PairingResponse, approved: Bool) {
         lock.lock(); defer { lock.unlock() }
-        guard var session = pairingSessions[rendezvousID], let key = session.pairingKey else { return }
+        guard var session = pairingSessions[pairingID], let key = session.pairingKey else { return }
         guard approved else {
             session.state = "consumed"
-            pairingSessions[rendezvousID] = session
+            pairingSessions[pairingID] = session
             event("pairing rejected by user")
-            if let cloud = cloudMailbox {
-                Task { await cloud.deletePairingSession(rendezvousID: rendezvousID) }
-            }
             return
         }
         var credential = DeviceCredential(mac: identity.publicIdentity, mobile: response.mobile)
@@ -453,17 +487,7 @@ public final class ChariotHub: @unchecked Sendable {
             return
         }
         session.state = "consumed"
-        pairingSessions[rendezvousID] = session
-        if let cloud = cloudMailbox, let encrypted = session.encryptedCredential {
-            Task {
-                do {
-                    let (_, record) = try await cloud.fetchPairingSession(rendezvousID: rendezvousID)
-                    try await cloud.completePairingSession(record: record, encryptedCredential: encrypted)
-                } catch {
-                    self.event("cloudkit credential publish failed: \(error)")
-                }
-            }
-        }
+        pairingSessions[pairingID] = session
 
         registry.devices.removeAll { $0.identity.deviceID == response.mobile.deviceID }
         registry.devices.append(DeviceRegistry.Entry(identity: response.mobile,
@@ -478,7 +502,8 @@ public final class ChariotHub: @unchecked Sendable {
     /// Revoke a device: reject its credential and advance the session epoch so
     /// it cannot decrypt future envelopes (design §8.1). A signed
     /// `device.revoked` notice is sealed with the *old* epoch first — the last
-    /// message the revoked device can still read.
+    /// message the revoked device can still read — then any live WebSocket
+    /// session is told and closed.
     public func revokeDevice(_ deviceID: String) {
         lock.lock()
         guard let index = registry.devices.firstIndex(where: { $0.identity.deviceID == deviceID }) else {
@@ -502,19 +527,23 @@ public final class ChariotHub: @unchecked Sendable {
         } catch {
             event("revocation notice failed: \(error)")
         }
+        // Tell the live session (if any) and drop it.
+        lock.lock()
+        let sessionID = wsByDevice[deviceID]
+        let ws = sessionID.flatMap { wsSessions[$0]?.connection }
+        lock.unlock()
+        if let ws {
+            sendFrame(TransportFrame(type: .revoked), over: ws)
+            ws.close()
+        }
+        broadcastStatus()
         event("revoked device \(deviceID.prefix(8)); epoch advanced to \(registry.epoch)")
     }
 
-    /// Route an outbound envelope through the active transport.
+    /// Queue an outbound envelope durably; a live session gets it immediately.
+    /// Envelopes stay in the mailbox until the recipient acknowledges them.
     func deliver(envelope: EncryptedEnvelope) {
-        if let cloud = cloudMailbox {
-            Task {
-                do { try await cloud.deposit(envelope) }
-                catch { self.event("cloudkit deposit failed: \(error)") }
-            }
-        } else {
-            mailbox.deposit(envelope)
-        }
+        mailbox.deposit(envelope)
     }
 
     private func deviceEntry(_ deviceID: String) -> DeviceRegistry.Entry? {
@@ -524,18 +553,15 @@ public final class ChariotHub: @unchecked Sendable {
 
     // MARK: Envelope handling (phone → Mac)
 
-    private func handleDeposit(_ envelope: EncryptedEnvelope) {
-        guard envelope.recipientDeviceID == identity.deviceID else { return }  // phone-bound mail stays queued
-        defer { mailbox.acknowledge(recipient: identity.deviceID, messageIDs: [envelope.messageID]) }
-        processInboundEnvelope(envelope)
-    }
-
-    /// Decrypt, replay-check, and dispatch an inbound envelope (any transport).
-    func processInboundEnvelope(_ envelope: EncryptedEnvelope) {
-        guard envelope.recipientDeviceID == identity.deviceID else { return }
+    /// Decrypt, replay-check, and dispatch an inbound envelope. Returns true
+    /// when the envelope should be acknowledged to the sender (processed now
+    /// or a duplicate of something already processed).
+    @discardableResult
+    func processInboundEnvelope(_ envelope: EncryptedEnvelope) -> Bool {
+        guard envelope.recipientDeviceID == identity.deviceID else { return false }
         guard let entry = deviceEntry(envelope.senderDeviceID), entry.revokedAt == nil else {
             event("dropped envelope from unknown/revoked device")
-            return
+            return false
         }
         do {
             let session = try SessionCrypto(localIdentity: identity, peerPublicIdentity: entry.identity,
@@ -543,12 +569,19 @@ public final class ChariotHub: @unchecked Sendable {
             let message = try session.open(envelope)
             lock.lock()
             var window = replayWindows[envelope.senderDeviceID] ?? ReplayWindow()
-            try window.accept(messageID: message.messageID, sequence: message.sequence)
+            do {
+                try window.accept(messageID: message.messageID, sequence: message.sequence)
+            } catch AgentLinkError.replayDetected {
+                lock.unlock()
+                return true  // duplicate delivery — ack again, don't reprocess
+            }
             replayWindows[envelope.senderDeviceID] = window
             lock.unlock()
             try handleAgentMessage(message, from: entry)
+            return true
         } catch {
             event("envelope rejected: \(error)")
+            return false
         }
     }
 
@@ -622,6 +655,7 @@ public final class ChariotHub: @unchecked Sendable {
             } else {
                 event("guest status: \(state), kernel \(kernel)")
             }
+            broadcastStatus()
         case .oauthRequested(let provider, let purpose, let authURL):
             event("oauth requested by guest (\(provider)): \(purpose)")
             lock.lock()
@@ -705,19 +739,219 @@ public final class ChariotHub: @unchecked Sendable {
                           body: .object(["text": .string(text), "request_id": .string(requestID)]))
     }
 
-    // MARK: HTTP surface (CloudKit stand-in + local admin)
+    // MARK: WebSocket transport sessions
 
-    public func startMailboxServer(port: UInt16 = 8787) throws {
-        let server = HTTPServer { [weak self] request in
-            self?.route(request) ?? .error(500, "hub gone")
+    private func handleWebSocketUpgrade() -> HTTPServer.Response {
+        return .upgrade { [weak self] connection in
+            guard let self else { connection.close(); return }
+            var nonce = Data(count: 24)
+            nonce.withUnsafeMutableBytes { _ = SecRandomCopyBytes(kSecRandomDefault, 24, $0.baseAddress!) }
+            let session = WSSession(connection: connection, nonce: Base64URL.encode(nonce))
+            let id = ObjectIdentifier(connection)
+            self.lock.lock()
+            self.wsSessions[id] = session
+            self.lock.unlock()
+
+            connection.onText = { [weak self, weak connection] text in
+                guard let self, let connection else { return }
+                self.handleWSFrame(text: text, connection: connection)
+            }
+            connection.onClose = { [weak self, weak connection] in
+                guard let self, let connection else { return }
+                let id = ObjectIdentifier(connection)
+                self.lock.lock()
+                if let deviceID = self.wsSessions[id]?.deviceID,
+                   self.wsByDevice[deviceID] == id {
+                    self.wsByDevice.removeValue(forKey: deviceID)
+                }
+                self.wsSessions.removeValue(forKey: id)
+                self.lock.unlock()
+            }
+
+            var challenge = TransportFrame(type: .challenge)
+            challenge.nonce = session.nonce
+            self.sendFrame(challenge, over: connection)
         }
-        try server.start(port: port)
-        httpServer = server
-        mailboxPort = server.port
-        event("mailbox listening on 127.0.0.1:\(server.port)")
     }
 
-    private func route(_ request: HTTPServer.Request) -> HTTPServer.Response {
+    private func handleWSFrame(text: String, connection: WebSocketConnection) {
+        let id = ObjectIdentifier(connection)
+        lock.lock()
+        guard let session = wsSessions[id] else { lock.unlock(); return }
+        let authenticatedDevice = session.deviceID
+        lock.unlock()
+
+        guard let frame = try? TransportFrame.decode(Data(text.utf8)) else {
+            var error = TransportFrame(type: .error)
+            error.message = "malformed frame"
+            sendFrame(error, over: connection)
+            return
+        }
+
+        // Tailnet membership is transport only — nothing is served before the
+        // device proves possession of a paired signing key.
+        guard let deviceID = authenticatedDevice else {
+            handleWSHello(frame, session: sessionFor(connection), connection: connection)
+            return
+        }
+
+        switch frame.type {
+        case .envelope:
+            guard let envelope = frame.envelope, envelope.senderDeviceID == deviceID else { return }
+            if processInboundEnvelope(envelope) {
+                var ack = TransportFrame(type: .ack)
+                ack.messageIDs = [envelope.messageID]
+                sendFrame(ack, over: connection)
+            }
+        case .ack:
+            // Phone confirmed receipt: drop the envelopes from the durable queue.
+            if let ids = frame.messageIDs {
+                mailbox.acknowledge(recipient: deviceID, messageIDs: ids)
+            }
+        default:
+            break
+        }
+    }
+
+    private func sessionFor(_ connection: WebSocketConnection) -> WSSession? {
+        lock.lock(); defer { lock.unlock() }
+        return wsSessions[ObjectIdentifier(connection)]
+    }
+
+    private func handleWSHello(_ frame: TransportFrame, session: WSSession?, connection: WebSocketConnection) {
+        guard let session else { connection.close(); return }
+        guard frame.type == .hello,
+              let deviceID = frame.deviceID,
+              let signature = frame.signature,
+              let instanceID = frame.instanceID else {
+            sendFrame(TransportFrame(type: .denied), over: connection)
+            connection.close()
+            return
+        }
+        guard let entry = deviceEntry(deviceID), entry.revokedAt == nil else {
+            // Revoked and unknown devices are distinguishable on purpose: the
+            // phone shows "revoked" only when this Mac actually revoked it.
+            if deviceEntry(deviceID) != nil {
+                sendFrame(TransportFrame(type: .revoked), over: connection)
+            } else {
+                sendFrame(TransportFrame(type: .denied), over: connection)
+            }
+            connection.close()
+            return
+        }
+        guard TransportAuth.verify(nonce: session.nonce, deviceID: deviceID, instanceID: instanceID,
+                                   signature: signature,
+                                   signingPublicKey: entry.identity.signingPublicKey) else {
+            event("ws auth failed for device \(deviceID.prefix(8))")
+            sendFrame(TransportFrame(type: .denied), over: connection)
+            connection.close()
+            return
+        }
+
+        lock.lock()
+        session.deviceID = deviceID
+        session.instanceID = instanceID
+        // One live session per device: a reconnect supersedes the old socket.
+        if let previous = wsByDevice[deviceID], previous != ObjectIdentifier(connection),
+           let stale = wsSessions[previous]?.connection {
+            stale.close()
+        }
+        wsByDevice[deviceID] = ObjectIdentifier(connection)
+        let epoch = registry.epoch
+        lock.unlock()
+
+        var welcome = TransportFrame(type: .welcome)
+        welcome.epoch = epoch
+        welcome.macDeviceID = identity.deviceID
+        sendFrame(welcome, over: connection)
+        sendStatusFrame(over: connection)
+        event("device \(entry.displayName) connected (instance \(instanceID))")
+
+        // Replay everything still queued for this device; the phone acks and
+        // deduplicates via its replay window.
+        for stored in mailbox.fetch(recipient: deviceID, after: 0, limit: 500) {
+            var envelopeFrame = TransportFrame(type: .envelope)
+            envelopeFrame.envelope = stored.envelope
+            sendFrame(envelopeFrame, over: connection)
+        }
+        startStatusTimerIfNeeded()
+    }
+
+    private func pushEnvelopeIfConnected(_ envelope: EncryptedEnvelope) {
+        lock.lock()
+        let connection = wsByDevice[envelope.recipientDeviceID].flatMap { wsSessions[$0]?.connection }
+        lock.unlock()
+        guard let connection else { return }
+        var frame = TransportFrame(type: .envelope)
+        frame.envelope = envelope
+        sendFrame(frame, over: connection)
+    }
+
+    private func sendFrame(_ frame: TransportFrame, over connection: WebSocketConnection) {
+        if let data = try? frame.encoded(), let text = String(data: data, encoding: .utf8) {
+            connection.send(text: text)
+        }
+    }
+
+    private func sendStatusFrame(over connection: WebSocketConnection) {
+        var status = TransportFrame(type: .status)
+        status.vmState = vmState.rawValue
+        status.bridgeConnected = bridgeConnected
+        lock.lock()
+        status.epoch = registry.epoch
+        lock.unlock()
+        sendFrame(status, over: connection)
+    }
+
+    /// Push current sandbox status to every authenticated session.
+    func broadcastStatus() {
+        lock.lock()
+        let connections = wsByDevice.values.compactMap { wsSessions[$0]?.connection }
+        lock.unlock()
+        connections.forEach { sendStatusFrame(over: $0) }
+    }
+
+    private func startStatusTimerIfNeeded() {
+        lock.lock(); defer { lock.unlock() }
+        guard statusTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + 10, repeating: 10)
+        timer.setEventHandler { [weak self] in
+            self?.broadcastStatus()
+            // Envelopes a recipient can never decrypt anymore (old epoch)
+            // age out instead of sitting in the queue forever.
+            self?.mailbox.expireStale()
+        }
+        timer.resume()
+        statusTimer = timer
+    }
+
+    // MARK: HTTP surfaces
+
+    /// Start both servers: the transport surface (loopback; reached over the
+    /// tailnet via agent-tailnet's TLS proxy) and the local-only admin surface
+    /// (never proxied — one port up from the transport port by default).
+    public func startTransportServer(port: UInt16 = 8787, adminPort requestedAdminPort: UInt16? = nil) throws {
+        let transport = HTTPServer { [weak self] request in
+            self?.routeTransport(request) ?? .error(500, "hub gone")
+        }
+        try transport.start(port: port)
+        transportServer = transport
+        transportPort = transport.port
+
+        let admin = HTTPServer { [weak self] request in
+            self?.routeAdmin(request) ?? .error(500, "hub gone")
+        }
+        try admin.start(port: requestedAdminPort ?? (transport.port &+ 1))
+        adminServer = admin
+        adminPort = admin.port
+        event("transport on 127.0.0.1:\(transport.port), admin on 127.0.0.1:\(admin.port)")
+    }
+
+    /// Routes reachable through the tailnet proxy. Everything here is either
+    /// public identity info, the self-protecting pairing handshake, or the
+    /// authenticated WebSocket session — no admin controls.
+    private func routeTransport(_ request: HTTPServer.Request) -> HTTPServer.Response {
         let parts = request.path.split(separator: "/").map(String.init)
         switch (request.method, parts.first ?? "") {
         case ("GET", "status"):
@@ -727,10 +961,13 @@ public final class ChariotHub: @unchecked Sendable {
                 "vm_state": vmState.rawValue,
                 "bridge_connected": bridgeConnected,
                 "epoch": Int(registry.epoch),
-                "mode": "cloud-fallback"
+                "instance_id": currentInstanceID,
+                "mode": tailscaleEnabled ? "tailscale" : "local"
             ])
+        case ("GET", "v2") where parts.count == 2 && parts[1] == "ws":
+            return handleWebSocketUpgrade()
         case ("GET", "pairing") where parts.count == 2:
-            guard let session = pairingSessions[parts[1]] else { return .error(404, "unknown rendezvous") }
+            guard let session = pairingSessions[parts[1]] else { return .error(404, "unknown pairing id") }
             return .json([
                 "state": session.state,
                 "mac_device_id": session.payload.macDeviceID,
@@ -747,51 +984,23 @@ public final class ChariotHub: @unchecked Sendable {
                   let ciphertext = try? Base64URL.decode(ciphertextB64) else {
                 return .error(400, "malformed pairing response")
             }
-            return handlePairingResponse(rendezvousID: parts[1], phoneEphemeral: ephemeral, ciphertext: ciphertext)
+            switch acceptPairingResponse(pairingID: parts[1], phoneEphemeral: ephemeral, ciphertext: ciphertext) {
+            case .success: return .json(["state": "responded"])
+            case .failure(let code): return .error(code.status, code.message)
+            }
         case ("GET", "pairing") where parts.count == 3 && parts[2] == "credential":
-            guard let session = pairingSessions[parts[1]] else { return .error(404, "unknown rendezvous") }
+            guard let session = pairingSessions[parts[1]] else { return .error(404, "unknown pairing id") }
             guard let credential = session.encryptedCredential else { return .error(404, "not issued yet") }
             return .json(["ciphertext": Base64URL.encode(credential), "epoch": Int(registry.epoch)])
-        case ("POST", "envelopes"):
-            guard let envelope = try? CanonicalCoding.decoder().decode(EncryptedEnvelope.self, from: request.body) else {
-                return .error(400, "malformed envelope")
-            }
-            if let entry = deviceEntry(envelope.senderDeviceID), entry.revokedAt != nil {
-                return .error(403, "device revoked")
-            }
-            let serial = mailbox.deposit(envelope)
-            return .json(["serial": Int(serial)])
-        case ("GET", "envelopes"):
-            guard let recipient = request.query["recipient"] else { return .error(400, "recipient required") }
-            if let entry = deviceEntry(recipient), entry.revokedAt != nil {
-                return .error(403, "device revoked")
-            }
-            let after = UInt64(request.query["after"] ?? "0") ?? 0
-            let stored = mailbox.fetch(recipient: recipient, after: after)
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            let items: [[String: Any]] = stored.compactMap { item in
-                guard let data = try? encoder.encode(item.envelope),
-                      let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
-                return ["serial": Int(item.serial), "envelope": object]
-            }
-            return .json(["envelopes": items, "epoch": Int(registry.epoch)])
-        case ("POST", "receipts"):
-            guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any],
-                  let recipient = object["recipient"] as? String,
-                  let ids = object["message_ids"] as? [String] else {
-                return .error(400, "malformed receipt")
-            }
-            mailbox.acknowledge(recipient: recipient, messageIDs: ids)
-            return .json(["acknowledged": ids.count])
         default:
-            return routeAdmin(request, parts: parts)
+            return .error(404, "not found")
         }
     }
 
-    /// Local-only admin endpoints used by the E2E harness (and available to
-    /// the GUI). The mailbox itself is localhost-only, so these are too.
-    private func routeAdmin(_ request: HTTPServer.Request, parts: [String]) -> HTTPServer.Response {
+    /// Local-only admin endpoints used by the E2E harness and the GUI. This
+    /// server is never exposed through the tailnet proxy.
+    private func routeAdmin(_ request: HTTPServer.Request) -> HTTPServer.Response {
+        let parts = request.path.split(separator: "/").map(String.init)
         guard parts.first == "admin" else { return .error(404, "not found") }
         let rest = Array(parts.dropFirst())
         switch (request.method, rest.first ?? "") {
@@ -812,7 +1021,8 @@ public final class ChariotHub: @unchecked Sendable {
                 "bridge_connected": bridgeConnected,
                 "epoch": Int(registry.epoch),
                 "devices": devices,
-                "mac_fingerprint": identity.publicIdentity.fingerprint
+                "mac_fingerprint": identity.publicIdentity.fingerprint,
+                "tailnet": tailnetStatus.label
             ])
         case ("POST", "revoke"):
             guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
@@ -821,45 +1031,37 @@ public final class ChariotHub: @unchecked Sendable {
             return .json(["revoked": deviceID])
         case ("GET", "events"):
             return .json(["events": eventBuffer.recent()])
-        case ("POST", "testpush"):
-            guard let cloud = cloudMailbox else { return .error(400, "cloudkit not enabled") }
-            let semaphore = DispatchSemaphore(value: 0)
-            let box = OutputCollector()
-            Task {
-                do {
-                    try await cloud.triggerTestPush()
-                    box.append("zone change written — other devices should receive a push now")
-                } catch {
-                    box.append("test write failed: \(error)")
-                }
-                semaphore.signal()
-            }
-            _ = semaphore.wait(timeout: .now() + 15)
-            return .json(["result": box.text])
         case ("GET", "sessions"):
             lock.lock()
-            let sessions = pairingSessions.map { ["rendezvous_id": $0.key, "state": $0.value.state,
+            let sessions = pairingSessions.map { ["pairing_id": $0.key, "state": $0.value.state,
                                                   "has_credential": $0.value.encryptedCredential != nil] }
             lock.unlock()
             return .json(["sessions": sessions])
-        case ("GET", "cloudkit") where rest.count == 3 && rest[1] == "pairing":
-            // Debug probe: does the pairing record exist in CloudKit as this
-            // Mac sees it?
-            guard let cloud = cloudMailbox else { return .error(400, "cloudkit not enabled") }
-            let rendezvousID = rest[2]
-            let semaphore = DispatchSemaphore(value: 0)
-            let box = OutputCollector()
-            Task {
-                do {
-                    let (pairing, _) = try await cloud.fetchPairingSession(rendezvousID: rendezvousID)
-                    box.append("state=\(pairing.state) epoch=\(pairing.epoch) hasResponse=\(pairing.encryptedMobileResponse != nil) hasCredential=\(pairing.encryptedCredential != nil)")
-                } catch {
-                    box.append("error: \(error)")
+        case ("GET", "tailnet"):
+            var payload: [String: Any] = ["status": tailnetStatus.label]
+            if case .needsLogin(let url) = tailnetStatus { payload["auth_url"] = url }
+            if let info = tailnet?.info {
+                payload["dns_name"] = info.dnsName
+                payload["service_url"] = info.serviceURL
+                payload["tailscale_tls"] = info.tailscaleTLS
+                if let expiry = info.keyExpiry {
+                    payload["key_expiry"] = ISO8601DateFormatter().string(from: expiry)
                 }
-                semaphore.signal()
             }
-            _ = semaphore.wait(timeout: .now() + 15)
-            return .json(["probe": box.text])
+            return .json(payload)
+        case ("POST", "tailnet"):
+            guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
+                  let action = object["action"] else { return .error(400, "action required") }
+            guard let tailnet else { return .error(400, "tailscale not enabled") }
+            switch action {
+            case "start": tailnet.start()
+            case "stop": tailnet.stop()
+            case "logout": tailnet.logout()
+            case "reset":
+                do { try tailnet.reset() } catch { return .error(500, "\(error)") }
+            default: return .error(400, "unknown action")
+            }
+            return .json(["status": tailnetStatus.label])
         case ("POST", "vm") where rest.count == 2:
             let action = rest[1]
             let semaphore = DispatchSemaphore(value: 0)
@@ -883,22 +1085,6 @@ public final class ChariotHub: @unchecked Sendable {
             }
             _ = semaphore.wait(timeout: .now() + 300)
             return .json(["result": box.text, "vm_state": vmState.rawValue])
-        case ("GET", "cloudkit") where rest.count == 3 && rest[1] == "inbox":
-            guard let cloud = cloudMailbox else { return .error(400, "cloudkit not enabled") }
-            let recipient = rest[2]
-            let semaphore = DispatchSemaphore(value: 0)
-            let box = OutputCollector()
-            Task {
-                do {
-                    let envelopes = try await cloud.fetchEnvelopes(recipient: recipient)
-                    box.append("\(envelopes.count)")
-                } catch {
-                    box.append("error: \(error)")
-                }
-                semaphore.signal()
-            }
-            _ = semaphore.wait(timeout: .now() + 20)
-            return .json(["pending": box.text])
         case ("GET", "agent"):
             return .json([
                 "installed": agentStatus?.installed ?? false,
@@ -955,17 +1141,6 @@ public final class ChariotHub: @unchecked Sendable {
         default:
             return .error(404, "not found")
         }
-    }
-}
-
-final class OneShot: @unchecked Sendable {
-    private let lock = NSLock()
-    private var claimed = false
-    func claim() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if claimed { return false }
-        claimed = true
-        return true
     }
 }
 

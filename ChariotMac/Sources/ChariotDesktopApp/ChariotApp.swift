@@ -1,6 +1,5 @@
 import SwiftUI
 import AppKit
-import CloudKit
 import ChariotCore
 import AgentLinkKit
 
@@ -19,40 +18,9 @@ struct ChariotApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    static let pushWake = Notification.Name("chariot.mac.push.wake")
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        NSApp.registerForRemoteNotifications()
-    }
-
-    static let apnsDiagnostic = Notification.Name("chariot.mac.apns.diagnostic")
-
-    private func diagnose(_ message: String) {
-        NotificationCenter.default.post(name: Self.apnsDiagnostic, object: message)
-    }
-
-    func application(_ application: NSApplication,
-                     didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
-        diagnose("apns registered (token \(deviceToken.prefix(4).map { String(format: "%02x", $0) }.joined())…)")
-    }
-
-    func application(_ application: NSApplication,
-                     didFailToRegisterForRemoteNotificationsWithError error: Error) {
-        diagnose("apns registration FAILED: \(error)")
-    }
-
-    // CloudKit zone-subscription pushes: a wake signal only (design §4.8).
-    func application(_ application: NSApplication,
-                     didReceiveRemoteNotification userInfo: [String: Any]) {
-        diagnose("push received")
-        NotificationCenter.default.post(name: Self.pushWake, object: nil)
-    }
-
-    // Foreground activation: reconcile once (§13.12).
-    func applicationDidBecomeActive(_ notification: Notification) {
-        NotificationCenter.default.post(name: Self.pushWake, object: nil)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -83,11 +51,20 @@ final class AppModel: ObservableObject {
     @Published var signInInProgress = false
     @Published var eventLog: [String] = []
     @Published var fatalError: String?
-    @Published var transportMode = "Local mailbox (127.0.0.1)"
+    @Published var tailnetStatus: TailnetStatus = .stopped
+    @Published var tailnetInfo: TailnetInfo?
 
     private(set) var hub: ChariotHub?
 
     var macFingerprint: String { hub?.macPublicIdentity.fingerprint ?? "—" }
+
+    var transportMode: String {
+        guard hub?.tailscaleEnabled == true else { return "Local development (127.0.0.1)" }
+        switch tailnetStatus {
+        case .ready(let info): return "Tailscale — \(info.dnsName)"
+        default: return "Tailscale — \(tailnetStatus.label)"
+        }
+    }
 
     init() {
         do {
@@ -124,16 +101,6 @@ final class AppModel: ObservableObject {
                     self?.approvalRequest = (response.mobileDisplayName, response.mobile.fingerprint, respond)
                 }
             }
-            NotificationCenter.default.addObserver(forName: AppDelegate.pushWake, object: nil,
-                                                   queue: .main) { [weak hub] _ in
-                hub?.pokeCloudPoll()
-            }
-            NotificationCenter.default.addObserver(forName: AppDelegate.apnsDiagnostic, object: nil,
-                                                   queue: .main) { [weak hub] notification in
-                if let message = notification.object as? String {
-                    hub?.note(message)
-                }
-            }
             // Brokered browser step (design §3.1): guest asked for OAuth; the
             // Mac performs the browser dance. The localhost callback is
             // tunneled back into the guest by the hub.
@@ -144,39 +111,20 @@ final class AppModel: ObservableObject {
                     }
                 }
             }
-            try hub.startMailboxServer(port: UInt16(env["CHARIOT_MAILBOX_PORT"] ?? "8787") ?? 8787)
-            // Real CloudKit transport (design §4.6) when the entitled build
-            // declares a container; the localhost mailbox stays for local dev.
-            if let container = env["CHARIOT_CLOUDKIT"]
-                ?? Bundle.main.object(forInfoDictionaryKey: "ChariotCloudKitContainer") as? String {
-                hub.cloudDesired = true
-                Task {
-                    // The development container rate-limits aggressively; keep
-                    // retrying with the server-provided backoff until it opens.
-                    while true {
-                        do {
-                            try await hub.enableCloudKit(containerID: container)
-                            await MainActor.run { self.transportMode = "CloudKit (\(container))" }
-                            return
-                        } catch let error as CKError
-                            where error.code == .quotaExceeded || error.code == .requestRateLimited {
-                            let wait = (error.retryAfterSeconds ?? 60) + 5
-                            await MainActor.run {
-                                self.transportMode = "CloudKit throttled — retrying in \(Int(wait))s"
-                            }
-                            try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
-                        } catch {
-                            await MainActor.run {
-                                self.transportMode = "CloudKit unavailable — local mailbox only"
-                                self.eventLog.append("CloudKit failed: \(error)")
-                            }
-                            return
-                        }
-                    }
+            try hub.startTransportServer(port: UInt16(env["CHARIOT_MAILBOX_PORT"] ?? "8787") ?? 8787)
+
+            // Embedded Tailscale node (one per installation). Users never
+            // install the Tailscale Mac app; the bundled helper is the node.
+            if hub.tailscaleEnabled {
+                if let helper = Self.helperURL() {
+                    hub.enableTailscale(helperURL: helper)
+                } else {
+                    eventLog.append("agent-tailnet helper missing from the app bundle")
                 }
             }
+
             refreshDevices()
-            statusLine = "Mailbox on 127.0.0.1:\(hub.mailboxPort). Sandbox stopped."
+            statusLine = "Transport on 127.0.0.1:\(hub.transportPort). Sandbox stopped."
             vmState = hub.vmState
             // Adopt an existing instance so the UI reflects it before Start.
             if !hub.backend.existingInstanceIDs().isEmpty {
@@ -194,6 +142,23 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// The bundled helper lives next to the app executable (signed and covered
+    /// by the hardened runtime); a dev override and a build-tree fallback keep
+    /// `swift run` workflows working.
+    static func helperURL() -> URL? {
+        var candidates: [URL] = []
+        if let override = ProcessInfo.processInfo.environment["CHARIOT_TAILNET_HELPER"] {
+            candidates.append(URL(fileURLWithPath: override))
+        }
+        if let executable = Bundle.main.executableURL {
+            candidates.append(executable.deletingLastPathComponent().appendingPathComponent("agent-tailnet"))
+        }
+        if let resources = Bundle.main.resourceURL {
+            candidates.append(resources.appendingPathComponent("agent-tailnet"))
+        }
+        return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
     var baseImagePath: String {
         ProcessInfo.processInfo.environment["CHARIOT_BASE_IMAGE"]
             ?? FileManager.default.homeDirectoryForCurrentUser
@@ -205,6 +170,8 @@ final class AppModel: ObservableObject {
         vmState = hub.vmState
         bridgeConnected = hub.bridgeConnected
         guestKernel = hub.lastGuestStatus?.kernel ?? ""
+        tailnetStatus = hub.tailnetStatus
+        tailnetInfo = hub.tailnet?.info
         if let agent = hub.agentStatus {
             agentInstalled = agent.installed
             agentVersion = agent.version ?? ""
@@ -215,6 +182,52 @@ final class AppModel: ObservableObject {
             agentSignedIn = false
         }
         refreshDevices()
+    }
+
+    // MARK: Tailscale controls
+
+    var tailnetAuthURL: String? {
+        if case .needsLogin(let url) = tailnetStatus { return url }
+        return nil
+    }
+
+    func tailscaleSignIn() {
+        guard let hub else { return }
+        if let urlString = tailnetAuthURL, let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
+        } else {
+            hub.tailnet?.start()
+            hub.tailnet?.requestStatus()
+        }
+    }
+
+    func tailscaleReauthenticate() {
+        hub?.tailnet?.logout()  // backend falls to NeedsLogin and emits a fresh auth URL
+    }
+
+    func tailscaleDisconnect() {
+        hub?.tailnet?.stop()
+        refresh()
+    }
+
+    func tailscaleConnect() {
+        hub?.tailnet?.start()
+        refresh()
+    }
+
+    /// Destructive: deletes the local node identity; requires signing in to
+    /// Tailscale again. The UI shows an explicit warning first.
+    func tailscaleReset() {
+        do {
+            try hub?.tailnet?.reset()
+        } catch {
+            statusLine = "Tailscale reset failed: \(error)"
+        }
+        refresh()
+    }
+
+    func openTailscaleAdmin() {
+        NSWorkspace.shared.open(URL(string: "https://login.tailscale.com/admin/machines")!)
     }
 
     func signInCodex() {

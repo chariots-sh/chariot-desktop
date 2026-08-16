@@ -13,10 +13,7 @@ let package = Package(
     targets: [
         .target(
             name: "ChariotCore",
-            dependencies: [
-                "AgentLinkKit",
-                .product(name: "AgentLinkCloudKit", package: "AgentLinkKit")
-            ]
+            dependencies: ["AgentLinkKit"]
         ),
         .executableTarget(
             name: "chariotd",

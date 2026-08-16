@@ -14,7 +14,7 @@ struct WelcomeView: View {
                 .font(.system(size: 64))
                 .foregroundStyle(.tint)
             Text("Chariot").font(.largeTitle).bold()
-            Text("Chat with the coding agent running in the sandbox on your Mac.\n\nYour Mac and this device should be signed into the same iCloud account. Messages are end-to-end encrypted — the mailbox only ever sees ciphertext.")
+            Text("Chat with the coding agent running in the sandbox on your Mac.\n\nInstall the Tailscale app on this phone and connect it to the same tailnet as your Mac. Messages travel inside your private tailnet and are end-to-end encrypted on top.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 32)
@@ -191,8 +191,18 @@ struct ConversationView: View {
                 }
                 .padding(10)
             }
-            .navigationTitle(model.macOnline ? "Agent" : "Agent (Mac offline)")
+            .navigationTitle(model.connectionState == .connected ? "Agent" : "Agent (\(model.connectionState.label))")
             .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .top) {
+                if model.connectionState != .connected, !model.connectionDetail.isEmpty {
+                    Text(model.connectionDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                        .background(.yellow.opacity(0.15))
+                }
+            }
         }
     }
 
@@ -248,15 +258,25 @@ struct ConnectionDetailsView: View {
                     LabeledContent("Mac fingerprint", value: model.record?.macIdentity.fingerprint ?? "—")
                         .font(.footnote.monospaced())
                 }
-                Section("Connection") {
+                Section {
                     LabeledContent("Mode", value: model.connectionMode)
+                    LabeledContent("Service", value: model.record?.serviceURL ?? "—")
+                        .font(.footnote.monospaced())
+                    LabeledContent("Instance", value: model.record?.instanceID ?? "—")
                     LabeledContent("Epoch", value: "\(model.record?.epoch ?? 0)")
-                    LabeledContent("Last push received",
-                                   value: model.lastPushAt?.formatted(date: .omitted, time: .standard) ?? "never")
                     LabeledContent("Last activity",
                                    value: model.lastActivity?.formatted(date: .omitted, time: .standard) ?? "—")
                     LabeledContent("Paired",
                                    value: model.record?.pairedAt.formatted(date: .abbreviated, time: .shortened) ?? "—")
+                    Button("Reconnect now") { model.reconnectIfNeeded() }
+                } header: {
+                    Text("Connection")
+                } footer: {
+                    if !model.connectionDetail.isEmpty {
+                        Text(model.connectionDetail)
+                    } else {
+                        Text("Traffic flows over your Tailscale network. Keep the Tailscale app connected on this phone.")
+                    }
                 }
                 Section("This device") {
                     LabeledContent("Fingerprint", value: model.fingerprint)

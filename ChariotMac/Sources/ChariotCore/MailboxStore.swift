@@ -1,10 +1,10 @@
 import Foundation
 import AgentLinkKit
 
-/// Durable envelope mailbox with the semantics the design assigns to CloudKit
-/// (§4.6, §13.9): opaque encrypted envelopes, per-recipient fetch after a
-/// cursor, acknowledgement deletes, expiry. Persisted as JSON on disk so the
-/// daemon can restart without losing queued messages.
+/// Durable outbound queue for phone-bound envelopes: opaque encrypted
+/// envelopes, per-recipient fetch, acknowledgement deletes, expiry. Persisted
+/// as JSON on disk so a restart never loses queued messages; envelopes leave
+/// the queue only when the recipient acknowledges them over the WebSocket.
 public final class MailboxStore: @unchecked Sendable {
     public struct StoredEnvelope: Codable {
         public let serial: UInt64

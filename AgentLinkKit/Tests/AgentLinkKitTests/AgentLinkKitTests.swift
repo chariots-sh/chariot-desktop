@@ -6,18 +6,22 @@ final class AgentLinkKitTests: XCTestCase {
 
     func makePayload(expiresIn: TimeInterval = 120,
                      secretBytes: Int = 32,
-                     type: String = PairingPayload.payloadType) throws -> Data {
+                     type: String = PairingPayload.payloadType,
+                     serviceURL: String = "https://agentbox-ab12.tail1234.ts.net",
+                     tlsPublicKeyHash: String? = nil) throws -> Data {
         let mac = DeviceIdentity()
         let eph = Curve25519.KeyAgreement.PrivateKey()
         var payload = try CanonicalCoding.encode(PairingPayload(
-            rendezvousID: UUID().uuidString.lowercased(),
+            serviceURL: serviceURL,
+            instanceID: "sandbox-1",
             macDeviceID: mac.deviceID,
             macDisplayName: "Test Mac",
             macSigningPublicKey: mac.signingKey.publicKey.rawRepresentation,
             macPairingPublicKey: eph.publicKey.rawRepresentation,
+            tlsPublicKeyHash: tlsPublicKeyHash,
+            pairingID: UUID().uuidString.lowercased(),
             pairingSecret: Data((0..<secretBytes).map { _ in UInt8.random(in: 0...255) }),
-            expiresAt: Date().addingTimeInterval(expiresIn),
-            mailbox: "http://127.0.0.1:8787"
+            expiresAt: Date().addingTimeInterval(expiresIn)
         ))
         if type != PairingPayload.payloadType {
             var obj = try JSONSerialization.jsonObject(with: payload) as! [String: Any]
@@ -63,6 +67,78 @@ final class AgentLinkKitTests: XCTestCase {
         obj["mac_signing_public_key"] = "AAAA"  // wrong length key
         let tampered = try JSONSerialization.data(withJSONObject: obj)
         XCTAssertThrowsError(try PairingPayload.validate(json: tampered))
+    }
+
+    func testServiceURLValidation() throws {
+        // Loopback http is allowed for the development harness.
+        _ = try PairingPayload.validate(json: try makePayload(serviceURL: "http://127.0.0.1:8787"))
+        // Plain http to a real host is rejected.
+        XCTAssertThrowsError(try PairingPayload.validate(json:
+            try makePayload(serviceURL: "http://agentbox.example.ts.net")))
+        // Bare tailnet IPs are rejected: payloads must carry the MagicDNS name.
+        XCTAssertThrowsError(try PairingPayload.validate(json:
+            try makePayload(serviceURL: "https://100.101.102.103")))
+        XCTAssertThrowsError(try PairingPayload.validate(json: try makePayload(serviceURL: "not a url")))
+    }
+
+    func testLegacyV1PayloadRejected() throws {
+        let data = try makePayload()
+        var obj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        obj["version"] = 1
+        let v1 = try JSONSerialization.data(withJSONObject: obj)
+        XCTAssertThrowsError(try PairingPayload.validate(json: v1)) {
+            XCTAssertEqual($0 as? AgentLinkError, .unsupportedVersion(1))
+        }
+    }
+
+    func testTLSPinRoundTrip() throws {
+        let pin = Data(SHA256.hash(data: Data("spki".utf8))).base64EncodedString()
+        let payload = try PairingPayload.validate(json: try makePayload(tlsPublicKeyHash: pin))
+        XCTAssertEqual(payload.tlsPublicKeyHash, pin)
+        // And absent stays absent (Tailscale-issued TLS case).
+        XCTAssertNil(try PairingPayload.validate(json: try makePayload()).tlsPublicKeyHash)
+    }
+
+    // MARK: WebSocket session auth
+
+    func testTransportAuthChallengeResponse() throws {
+        let phone = DeviceIdentity()
+        let nonce = UUID().uuidString
+        let signature = try TransportAuth.signature(nonce: nonce, deviceID: phone.deviceID,
+                                                    instanceID: "sandbox-1",
+                                                    signingKey: phone.signingKey)
+        XCTAssertTrue(TransportAuth.verify(nonce: nonce, deviceID: phone.deviceID,
+                                           instanceID: "sandbox-1", signature: signature,
+                                           signingPublicKey: phone.publicIdentity.signingPublicKey))
+        // Any field substitution breaks the signature.
+        XCTAssertFalse(TransportAuth.verify(nonce: "other-nonce", deviceID: phone.deviceID,
+                                            instanceID: "sandbox-1", signature: signature,
+                                            signingPublicKey: phone.publicIdentity.signingPublicKey))
+        XCTAssertFalse(TransportAuth.verify(nonce: nonce, deviceID: phone.deviceID,
+                                            instanceID: "sandbox-2", signature: signature,
+                                            signingPublicKey: phone.publicIdentity.signingPublicKey))
+        let other = DeviceIdentity()
+        XCTAssertFalse(TransportAuth.verify(nonce: nonce, deviceID: phone.deviceID,
+                                            instanceID: "sandbox-1", signature: signature,
+                                            signingPublicKey: other.publicIdentity.signingPublicKey))
+    }
+
+    func testTransportFrameRoundTrip() throws {
+        var frame = TransportFrame(type: .ack)
+        frame.messageIDs = ["m1", "m2"]
+        let decoded = try TransportFrame.decode(frame.encoded())
+        XCTAssertEqual(decoded, frame)
+
+        let mac = DeviceIdentity()
+        let phone = DeviceIdentity()
+        let session = try SessionCrypto(localIdentity: phone, peerPublicIdentity: mac.publicIdentity, epoch: 1)
+        let message = AgentMessage(conversationID: "c", senderDeviceID: phone.deviceID,
+                                   sequence: 1, type: .conversationSend,
+                                   body: .object(["text": .string("hi")]))
+        var envelopeFrame = TransportFrame(type: .envelope)
+        envelopeFrame.envelope = try session.seal(message)
+        let decodedEnvelope = try TransportFrame.decode(envelopeFrame.encoded())
+        XCTAssertEqual(decodedEnvelope.envelope, envelopeFrame.envelope)
     }
 
     // MARK: Pairing crypto symmetry

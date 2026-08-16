@@ -1,13 +1,15 @@
 import Foundation
 
-/// Minimal blocking HTTP/1.1 server bound to 127.0.0.1 only. This is the
-/// development stand-in for CloudKit's transport surface — it never listens on
-/// a LAN or public interface.
+/// Minimal blocking HTTP/1.1 server bound to 127.0.0.1 only, with WebSocket
+/// upgrade support. It never listens on a LAN or public interface: tailnet
+/// clients reach it exclusively through the agent-tailnet helper's tsnet
+/// listener, which proxies to this loopback socket.
 final class HTTPServer: @unchecked Sendable {
     struct Request {
         let method: String
         let path: String
         let query: [String: String]
+        let headers: [String: String]  // keys lowercased
         let body: Data
     }
 
@@ -15,6 +17,9 @@ final class HTTPServer: @unchecked Sendable {
         let status: Int
         let body: Data
         var contentType: String = "application/json"
+        /// When set, the connection is upgraded to a WebSocket after the
+        /// handshake and handed to this callback; status/body are ignored.
+        var webSocket: ((WebSocketConnection) -> Void)?
 
         static func json(_ object: Any, status: Int = 200) -> Response {
             let data = (try? JSONSerialization.data(withJSONObject: object)) ?? Data("{}".utf8)
@@ -27,6 +32,10 @@ final class HTTPServer: @unchecked Sendable {
 
         static func error(_ status: Int, _ message: String) -> Response {
             .json(["error": message], status: status)
+        }
+
+        static func upgrade(_ handler: @escaping (WebSocketConnection) -> Void) -> Response {
+            Response(status: 101, body: Data(), webSocket: handler)
         }
     }
 
@@ -81,12 +90,14 @@ final class HTTPServer: @unchecked Sendable {
             let client = accept(listenerFD, nil, nil)
             guard client >= 0 else { break }
             let thread = Thread { [weak self] in self?.handle(client: client) }
+            thread.name = "chariot.http.connection"
             thread.start()
         }
     }
 
     private func handle(client: Int32) {
-        defer { Darwin.close(client) }
+        var closeOnExit = true
+        defer { if closeOnExit { Darwin.close(client) } }
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 65536)
 
@@ -110,8 +121,16 @@ final class HTTPServer: @unchecked Sendable {
         guard let end = headerEnd else { return }
         let headerData = buffer.subdata(in: buffer.startIndex..<end.lowerBound)
         let body = buffer.subdata(in: end.upperBound..<buffer.index(end.upperBound, offsetBy: contentLength))
-        guard let headerText = String(data: headerData, encoding: .utf8),
-              let requestLine = headerText.split(separator: "\r\n").first else { return }
+        guard let headerText = String(data: headerData, encoding: .utf8) else { return }
+        let headerLines = headerText.split(separator: "\r\n")
+        guard let requestLine = headerLines.first else { return }
+        var headers: [String: String] = [:]
+        for line in headerLines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let key = line[line.startIndex..<colon].lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            headers[key] = value
+        }
         let parts = requestLine.split(separator: " ")
         guard parts.count >= 2 else { return }
         let method = String(parts[0])
@@ -129,7 +148,30 @@ final class HTTPServer: @unchecked Sendable {
             }
         }
 
-        let response = handler(Request(method: method, path: path, query: query, body: body))
+        let request = Request(method: method, path: path, query: query, headers: headers, body: body)
+        let response = handler(request)
+
+        if let wsHandler = response.webSocket {
+            guard headers["upgrade"]?.lowercased() == "websocket",
+                  let clientKey = headers["sec-websocket-key"] else {
+                let out = Data("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+                _ = out.withUnsafeBytes { write(client, $0.baseAddress, $0.count) }
+                return
+            }
+            let accept = WebSocketConnection.acceptKey(for: clientKey)
+            let handshake = "HTTP/1.1 101 Switching Protocols\r\n"
+                + "Upgrade: websocket\r\n"
+                + "Connection: Upgrade\r\n"
+                + "Sec-WebSocket-Accept: \(accept)\r\n\r\n"
+            let out = Data(handshake.utf8)
+            _ = out.withUnsafeBytes { write(client, $0.baseAddress, $0.count) }
+            let connection = WebSocketConnection(fd: client)
+            wsHandler(connection)
+            closeOnExit = true  // run() returns when the socket is done
+            connection.run()
+            return
+        }
+
         let statusText = response.status == 200 ? "OK" : (response.status == 404 ? "Not Found" : "Error")
         var out = Data("HTTP/1.1 \(response.status) \(statusText)\r\n".utf8)
         out.append(Data("Content-Type: \(response.contentType)\r\n".utf8))

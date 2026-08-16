@@ -1,31 +1,7 @@
 import SwiftUI
-import UIKit
-
-/// Registers for silent CloudKit pushes (design §13.12). Notifications are
-/// only a wake signal — the model re-polls its mailbox on every wake.
-final class PushDelegate: NSObject, UIApplicationDelegate {
-    static let wakeNotification = Notification.Name("chariot.push.wake")
-
-    func application(_ application: UIApplication,
-                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
-        application.registerForRemoteNotifications()
-        return true
-    }
-
-    func application(_ application: UIApplication,
-                     didReceiveRemoteNotification userInfo: [AnyHashable: Any],
-                     fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
-        NotificationCenter.default.post(name: Self.wakeNotification, object: nil)
-        // Give the model a moment to fetch before reporting.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            completionHandler(.newData)
-        }
-    }
-}
 
 @main
 struct ChariotMobileApp: App {
-    @UIApplicationDelegateAdaptor(PushDelegate.self) var pushDelegate
     @StateObject private var model = PhoneModel()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -33,21 +9,12 @@ struct ChariotMobileApp: App {
         WindowGroup {
             RootView()
                 .environmentObject(model)
-                .onReceive(NotificationCenter.default.publisher(for: PushDelegate.wakeNotification)) { _ in
-                    model.lastPushAt = Date()
-                    Task {
-                        await model.pollOnce()
-                        model.flushOutbox()
-                    }
-                }
         }
         .onChange(of: scenePhase) { _, phase in
-            // Foreground activation: reconcile once, then APNs carries it.
+            // iOS suspends the WebSocket in the background; foreground
+            // activation reconnects and resumes from the last acked message.
             if phase == .active {
-                Task {
-                    await model.pollOnce()
-                    model.flushOutbox()
-                }
+                model.reconnectIfNeeded()
             }
         }
     }
