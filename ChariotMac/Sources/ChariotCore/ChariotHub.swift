@@ -70,6 +70,8 @@ public final class ChariotHub: @unchecked Sendable {
         var encryptedCredential: Data?
     }
     private var pairingSessions: [String: PairingSession] = [:]
+    /// Responders for pairings waiting on interactive device approval.
+    private var pendingApprovals: [String: @Sendable (Bool) -> Void] = [:]
 
     /// Approve new devices without UI (used by the daemon; the app can set
     /// this false and approve interactively).
@@ -772,7 +774,20 @@ public final class ChariotHub: @unchecked Sendable {
             if autoApprovePairing {
                 approve(true)
             } else if let ask = onDeviceApprovalRequest {
-                ask(response, approve)
+                // Interactive approval races the admin surface (see
+                // resolvePendingPairing); whoever takes the responder out of
+                // pendingApprovals first decides, the other no-ops.
+                lock.lock()
+                pendingApprovals[pairingID] = approve
+                lock.unlock()
+                let guarded: @Sendable (Bool) -> Void = { [weak self] approved in
+                    guard let self else { return }
+                    self.lock.lock()
+                    let responder = self.pendingApprovals.removeValue(forKey: pairingID)
+                    self.lock.unlock()
+                    responder?(approved)
+                }
+                ask(response, guarded)
             } else {
                 approve(false)
             }
@@ -785,6 +800,20 @@ public final class ChariotHub: @unchecked Sendable {
             event("pairing response rejected: \(error)")
             return .failure(.invalid)
         }
+    }
+
+    /// Approve or reject a pairing that is waiting on interactive device
+    /// approval — the loopback admin surface's stand-in for clicking the
+    /// GUI alert (used by automated end-to-end tests). Returns false when
+    /// nothing is waiting (already resolved, expired, or unknown).
+    @discardableResult
+    public func resolvePendingPairing(pairingID: String, approved: Bool) -> Bool {
+        lock.lock()
+        let responder = pendingApprovals.removeValue(forKey: pairingID)
+        lock.unlock()
+        guard let responder else { return false }
+        responder(approved)
+        return true
     }
 
     private func completePairing(pairingID: String, response: PairingResponse, approved: Bool) {
@@ -971,6 +1000,53 @@ public final class ChariotHub: @unchecked Sendable {
             let bridge = context.bridge
             lock.unlock()
             try? bridge?.cancel(conversationID: message.conversationID)
+        case .fileWrite:
+            // Phone → workspace data upload (design: phone is the source of
+            // truth; the VM replica is disposable). Same path discipline as
+            // pack populate: the guest bridge only writes under /workspace.
+            let path = message.body["path"]?.stringValue ?? ""
+            let deviceID = entry.identity.deviceID
+            let conversationID = message.conversationID
+            guard path.hasPrefix("/workspace/"), !path.contains(".."),
+                  let encoded = message.body["contents_b64"]?.stringValue,
+                  let contents = Data(base64Encoded: encoded) else {
+                try sendToDevice(deviceID, context: context, type: .fileWriteResult,
+                                 conversationID: conversationID,
+                                 body: .object(["request_id": .string(message.messageID),
+                                                "path": .string(path),
+                                                "ok": .bool(false),
+                                                "error": .string("invalid path or contents")]))
+                return
+            }
+            lock.lock()
+            let bridge = context.bridge
+            lock.unlock()
+            guard let bridge else {
+                try sendToDevice(deviceID, context: context, type: .fileWriteResult,
+                                 conversationID: conversationID,
+                                 body: .object(["request_id": .string(message.messageID),
+                                                "path": .string(path),
+                                                "ok": .bool(false),
+                                                "error": .string("sandbox is not running")]))
+                return
+            }
+            event("file from \(entry.displayName) → \(displayName(of: context)): \(path) (\(contents.count) bytes)")
+            Task { [weak self] in
+                guard let self else { return }
+                var failure: String?
+                do {
+                    _ = try await bridge.putFile(path: path, contents: contents,
+                                                 mode: 0o644, ifAbsent: false)
+                } catch {
+                    failure = "\(error)"
+                }
+                var body: [String: JSONValue] = ["request_id": .string(message.messageID),
+                                                 "path": .string(path),
+                                                 "ok": .bool(failure == nil)]
+                if let failure { body["error"] = .string(failure) }
+                try? self.sendToDevice(deviceID, context: context, type: .fileWriteResult,
+                                       conversationID: conversationID, body: .object(body))
+            }
         case .sandboxStatus:
             lock.lock()
             let status = context.lastGuestStatus
@@ -1475,6 +1551,10 @@ public final class ChariotHub: @unchecked Sendable {
             return .json(["agents": agents])
         case (_, "agents") where rest.count == 3:
             return routeAgentAdmin(request, instanceID: rest[1], action: rest[2])
+        case ("POST", "pairing") where rest.count == 3 && rest[2] == "approve":
+            return resolvePendingPairing(pairingID: rest[1], approved: true)
+                ? .json(["result": "ok"])
+                : .error(404, "no pairing awaiting approval")
         case ("POST", "pairing"):
             do {
                 let payload = try startPairingSession()
