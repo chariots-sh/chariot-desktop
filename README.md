@@ -124,6 +124,13 @@ guardian.pack/
   The credential IS the grant — there is no hub-wide agent ACL.
 - **Codex sign-in is per VM** (auth lives in each guest, erased by that
   agent's Reset); one brokered browser dance per agent.
+- **Phone data uploads**: a paired device can push files into its agent's
+  `/workspace` with `file.write` envelopes over the encrypted channel
+  (`file.write.result` confirms each write, keyed by request message ID, so
+  the phone can order a prompt strictly after its own data). Contents may be
+  sent raw or as raw DEFLATE (`"encoding": "deflate"`); the hub inflates
+  before the guest sees the file. This is how the A-LIST locomo Guardian
+  keeps `/workspace/data/alist-archive.json` fresh before every turn.
 - A `data` field in pack.json is reserved for Milestone 2 (phone data
   providers) and ignored by this loader.
 
@@ -141,8 +148,11 @@ ChariotMac/.build/arm64-apple-macosx/debug/chariotd \
 `chariotd` serves the transport (pairing + WebSocket) on `127.0.0.1:8787` and
 local admin endpoints on `127.0.0.1:8788` (`/admin/pairing`, `/admin/summary`,
 `/admin/conversation`, `/admin/revoke`, `/admin/devaccess`, `/admin/tailnet`,
-plus the fleet surface: `GET /admin/packs`, `GET|POST /admin/agents`, and
-per-agent `POST /admin/agents/<uuid>/{vm,pairing,conversation,login}`).
+plus the fleet surface: `GET /admin/packs`, `GET|POST /admin/agents`,
+per-agent `POST /admin/agents/<uuid>/{vm,pairing,conversation,login}`,
+`GET /admin/events` for the hub event buffer, and
+`POST /admin/pairing/<id>/approve` to resolve a pairing waiting on the GUI
+approval alert — the headless stand-in automated tests use).
 The admin surface is never reachable through the tailnet proxy. The GUI and
 daemon share the same data dir and ports, so run one at a time
 (`pkill -TERM -f chariotd`).

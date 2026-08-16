@@ -13,6 +13,8 @@ public enum AgentMessageType: String, Codable, Sendable {
     case oauthCompleted = "oauth.completed"
     case sandboxStatus = "sandbox.status"
     case deviceRevoked = "device.revoked"
+    case fileWrite = "file.write"
+    case fileWriteResult = "file.write.result"
     case ack = "ack"
 }
 

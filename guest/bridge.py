@@ -38,7 +38,10 @@ CODEX_BINARIES = {
     "/usr/local/bin/codex-code-mode-host": "codex-code-mode-host-aarch64-unknown-linux-musl",
 }
 PROTOCOL_VERSION = 1
-MAX_LINE_BYTES = 1 * 1024 * 1024
+# Big enough for a file.put of a phone data snapshot (base64 inflates the
+# payload 4/3; a multi-MB archive arrives as one JSON line). vsock is local
+# and the host is trusted, so this is a sanity bound, not a defense.
+MAX_LINE_BYTES = 64 * 1024 * 1024
 OUTPUT_LIMIT_PER_ITEM = 4000
 
 start_time = time.time()
