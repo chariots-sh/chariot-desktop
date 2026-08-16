@@ -4,9 +4,9 @@ Implementation of the sandboxed agent system described in
 [sandboxed-agent-system-design.md](sandboxed-agent-system-design.md): a native
 macOS app that runs **OpenAI Codex CLI** inside a disposable Linux VM
 (`Virtualization.framework`), plus an iPhone app that pairs via QR code and
-drives the agent through end-to-end-encrypted messages over CloudKit.
+drives the agent through end-to-end-encrypted messages **over Tailscale**.
 
-Current state (the notes below the quick start describe the layered history):
+Current state:
 
 - The in-VM agent is real Codex (`codex exec --json` per turn, session resume
   per conversation). Sign-in uses Codex's ChatGPT browser login, brokered per
@@ -14,29 +14,38 @@ Current state (the notes below the quick start describe the layered history):
   `localhost:1455` OAuth callback is tunneled into the guest over vsock. The
   session is sandbox-local (credential level 3): survives Stop/Restart,
   erased by Reset.
-- Transport is real CloudKit (`iCloud.com.protocols.chariot`, private DB custom
-  zone) with `CKSyncEngine` change-token fetching on a steady reconcile
-  cadence; silent pushes are treated as accelerators only — macOS defers them
-  too aggressively to carry latency.
-- The localhost HTTP mailbox remains as the dev/E2E-harness transport
-  (`chariotd`), and `!command` prompts remain as a raw-shell debug fallback.
+- Transport is **Tailscale**: the Mac app bundles `agent-tailnet`, an embedded
+  `tsnet` node (one per installation, hostname `agentbox-<suffix>`), exposing
+  a single HTTPS/WSS endpoint on tailnet TCP 443. The phone — whose VPN is the
+  **official Tailscale iOS app** — holds one persistent WebSocket and resumes
+  on foregrounding/network changes. No developer-operated relay, signaling,
+  TURN, or mailbox service exists; CloudKit and WebRTC are gone.
+  See [docs/tailscale.md](docs/tailscale.md).
+- The same transport service also listens on loopback, which is what the
+  dev/E2E harness (`chariotd`, simulator) connects to directly with
+  `CHARIOT_TAILSCALE=0` — same protocol, no tailnet required.
 
 ## What's here
 
 | Component | Path | Role |
 |---|---|---|
-| `AgentLinkKit` | `AgentLinkKit/` | Shared Swift package: protocol models, QR payload validation, Ed25519/X25519 envelope crypto, replay protection, device credentials. 18 unit tests. |
-| `ChariotCore` | `ChariotMac/Sources/ChariotCore/` | VM supervisor (`SandboxBackend` over Virtualization.framework), vsock bridge client, localhost mailbox server, pairing/session hub, developer access (SSH over virtio tunnel). |
+| `AgentLinkKit` | `AgentLinkKit/` | Shared Swift package: protocol models, QR v2 payload validation, Ed25519/X25519 envelope crypto, WebSocket frame protocol + session auth, replay protection, device credentials. 23 unit tests. |
+| `agent-tailnet` | `agent-tailnet/` | Bundled Go helper: persistent `tsnet` node, NDJSON control protocol over stdio, TLS (Tailscale-issued or pinned self-signed), tailnet→loopback proxy. |
+| `ChariotCore` | `ChariotMac/Sources/ChariotCore/` | VM supervisor (`SandboxBackend` over Virtualization.framework), vsock bridge client, transport service (HTTP + WebSocket), tailnet supervisor, pairing/session hub, developer access (SSH over virtio tunnel). |
 | `chariotd` | `ChariotMac/Sources/chariotd/` | Headless daemon used by the E2E harness. |
-| Chariot Desktop.app | `ChariotMac/Sources/ChariotDesktopApp/` | SwiftUI app: sandbox lifecycle, conversation, QR pairing sheet with device approval, paired-device revocation, developer access panel. |
-| ChariotMobile.app | `ChariotMobile/` | Sample iPhone app: Welcome/Scanner/Conversation/Connection screens, durable outbox, mailbox polling, revocation handling. |
+| Chariot Desktop.app | `ChariotMac/Sources/ChariotDesktopApp/` | SwiftUI app: sandbox lifecycle, conversation, Tailscale panel (sign-in/reauth/disconnect/reset), QR pairing sheet with device approval, revocation, developer access. |
+| ChariotMobile.app | `ChariotMobile/` | iPhone app: Welcome/Scanner/Conversation/Connection screens, persistent WSS with backoff+jitter reconnect, durable outbox, revocation handling. |
 | Guest assets | `guest/` | `bridge.py` (vsock agent bridge + SSH tunnel) and the cloud-init `user-data` template. |
 | Scripts | `scripts/` | Build/run/E2E helpers. |
+| Docs | `docs/tailscale.md` | Tailnet onboarding, HTTPS, Grants policy examples, key expiry, troubleshooting. |
 
 ## Requirements
 
-- Apple silicon Mac, macOS 14+ (developed on 26.x), Xcode toolchain
+- Apple silicon Mac, macOS 14+ (developed on 26.x), Xcode toolchain, Go 1.22+
+  (for the bundled `agent-tailnet` helper)
 - ~10 GB disk for the guest image and instance disks
+- A [Tailscale](https://tailscale.com) account (free for personal use); the
+  official Tailscale app on the iPhone
 - The Debian ARM64 cloud image (raw): downloaded automatically to
   `guest-images/debian-12-genericcloud-arm64.raw` by the E2E script, or:
   ```bash
@@ -47,25 +56,32 @@ Current state (the notes below the quick start describe the layered history):
 ## Quick start (GUI)
 
 ```bash
-scripts/build-app.sh        # builds build/Chariot Desktop.app (ad-hoc signed)
+scripts/build-app.sh        # builds build/Chariot Desktop.app (incl. agent-tailnet, ad-hoc signed)
 scripts/run-desktop.sh      # launches it with defaults for this checkout
 ```
 
-In the app: **Sandbox → Start** boots the VM (first boot ~40 s while cloud-init
-provisions the bridge). **Conversation** talks to the agent — prefix a message
-with `!` to run a shell command inside the guest. **Devices → Pair new device**
-shows the QR code; approval is interactive in the GUI.
+In the app: **Tailscale → Sign in to Tailscale** authenticates the embedded
+node (one browser login; the identity persists). **Sandbox → Start** boots the
+VM (first boot ~40 s while cloud-init provisions the bridge). **Conversation**
+talks to the agent — prefix a message with `!` to run a shell command inside
+the guest. **Devices → Pair new device** shows the QR code; approval is
+interactive in the GUI.
 
-iPhone app (simulator):
+iPhone: install the official Tailscale app, join the same tailnet, then scan
+the QR with ChariotMobile. Mac and phone restarts don't require rescanning.
+
+iPhone app (simulator, loopback dev mode):
 
 ```bash
 scripts/build-ios.sh
 xcrun simctl install <booted-udid> build/ChariotMobile.app
 ```
 
-The simulator has no camera, so use **Copy payload (simulator)** in the Mac
-pairing sheet and paste it into the phone's scanner screen. On a real device
-the same screen scans the QR live via `DataScannerViewController`.
+The simulator has no camera and no tailnet: run the Mac side with
+`CHARIOT_TAILSCALE=0` so QR payloads carry the loopback service URL, then use
+**Copy payload** in the Mac pairing sheet and paste it into the phone's
+scanner screen. On a real device the same screen scans the QR live via
+`DataScannerViewController`.
 
 ## Headless daemon + end-to-end test
 
@@ -74,18 +90,56 @@ scripts/build-mac.sh
 ChariotMac/.build/arm64-apple-macosx/debug/chariotd \
   --data-dir chariot-data \
   --base-image guest-images/debian-12-genericcloud-arm64.raw \
-  --guest-resources guest
+  --guest-resources guest \
+  --no-tailscale          # loopback dev mode; omit to run the embedded node
 ```
 
-`chariotd` exposes the mailbox on `127.0.0.1:8787` plus local admin endpoints
-(`/admin/pairing`, `/admin/summary`, `/admin/conversation`, `/admin/revoke`,
-`/admin/devaccess`). The GUI and daemon share the same data dir and port, so
-run one at a time (`pkill -TERM -f chariotd`).
+`chariotd` serves the transport (pairing + WebSocket) on `127.0.0.1:8787` and
+local admin endpoints on `127.0.0.1:8788` (`/admin/pairing`, `/admin/summary`,
+`/admin/conversation`, `/admin/revoke`, `/admin/devaccess`, `/admin/tailnet`).
+The admin surface is never reachable through the tailnet proxy. The GUI and
+daemon share the same data dir and ports, so run one at a time
+(`pkill -TERM -f chariotd`).
+
+Automated transport E2E (no tailnet or VM needed):
+
+```bash
+scripts/e2e-transport.sh    # 16 checks: pairing, WS auth, roundtrip, dedup, offline replay, revocation
+```
 
 Developer access (design §1.5): `POST /admin/devaccess {"action":"enable"}`
 (or the GUI panel) starts a localhost-only listener forwarded over virtio to
 guest sshd, generates the per-instance key/config, and prints the
 `ssh -F … chariot-development` command plus copyable Codex instructions.
+SSH/SCP remain loopback-only — they are **not** exposed over Tailscale.
+
+## Transport architecture
+
+```
+iPhone app ──HTTPS/WSS──▶ tailnet (TCP 443) ──▶ agent-tailnet (tsnet, TLS)
+                                                    │ loopback proxy
+Official Tailscale iOS app provides the VPN         ▼
+                                              transport service (ChariotCore)
+                                                    │
+                                              agent supervisor → Linux VM
+```
+
+- **One node per installation** (`Ephemeral=false`, state in
+  `Application Support/ChariotDesktop/tailnet-state`, mode 0700). All sandbox
+  instances share it; connections are routed by `instance_id`.
+- **No secrets in the QR**: payload v2 carries the MagicDNS service URL (from
+  authenticated Tailscale state), the Mac's public keys, an optional TLS pin,
+  and a single-use pairing ID + secret. Never auth keys, login URLs, admin
+  tokens, or bare 100.x addresses.
+- **Tailnet ≠ authorization**: the WebSocket session starts with a
+  challenge/response signed by the paired device key; unpaired tailnet peers
+  get nothing. All messages remain E2E-encrypted with per-epoch keys.
+- **Durability**: outbound mail queues on the Mac until the phone acks;
+  the phone keeps a durable outbox until the Mac acks; both sides dedupe by
+  device, epoch, and sequence (replay windows). Direct and DERP-relayed
+  Tailscale paths behave identically.
+- The temporary `tailscale_transport` migration flag is `CHARIOT_TAILSCALE`
+  (default on; `0` = loopback dev mode).
 
 ## Architecture notes & deviations from the design doc
 
@@ -97,37 +151,37 @@ guest sshd, generates the per-instance key/config, and prints the
 - **Bridge**: newline-delimited JSON over vsock port 1024 (§1.4). Port 1023
   carries the developer-access SSH tunnel; nothing is ever bound to a LAN
   interface.
-- **CloudKit stand-in**: this environment has no Apple Developer account, so
-  CloudKit/APNs entitlements cannot be provisioned. The encrypted-mailbox
-  semantics of §4.6/§13.9 (opaque envelopes, per-recipient fetch after a
-  cursor, receipts→deletion, dedup, expiry) are implemented behind a
-  localhost-only HTTP server instead. Envelopes are sealed/opened by the same
-  `AgentLinkKit` crypto on both ends, so the mailbox only ever sees
-  ciphertext — swapping the transport back to CloudKit is a transport-layer
-  change only, as the design intends. Phone-side push is replaced by polling.
+- **Transport**: the design doc's CloudKit mailbox + WebRTC direct path was
+  replaced wholesale by the Tailscale architecture above. Migration from a
+  CloudKit-era install preserves local message history but requires one new
+  QR pairing — trust is never transferred through the old transport.
 - **Identity storage**: sample persists keys as 0600 JSON files instead of
   Keychain so the ad-hoc-signed daemon and app can share identity without
   keychain ACL prompts. Production: Keychain (§3.1, §13.8).
-- **Not implemented** (per design phasing): WebRTC direct transport (Phase 5),
-  OAuth broker (Phase 2's provider integration), background helper/SMAppService,
-  artifact import/export UI, notarized distribution.
+- **Not implemented**: OAuth broker beyond Codex's brokered login,
+  background helper/SMAppService (the helper runs while the app or daemon
+  runs; if background receive is needed later, the helper and supervisor move
+  into the existing signed background-service architecture with the *same*
+  Tailscale identity), artifact import/export UI, notarized distribution.
 
 ## What was verified end to end
 
-1. `AgentLinkKit`: 18/18 unit tests (payload validation incl. expiry/replay/
-   tamper, pairing key agreement, credential sign/verify, envelope round trip,
-   wrong-epoch/expired/third-party rejection, replay window).
+1. `AgentLinkKit`: 23/23 unit tests (QR v2 validation incl. expiry/version/
+   service-URL/pin rules, pairing key agreement, credential sign/verify,
+   envelope round trip, wrong-epoch/expired/third-party rejection, replay
+   window, WebSocket challenge-response auth, frame round trip).
 2. VM boots under Virtualization.framework; bridge connects over vsock;
    `!commands` execute as `agent` in `/workspace`; guest has NAT internet.
 3. Developer access: `ssh -F … chariot-development` through the localhost →
    virtio tunnel, host-key pinned, key-only auth.
-4. Pairing: QR payload → rendezvous → encrypted response → credential
-   issuance → both sides show matching fingerprints; QR reuse is rejected
-   (single-claim rendezvous), expiry enforced.
-5. Phone → Mac → VM → phone round trip with E2E-encrypted envelopes, streamed
-   output batched into chunks, receipts deleting delivered mail.
-6. Durability: message sent while the simulator was killed mid-flight was
-   delivered after reboot from the persisted outbox; cursor-based catch-up.
-7. Revocation: Mac rejects the device (403) and advances the epoch; phone
-   shows the revoked screen; re-pairing restores service and flushes the
-   queued outbox.
+4. Pairing (loopback harness): QR v2 payload → session fetch → encrypted
+   response → credential issuance → both sides show matching fingerprints;
+   QR reuse rejected (atomic single-use pairing ID), expiry enforced.
+5. Phone → Mac → VM → phone round trip over the WebSocket with E2E-encrypted
+   envelopes, streamed output batched into chunks, acks deleting delivered
+   mail on both sides.
+6. Durability: messages queued while disconnected are delivered exactly once
+   after reconnection (server replay + client replay-window dedup).
+7. Revocation: Mac closes the session with a `revoked` frame and advances the
+   epoch; phone shows the revoked screen; reconnection is refused;
+   re-pairing restores service.

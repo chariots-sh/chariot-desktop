@@ -1,31 +1,28 @@
 import Foundation
-import CloudKit
+import CryptoKit
 #if canImport(AgentLinkKit)
 import AgentLinkKit
 #endif
 
-/// Abstraction over the encrypted-mailbox transport (design §6: "a transport
-/// abstraction with CloudKit implemented first"). Two implementations: the
-/// real CloudKit private-database mailbox, and the localhost HTTP stand-in
-/// used for development against a Mac running in local mode.
-protocol PhoneTransport: Sendable {
-    var modeDescription: String { get }
-
-    // Pairing (design §13.7)
-    func fetchPairingRecord(rendezvousID: String) async throws -> PairingRendezvous
-    func claimPairing(rendezvousID: String, ephemeralPublicKey: Data, encryptedResponse: Data) async throws
-    func fetchCredential(rendezvousID: String) async throws -> (ciphertext: Data, epoch: UInt32)?
-
-    // Envelopes (design §4.6)
-    func send(_ envelope: EncryptedEnvelope) async throws
-    func fetchInbox(recipient: String) async throws -> [EncryptedEnvelope]
-    func acknowledge(recipient: String, messageIDs: [String]) async throws
-
-    /// Presence/status of the Mac, when the transport can know it.
-    func macStatus() async -> MacStatus?
-
-    /// Register for push wake, if supported.
-    func registerForWake(deviceID: String) async
+/// Tailscale transport for the phone. The official Tailscale iOS app provides
+/// the VPN; this class is an ordinary HTTPS/WSS client talking to the Mac's
+/// embedded tailnet node (or to loopback in the development harness — same
+/// protocol, no TLS).
+///
+/// Pairing uses short REST calls; the message protocol runs over one
+/// persistent WebSocket carrying `TransportFrame` JSON. iOS suspends the app
+/// in the background, so the connection is re-established on foregrounding
+/// and network changes; sequencing, acks, and the durable outbox make that
+/// loss-free.
+enum TransportError: Error {
+    case revoked            // the Mac refuses this device
+    case denied             // WS authentication failed
+    case conflict           // pairing session already claimed
+    case notFound
+    case expired
+    case http(Int)
+    case unreachable(URLError.Code)
+    case tlsPinMismatch
 }
 
 struct PairingRendezvous {
@@ -35,235 +32,121 @@ struct PairingRendezvous {
     var state: String
 }
 
-struct MacStatus {
-    var reachable: Bool
-    var vmState: String?
-    var epoch: UInt32?
-}
+/// Narrow certificate validation: when the QR pinned a public-key hash (the
+/// Mac serves a per-installation self-signed certificate), accept exactly that
+/// SPKI for this host and nothing else. Without a pin, standard system trust
+/// applies (Tailscale-issued certificate). TLS validation is never disabled
+/// globally and no ATS exception is added.
+final class TransportSessionDelegate: NSObject, URLSessionDelegate {
+    let pinnedSPKIHash: String?
 
-enum TransportError: Error {
-    case revoked           // the Mac refuses this device
-    case conflict          // pairing session already claimed
-    case notFound
-    case http(Int)
-    case cloud(Error)
-}
-
-func makeTransport(mailbox: String) -> PhoneTransport? {
-    if mailbox.hasPrefix("cloudkit:") {
-        return CloudKitPhoneTransport(containerID: String(mailbox.dropFirst("cloudkit:".count)))
-    }
-    if mailbox.hasPrefix("http://127.0.0.1") || mailbox.hasPrefix("http://localhost") {
-        return LocalHTTPTransport(baseURL: mailbox)
-    }
-    return nil
-}
-
-// MARK: - CloudKit transport (design §13.9)
-
-final class CloudKitPhoneTransport: PhoneTransport, @unchecked Sendable {
-    let containerID: String
-    private let container: CKContainer
-    private let database: CKDatabase
-    private let zoneID: CKRecordZone.ID
-
-    init(containerID: String) {
-        self.containerID = containerID
-        self.container = CKContainer(identifier: containerID)
-        self.database = container.privateCloudDatabase
-        self.zoneID = CKRecordZone.ID(zoneName: "AgentLinkZone", ownerName: CKCurrentUserDefaultName)
+    init(pinnedSPKIHash: String?) {
+        self.pinnedSPKIHash = pinnedSPKIHash
     }
 
-    var modeDescription: String { "CloudKit mailbox" }
-
-    private func pairingRecordID(_ rendezvousID: String) -> CKRecord.ID {
-        CKRecord.ID(recordName: "pair-\(rendezvousID)", zoneID: zoneID)
-    }
-
-    func fetchPairingRecord(rendezvousID: String) async throws -> PairingRendezvous {
-        let record: CKRecord
-        do {
-            record = try await database.record(for: pairingRecordID(rendezvousID))
-        } catch let error as CKError where error.code == .unknownItem || error.code == .zoneNotFound {
-            throw TransportError.notFound
-        } catch {
-            throw TransportError.cloud(error)
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
         }
-        return PairingRendezvous(
-            macDeviceID: record["macDeviceID"] as? String ?? "",
-            macSigningPublicKey: record["macSigningPublicKey"] as? Data ?? Data(),
-            macPairingPublicKey: record["macPairingPublicKey"] as? Data ?? Data(),
-            state: record["state"] as? String ?? ""
-        )
-    }
-
-    func claimPairing(rendezvousID: String, ephemeralPublicKey: Data, encryptedResponse: Data) async throws {
-        let record: CKRecord
-        do {
-            record = try await database.record(for: pairingRecordID(rendezvousID))
-        } catch {
-            throw TransportError.notFound
+        guard let pin = pinnedSPKIHash else {
+            completionHandler(.performDefaultHandling, nil)
+            return
         }
-        guard record["state"] as? String == "waiting" else { throw TransportError.conflict }
-        record["state"] = "responded" as CKRecordValue
-        record["mobileEphemeralPublicKey"] = ephemeralPublicKey as CKRecordValue
-        record["encryptedMobileResponse"] = encryptedResponse as CKRecordValue
-        do {
-            let result = try await database.modifyRecords(saving: [record], deleting: [],
-                                                          savePolicy: .ifServerRecordUnchanged)
-            for (_, save) in result.saveResults { _ = try save.get() }
-        } catch let error as CKError where error.code == .serverRecordChanged {
-            throw TransportError.conflict  // atomic claim lost — QR replay rejected
-        } catch {
-            throw TransportError.cloud(error)
+        guard let leaf = (SecTrustCopyCertificateChain(trust) as? [SecCertificate])?.first,
+              let spki = Self.spkiDER(of: leaf) else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        let hash = Data(SHA256.hash(data: spki)).base64EncodedString()
+        if hash == pin {
+            // The pin is the trust decision; anchor the pinned certificate so
+            // the trust object itself also evaluates cleanly.
+            SecTrustSetAnchorCertificates(trust, [leaf] as CFArray)
+            SecTrustSetAnchorCertificatesOnly(trust, true)
+            var evalError: CFError?
+            _ = SecTrustEvaluateWithError(trust, &evalError)
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }
 
-    func fetchCredential(rendezvousID: String) async throws -> (ciphertext: Data, epoch: UInt32)? {
-        let record: CKRecord
-        do {
-            record = try await database.record(for: pairingRecordID(rendezvousID))
-        } catch {
-            throw TransportError.notFound
-        }
-        guard let credential = record["encryptedCredential"] as? Data else { return nil }
-        let epoch = (record["epoch"] as? Int64).map(UInt32.init) ?? 1
-        return (credential, epoch)
-    }
-
-    func send(_ envelope: EncryptedEnvelope) async throws {
-        let recordID = CKRecord.ID(recordName: "env-\(envelope.messageID)", zoneID: zoneID)
-        let record = CKRecord(recordType: "Envelope", recordID: recordID)
-        record["protocolVersion"] = envelope.version as CKRecordValue
-        record["messageID"] = envelope.messageID as CKRecordValue
-        record["conversationID"] = envelope.conversationID as CKRecordValue
-        record["senderDeviceID"] = envelope.senderDeviceID as CKRecordValue
-        record["recipientDeviceID"] = envelope.recipientDeviceID as CKRecordValue
-        record["sequence"] = Int64(envelope.sequence) as CKRecordValue
-        record["epoch"] = Int64(envelope.epoch) as CKRecordValue
-        record["createdAt"] = envelope.createdAt as CKRecordValue
-        record["expiresAt"] = envelope.expiresAt as CKRecordValue
-        record["nonce"] = envelope.nonce as CKRecordValue
-        record["ciphertext"] = envelope.ciphertext as CKRecordValue
-        record["signature"] = envelope.signature as CKRecordValue
-        do {
-            _ = try await database.save(record)
-        } catch let error as CKError where error.code == .serverRecordChanged {
-            return  // duplicate send — already deposited
-        } catch {
-            throw TransportError.cloud(error)
-        }
-    }
-
-    func fetchInbox(recipient: String) async throws -> [EncryptedEnvelope] {
-        let predicate = NSPredicate(format: "recipientDeviceID == %@", recipient)
-        let query = CKQuery(recordType: "Envelope", predicate: predicate)
-        do {
-            let (results, _) = try await database.records(matching: query, inZoneWith: zoneID,
-                                                          desiredKeys: nil, resultsLimit: 50)
-            var envelopes: [EncryptedEnvelope] = []
-            for (_, result) in results {
-                guard let record = try? result.get(), let envelope = Self.envelope(from: record) else { continue }
-                if envelope.expiresAt <= Date() { continue }
-                envelopes.append(envelope)
-            }
-            return envelopes.sorted {
-                $0.sequence != $1.sequence ? $0.sequence < $1.sequence : $0.createdAt < $1.createdAt
-            }
-        } catch let error as CKError where error.code == .zoneNotFound || error.code == .unknownItem {
-            return []
-        } catch {
-            throw TransportError.cloud(error)
-        }
-    }
-
-    static func envelope(from record: CKRecord) -> EncryptedEnvelope? {
-        guard let json = try? JSONSerialization.data(withJSONObject: [
-            "version": record["protocolVersion"] as? Int ?? 1,
-            "message_id": record["messageID"] as? String ?? "",
-            "conversation_id": record["conversationID"] as? String ?? "",
-            "sender_device_id": record["senderDeviceID"] as? String ?? "",
-            "recipient_device_id": record["recipientDeviceID"] as? String ?? "",
-            "sequence": (record["sequence"] as? Int64).map(UInt64.init) ?? 0,
-            "epoch": (record["epoch"] as? Int64).map(UInt32.init) ?? 0,
-            "created_at": ISO8601DateFormatter().string(from: record["createdAt"] as? Date ?? .distantPast),
-            "expires_at": ISO8601DateFormatter().string(from: record["expiresAt"] as? Date ?? .distantPast),
-            "nonce": Base64URL.encode(record["nonce"] as? Data ?? Data()),
-            "ciphertext": Base64URL.encode(record["ciphertext"] as? Data ?? Data()),
-            "signature": Base64URL.encode(record["signature"] as? Data ?? Data())
-        ]) else { return nil }
-        return try? CanonicalCoding.decoder().decode(EncryptedEnvelope.self, from: json)
-    }
-
-    func acknowledge(recipient: String, messageIDs: [String]) async throws {
-        guard !messageIDs.isEmpty else { return }
-        let ids = messageIDs.map { CKRecord.ID(recordName: "env-\($0)", zoneID: zoneID) }
-        _ = try? await database.modifyRecords(saving: [], deleting: ids)
-    }
-
-    func macStatus() async -> MacStatus? {
-        // CloudKit cannot observe the Mac directly; reachability of iCloud is
-        // the only signal. Sandbox state arrives via sandbox.status envelopes.
-        let status = try? await container.accountStatus()
-        return MacStatus(reachable: status == .available, vmState: nil, epoch: nil)
-    }
-
-    func registerForWake(deviceID: String) async {
-        let subscription = CKRecordZoneSubscription(zoneID: zoneID,
-                                                    subscriptionID: "chariot-phone-\(deviceID.prefix(8))")
-        let info = CKSubscription.NotificationInfo()
-        info.shouldSendContentAvailable = true
-        subscription.notificationInfo = info
-        do {
-            _ = try await database.save(subscription)
-            print("[chariot] zone subscription registered")
-        } catch let error as CKError where error.code == .serverRejectedRequest {
-            print("[chariot] zone subscription already exists")
-        } catch {
-            print("[chariot] zone subscription FAILED: \(error)")
-        }
+    /// DER SubjectPublicKeyInfo for the certificate's P-256 key (matches the
+    /// helper's hash over RawSubjectPublicKeyInfo).
+    static func spkiDER(of certificate: SecCertificate) -> Data? {
+        guard let key = SecCertificateCopyKey(certificate),
+              let raw = SecKeyCopyExternalRepresentation(key, nil) as Data? else { return nil }
+        let attributes = SecKeyCopyAttributes(key) as? [CFString: Any]
+        guard attributes?[kSecAttrKeyType] as? String == (kSecAttrKeyTypeECSECPrimeRandom as String),
+              (attributes?[kSecAttrKeySizeInBits] as? Int) == 256 else { return nil }
+        // Fixed ASN.1 header for an uncompressed P-256 public key.
+        let header: [UInt8] = [
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+            0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+            0x03, 0x01, 0x07, 0x03, 0x42, 0x00
+        ]
+        return Data(header) + raw
     }
 }
 
-// MARK: - Localhost HTTP transport (development stand-in)
+final class TailscaleTransport: NSObject, @unchecked Sendable {
+    let serviceURL: URL
+    let tlsPublicKeyHash: String?
+    private let session: URLSession
+    private let lock = NSLock()
 
-final class LocalHTTPTransport: PhoneTransport, @unchecked Sendable {
-    let baseURL: String
-    /// Serial cursor for the local mailbox; persisted via UserDefaults keyed by
-    /// base URL (the CloudKit transport has no cursor — acked mail is deleted).
-    private let cursorKey: String
-
-    init(baseURL: String) {
-        self.baseURL = baseURL
-        self.cursorKey = "chariot.cursor.\(baseURL.hashValue)"
+    init?(serviceURL: String, tlsPublicKeyHash: String?) {
+        guard let url = URL(string: serviceURL), url.host != nil else { return nil }
+        self.serviceURL = url
+        self.tlsPublicKeyHash = tlsPublicKeyHash
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 15
+        configuration.waitsForConnectivity = false
+        self.session = URLSession(configuration: configuration,
+                                  delegate: TransportSessionDelegate(pinnedSPKIHash: tlsPublicKeyHash),
+                                  delegateQueue: nil)
+        super.init()
     }
 
-    var modeDescription: String { "Local mailbox (development)" }
-
-    private var cursor: UInt64 {
-        get { UInt64(UserDefaults.standard.integer(forKey: cursorKey)) }
-        set { UserDefaults.standard.set(Int(newValue), forKey: cursorKey) }
+    var isDevelopmentLoopback: Bool {
+        serviceURL.host == "127.0.0.1" || serviceURL.host == "localhost"
     }
 
-    private func url(_ path: String, query: [String: String] = [:]) -> URL {
-        var components = URLComponents(string: baseURL)!
+    var modeDescription: String {
+        isDevelopmentLoopback ? "Local development" : "Tailscale"
+    }
+
+    // MARK: REST (pairing + reachability)
+
+    private func url(_ path: String) -> URL {
+        var components = URLComponents(url: serviceURL, resolvingAgainstBaseURL: false)!
         components.path = path
-        if !query.isEmpty {
-            components.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
-        }
         return components.url!
     }
 
     private func request(_ method: String, _ url: URL, body: Data? = nil) async throws -> Data {
-        var request = URLRequest(url: url, timeoutInterval: 10)
+        var request = URLRequest(url: url, timeoutInterval: 12)
         request.httpMethod = method
         request.httpBody = body
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch let error as URLError {
+            if error.code == .serverCertificateUntrusted || error.code == .cancelled {
+                throw TransportError.tlsPinMismatch
+            }
+            throw TransportError.unreachable(error.code)
+        }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 403 { throw TransportError.revoked }
         if status == 404 { throw TransportError.notFound }
-        if status == 409 || status == 410 { throw TransportError.conflict }
+        if status == 409 { throw TransportError.conflict }
+        if status == 410 { throw TransportError.expired }
         guard (200..<300).contains(status) else { throw TransportError.http(status) }
         return data
     }
@@ -274,8 +157,12 @@ final class LocalHTTPTransport: PhoneTransport, @unchecked Sendable {
         return (try? JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
-    func fetchPairingRecord(rendezvousID: String) async throws -> PairingRendezvous {
-        let object = try await json("GET", url("/pairing/\(rendezvousID)"))
+    func macStatus() async throws -> [String: Any] {
+        try await json("GET", url("/status"))
+    }
+
+    func fetchPairingRecord(pairingID: String) async throws -> PairingRendezvous {
+        let object = try await json("GET", url("/pairing/\(pairingID)"))
         return PairingRendezvous(
             macDeviceID: object["mac_device_id"] as? String ?? "",
             macSigningPublicKey: (try? Base64URL.decode(object["mac_signing_public_key"] as? String ?? "")) ?? Data(),
@@ -284,15 +171,15 @@ final class LocalHTTPTransport: PhoneTransport, @unchecked Sendable {
         )
     }
 
-    func claimPairing(rendezvousID: String, ephemeralPublicKey: Data, encryptedResponse: Data) async throws {
-        _ = try await json("POST", url("/pairing/\(rendezvousID)/response"),
+    func claimPairing(pairingID: String, ephemeralPublicKey: Data, encryptedResponse: Data) async throws {
+        _ = try await json("POST", url("/pairing/\(pairingID)/response"),
                            body: ["ephemeral_public_key": Base64URL.encode(ephemeralPublicKey),
                                   "ciphertext": Base64URL.encode(encryptedResponse)])
     }
 
-    func fetchCredential(rendezvousID: String) async throws -> (ciphertext: Data, epoch: UInt32)? {
+    func fetchCredential(pairingID: String) async throws -> (ciphertext: Data, epoch: UInt32)? {
         do {
-            let object = try await json("GET", url("/pairing/\(rendezvousID)/credential"))
+            let object = try await json("GET", url("/pairing/\(pairingID)/credential"))
             guard let ciphertextB64 = object["ciphertext"] as? String else { return nil }
             return (try Base64URL.decode(ciphertextB64), UInt32(object["epoch"] as? Int ?? 1))
         } catch TransportError.notFound {
@@ -300,41 +187,127 @@ final class LocalHTTPTransport: PhoneTransport, @unchecked Sendable {
         }
     }
 
-    func send(_ envelope: EncryptedEnvelope) async throws {
-        _ = try await request("POST", url("/envelopes"), body: try CanonicalCoding.encode(envelope))
+    // MARK: Persistent WebSocket
+
+    private var socket: URLSessionWebSocketTask?
+    private var pingTimer: Timer?
+    var onFrame: (@Sendable (TransportFrame) -> Void)?
+    var onDisconnect: (@Sendable (TransportError?) -> Void)?
+
+    var isConnected: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return socket?.state == .running
     }
 
-    func fetchInbox(recipient: String) async throws -> [EncryptedEnvelope] {
-        let object = try await json("GET", url("/envelopes",
-                                               query: ["recipient": recipient, "after": String(cursor)]))
-        guard let items = object["envelopes"] as? [[String: Any]] else { return [] }
-        var envelopes: [EncryptedEnvelope] = []
-        var newCursor = cursor
-        for item in items {
-            guard let serial = item["serial"] as? Int, let envelopeObject = item["envelope"] else { continue }
-            newCursor = max(newCursor, UInt64(serial))
-            if let data = try? JSONSerialization.data(withJSONObject: envelopeObject),
-               let envelope = try? CanonicalCoding.decoder().decode(EncryptedEnvelope.self, from: data) {
-                envelopes.append(envelope)
+    /// Open the WebSocket. Frames (including the server's `challenge`) arrive
+    /// via `onFrame`; the caller answers with `hello`.
+    func connectWebSocket() {
+        lock.lock()
+        socket?.cancel(with: .goingAway, reason: nil)
+        var components = URLComponents(url: serviceURL, resolvingAgainstBaseURL: false)!
+        components.scheme = (components.scheme == "http") ? "ws" : "wss"
+        components.path = "/v2/ws"
+        let task = session.webSocketTask(with: components.url!)
+        socket = task
+        lock.unlock()
+        task.resume()
+        receiveLoop(task)
+        schedulePings(task)
+    }
+
+    func disconnect() {
+        lock.lock()
+        let task = socket
+        socket = nil
+        lock.unlock()
+        task?.cancel(with: .goingAway, reason: nil)
+        DispatchQueue.main.async { [weak self] in
+            self?.pingTimer?.invalidate()
+            self?.pingTimer = nil
+        }
+    }
+
+    func sendFrame(_ frame: TransportFrame) {
+        lock.lock()
+        let task = socket
+        lock.unlock()
+        guard let task, let data = try? frame.encoded(),
+              let text = String(data: data, encoding: .utf8) else { return }
+        task.send(.string(text)) { _ in }
+    }
+
+    private func receiveLoop(_ task: URLSessionWebSocketTask) {
+        task.receive { [weak self, weak task] result in
+            guard let self, let task else { return }
+            switch result {
+            case .success(let message):
+                if case .string(let text) = message,
+                   let frame = try? TransportFrame.decode(Data(text.utf8)) {
+                    self.onFrame?(frame)
+                }
+                self.receiveLoop(task)
+            case .failure(let error):
+                self.lock.lock()
+                let isCurrent = self.socket === task
+                if isCurrent { self.socket = nil }
+                self.lock.unlock()
+                guard isCurrent else { return }
+                let urlError = error as? URLError
+                if urlError?.code == .serverCertificateUntrusted || urlError?.code == .cancelled {
+                    self.onDisconnect?(.tlsPinMismatch)
+                } else if let code = urlError?.code {
+                    self.onDisconnect?(.unreachable(code))
+                } else {
+                    self.onDisconnect?(nil)
+                }
             }
         }
-        cursor = newCursor
-        return envelopes
     }
 
-    func acknowledge(recipient: String, messageIDs: [String]) async throws {
-        _ = try? await json("POST", url("/receipts"),
-                            body: ["recipient": recipient, "message_ids": messageIDs] as [String: Any])
-    }
-
-    func macStatus() async -> MacStatus? {
-        guard let object = try? await json("GET", url("/status")) else {
-            return MacStatus(reachable: false, vmState: nil, epoch: nil)
+    private func schedulePings(_ task: URLSessionWebSocketTask) {
+        DispatchQueue.main.async { [weak self] in
+            self?.pingTimer?.invalidate()
+            self?.pingTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self, weak task] _ in
+                guard let self, let task, task.state == .running else { return }
+                task.sendPing { [weak self] error in
+                    if error != nil { self?.onDisconnect?(nil) }
+                }
+            }
         }
-        return MacStatus(reachable: true,
-                         vmState: object["vm_state"] as? String,
-                         epoch: (object["epoch"] as? Int).map(UInt32.init))
     }
+}
 
-    func registerForWake(deviceID: String) async {}  // polling only
+/// Human guidance for connection failures, per the phone's environment: the
+/// Tailscale VPN, tailnet policy, and the Mac itself are separate failure
+/// domains and get distinct, actionable messages.
+func describeTransportFailure(_ error: TransportError, host: String) -> String {
+    switch error {
+    case .unreachable(let code):
+        switch code {
+        case .cannotFindHost, .dnsLookupFailed:
+            return "Can't resolve \(host). Open Tailscale and connect this phone — and check it's signed in to the same tailnet as the Mac."
+        case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed:
+            return "No network connection. Open Tailscale and connect this phone."
+        case .timedOut:
+            return "The Mac is not answering. It may be offline or asleep, this phone may be on a different tailnet, or tailnet policy may be blocking access to the Mac."
+        case .cannotConnectToHost:
+            return "Reached the network but not the agent service. The Mac may be offline, its Tailscale login may have expired, or tailnet policy is blocking access."
+        default:
+            return "Connection failed (\(code.rawValue)). Check Tailscale on this phone and the Mac."
+        }
+    case .tlsPinMismatch:
+        return "The service's TLS identity doesn't match this pairing. If the Mac was reset, pair again with a fresh QR code."
+    case .revoked:
+        return "This phone has been revoked by the Mac."
+    case .denied:
+        return "The Mac rejected this phone's credentials. Pair again with a fresh QR code."
+    case .expired:
+        return "This pairing code has expired — show a fresh one on the Mac."
+    case .conflict:
+        return "This pairing code was already used — show a fresh one on the Mac."
+    case .notFound:
+        return "Pairing session not found — is the QR code current?"
+    case .http(let status):
+        return "The Mac's service returned an error (\(status))."
+    }
 }

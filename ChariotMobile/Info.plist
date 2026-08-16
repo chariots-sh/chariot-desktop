@@ -18,6 +18,20 @@
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key><true/>
+        <!-- Narrow exception scoped to tailnet MagicDNS names: lets the app's
+             pinned-key trust decision stand for the Mac's self-signed cert
+             when the tailnet has HTTPS certificates disabled. iOS (26.6+)
+             otherwise overrides the app's server-trust decision for
+             non-exempt domains. Not a global exception; the SPKI pin in
+             TransportSessionDelegate remains the trust boundary. -->
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>ts.net</key>
+            <dict>
+                <key>NSIncludesSubdomains</key><true/>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+            </dict>
+        </dict>
     </dict>
     <key>MinimumOSVersion</key><string>17.0</string>
 </dict>

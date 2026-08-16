@@ -8,11 +8,15 @@ cd "$ROOT/ChariotMac"
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)"
 
+"$ROOT/scripts/build-helper.sh" "$ROOT/build/agent-tailnet"
+
 APP="$ROOT/build/Chariot Desktop.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$BIN/ChariotDesktopApp" "$APP/Contents/MacOS/Chariot Desktop"
+# The embedded Tailscale node ships inside the bundle and is signed with it.
+cp "$ROOT/build/agent-tailnet" "$APP/Contents/MacOS/agent-tailnet"
 cp "$ROOT/guest/bridge.py" "$ROOT/guest/user-data.template" "$APP/Contents/Resources/"
 if [[ ! -f "$ROOT/build/AppIcon.icns" ]]; then
   swift "$ROOT/scripts/gen-icon.swift" "$ROOT/build/icon-1024.png"
@@ -47,6 +51,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+# Sign the helper first (hardened runtime), then the app with the
+# virtualization entitlement. Release builds swap `-` for a Developer ID and
+# run notarization; `codesign --verify --deep` must then pass over the bundle
+# including agent-tailnet.
+codesign --force --options runtime --sign - "$APP/Contents/MacOS/agent-tailnet"
 codesign --force --deep --sign - \
   --entitlements "$ROOT/ChariotMac/virtualization.entitlements" "$APP"
 echo "built: $APP"

@@ -18,6 +18,13 @@ targets:
   ChariotDesktop:
     type: application
     platform: macOS
+    preBuildScripts:
+      # Reproducible pure-Go build; versions pinned via agent-tailnet/go.sum.
+      - name: Build agent-tailnet
+        script: "\"$PROJECT_DIR/scripts/build-helper.sh\" \"$PROJECT_DIR/build/agent-tailnet\""
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(PROJECT_DIR)/build/agent-tailnet
     sources:
       - path: ChariotMac/Sources/ChariotDesktopApp
       - path: guest/bridge.py
@@ -31,13 +38,19 @@ targets:
         product: ChariotCore
       - package: AgentLinkKit
         product: AgentLinkKit
-      - package: AgentLinkKit
-        product: AgentLinkCloudKit
+    copyFiles:
+      # The embedded Tailscale node ships beside the app executable; Xcode
+      # code-signs embedded binaries with the app, so it is covered by the
+      # hardened runtime and notarization.
+      - destination: executables
+        files:
+          - path: build/agent-tailnet
+            codeSign: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.protocols.chariot.mac
         CODE_SIGN_ENTITLEMENTS: ChariotMac/ChariotDesktop.entitlements
-        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: NO
     info:
       path: build/xcodegen/ChariotDesktop-Info.plist
@@ -46,7 +59,6 @@ targets:
         CFBundleIconFile: AppIcon
         NSPrincipalClass: NSApplication
         NSHighResolutionCapable: true
-        ChariotCloudKitContainer: iCloud.com.protocols.chariot
   ChariotMobilePhone:
     type: application
     platform: iOS
@@ -67,7 +79,15 @@ targets:
       properties:
         CFBundleDisplayName: Chariot
         NSCameraUsageDescription: Chariot scans the pairing QR code displayed by your Mac.
-        UIBackgroundModes: [remote-notification]
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+          # Narrow exception scoped to tailnet MagicDNS names only: allows the
+          # app's pinned-key trust decision for the Mac's self-signed cert to
+          # stand when the tailnet has HTTPS certificates disabled. Never a
+          # global exception; the pin in TransportSessionDelegate remains the
+          # trust boundary.
+          NSExceptionDomains:
+            ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true

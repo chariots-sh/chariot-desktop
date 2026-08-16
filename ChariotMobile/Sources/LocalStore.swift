@@ -52,6 +52,13 @@ final class LocalStore {
     // Connection
 
     func loadConnection() -> ConnectionRecord? { read(ConnectionRecord.self, from: "connection.json") }
+
+    /// A connection file that exists but no longer decodes is a pre-Tailscale
+    /// (CloudKit-era) record: history is preserved, trust is not.
+    func hasLegacyConnection() -> Bool {
+        FileManager.default.fileExists(atPath: url("connection.json").path)
+            && loadConnection() == nil
+    }
     func saveConnection(_ record: ConnectionRecord) { write(record, to: "connection.json") }
     func clearConnection() { try? FileManager.default.removeItem(at: url("connection.json")) }
 

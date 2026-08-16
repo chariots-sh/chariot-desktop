@@ -38,6 +38,7 @@ struct ContentView: View {
                     List(selection: $selection) {
                         SidebarRow(icon: "shippingbox", title: "Sandbox").tag("sandbox")
                         SidebarRow(icon: "bubble.left.and.bubble.right", title: "Conversation").tag("chat")
+                        SidebarRow(icon: "network", title: "Tailscale").tag("tailscale")
                         SidebarRow(icon: "iphone", title: "Devices").tag("devices")
                         SidebarRow(icon: "terminal", title: "Developer Access").tag("dev")
                         SidebarRow(icon: "list.bullet.rectangle", title: "Activity").tag("log")
@@ -51,6 +52,7 @@ struct ContentView: View {
                 Group {
                     switch selection {
                     case "chat": ConversationView()
+                    case "tailscale": TailscaleView()
                     case "devices": DevicesView()
                     case "dev": DeveloperAccessView()
                     case "log": ActivityView()
@@ -296,6 +298,105 @@ struct ConversationView: View {
         guard !text.isEmpty else { return }
         draft = ""
         model.sendPrompt(text)
+    }
+}
+
+// MARK: - Tailscale
+
+struct TailscaleView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var confirmReset = false
+
+    var statusColor: Color {
+        switch model.tailnetStatus {
+        case .ready: return Theme.green
+        case .connecting, .launching: return Theme.amber
+        case .needsLogin, .keyExpired: return Theme.amber
+        case .error: return Theme.red
+        case .stopped: return Theme.secondary
+        }
+    }
+
+    var body: some View {
+        Page(hash: "tailscale", title: "Tailscale") {
+            Card(title: "embedded node", subtitle: "This Mac runs its own Tailscale node — no separate Tailscale app needed") {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Chip(text: model.tailnetStatus.label, color: statusColor)
+                        Spacer()
+                    }
+                    KVRow(key: "machine name", value: model.tailnetInfo?.dnsName ?? "—")
+                    KVRow(key: "tailnet", value: model.tailnetInfo?.tailnet ?? "—")
+                    KVRow(key: "tls", value: tlsDescription)
+                    KVRow(key: "key expires", value: keyExpiryDescription)
+
+                    if case .needsLogin = model.tailnetStatus {
+                        Text("This Mac needs to join your tailnet. Sign in with the same Tailscale account your iPhone uses.")
+                            .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                    }
+                    if case .keyExpired = model.tailnetStatus {
+                        Text("The node's Tailscale key expired. Reauthenticate to reconnect — or disable key expiry for this machine in the Tailscale admin console.")
+                            .font(.system(size: 11)).foregroundStyle(Theme.amber)
+                    }
+
+                    HStack(spacing: 8) {
+                        if case .needsLogin = model.tailnetStatus {
+                            Button("Sign in to Tailscale") { model.tailscaleSignIn() }
+                                .buttonStyle(AccentButtonStyle())
+                        } else if case .stopped = model.tailnetStatus {
+                            Button("Connect") { model.tailscaleConnect() }
+                                .buttonStyle(AccentButtonStyle())
+                        } else {
+                            Button("Reauthenticate") { model.tailscaleReauthenticate() }
+                                .buttonStyle(OutlineButtonStyle())
+                            Button("Disconnect") { model.tailscaleDisconnect() }
+                                .buttonStyle(OutlineButtonStyle())
+                        }
+                        Button("Open Tailscale status") { model.openTailscaleAdmin() }
+                            .buttonStyle(OutlineButtonStyle())
+                        Spacer()
+                        Button("Reset…") { confirmReset = true }
+                            .buttonStyle(AccentButtonStyle(danger: true))
+                    }
+                    .padding(.top, 6)
+                }
+            }
+
+            Card(title: "how the phone connects") {
+                VStack(alignment: .leading, spacing: 6) {
+                    bullet("Install the official Tailscale app on your iPhone and sign in to the same tailnet.")
+                    bullet("The agent service is reachable only inside your tailnet on TCP 443 — never on your LAN or the public internet.")
+                    bullet("Tailnet access is transport only: phones still pair by QR code, and every message stays end-to-end encrypted.")
+                    bullet("Tailscale is free for personal use (up to 6 users); commercial deployments need a paid plan.")
+                }
+            }
+        }
+        .confirmationDialog(
+            "Reset Tailscale networking?",
+            isPresented: $confirmReset, titleVisibility: .visible) {
+            Button("Delete node identity and reset", role: .destructive) { model.tailscaleReset() }
+        } message: {
+            Text("This deletes the local Tailscale node identity. The Mac will disappear from your tailnet and you must sign in to Tailscale again. Paired phones stay paired but cannot reconnect until the node is re-authenticated.")
+        }
+    }
+
+    private var tlsDescription: String {
+        guard let info = model.tailnetInfo else { return "—" }
+        return info.tailscaleTLS
+            ? "Tailscale-issued certificate (tailnet HTTPS enabled)"
+            : "self-signed certificate, pinned via pairing QR"
+    }
+
+    private var keyExpiryDescription: String {
+        guard let expiry = model.tailnetInfo?.keyExpiry else { return "—" }
+        return expiry.formatted(date: .abbreviated, time: .shortened)
+    }
+
+    private func bullet(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text("·").font(Theme.mono(12)).foregroundStyle(Theme.accent)
+            Text(text).font(.system(size: 12)).foregroundStyle(Theme.secondary)
+        }
     }
 }
 
