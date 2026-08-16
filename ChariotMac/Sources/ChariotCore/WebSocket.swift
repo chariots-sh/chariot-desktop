@@ -60,7 +60,10 @@ final class WebSocketConnection: @unchecked Sendable {
                 return
             }
             buffer.append(contentsOf: chunk[0..<n])
-            if buffer.count > 8 * 1024 * 1024 {  // bounded frames
+            // Bounded frames. 32 MiB accommodates a worst-case uncompressed
+            // phone data snapshot (file.write envelopes); normal snapshots
+            // arrive deflated and are far smaller.
+            if buffer.count > 32 * 1024 * 1024 {
                 finish()
                 return
             }
@@ -91,7 +94,7 @@ final class WebSocketConnection: @unchecked Sendable {
             for i in 2..<10 { length = length << 8 | UInt64(bytes[i]) }
             offset = 10
         }
-        guard length <= 8 * 1024 * 1024 else { return Frame(fin: true, opcode: 0x8, payload: Data()) }
+        guard length <= 32 * 1024 * 1024 else { return Frame(fin: true, opcode: 0x8, payload: Data()) }
         var maskKey: [UInt8] = []
         if masked {
             guard buffer.count >= offset + 4 else { return nil }

@@ -1007,9 +1007,18 @@ public final class ChariotHub: @unchecked Sendable {
             let path = message.body["path"]?.stringValue ?? ""
             let deviceID = entry.identity.deviceID
             let conversationID = message.conversationID
+            // "deflate" = raw DEFLATE (Apple Compression .zlib), applied by
+            // the phone so multi-MB snapshots stay small on the wire; the
+            // guest always receives the decoded plaintext.
+            var contents = message.body["contents_b64"]?.stringValue
+                .flatMap { Data(base64Encoded: $0) }
+            if message.body["encoding"]?.stringValue == "deflate" {
+                contents = contents.flatMap {
+                    try? ($0 as NSData).decompressed(using: .zlib) as Data
+                }
+            }
             guard path.hasPrefix("/workspace/"), !path.contains(".."),
-                  let encoded = message.body["contents_b64"]?.stringValue,
-                  let contents = Data(base64Encoded: encoded) else {
+                  let contents else {
                 try sendToDevice(deviceID, context: context, type: .fileWriteResult,
                                  conversationID: conversationID,
                                  body: .object(["request_id": .string(message.messageID),
