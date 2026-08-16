@@ -6,6 +6,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/build/agent-tailnet}"
+case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 mkdir -p "$(dirname "$OUT")"
 
 cd "$ROOT/agent-tailnet"

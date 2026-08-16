@@ -272,6 +272,7 @@ func serve(ctx context.Context, s *tsnet.Server, lc *local.Client, port int, ups
 				ln = tls.NewListener(raw, &tls.Config{
 					Certificates: []tls.Certificate{cert},
 					MinVersion:   tls.VersionTLS12,
+					NextProtos:   []string{"http/1.1"},
 				})
 				ready.TLSSPKISHA256 = spki
 				emit(ready) // re-emit with the pin so the app can build QR payloads
@@ -314,6 +315,18 @@ func proxy(ctx context.Context, lc *local.Client, conn net.Conn, upstream string
 		}
 	}
 	emit(peer)
+
+	// Complete the TLS handshake explicitly so failures are reported instead
+	// of surfacing as a silent proxy teardown.
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		hsCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		err := tlsConn.HandshakeContext(hsCtx)
+		cancel()
+		if err != nil {
+			emitError("tls handshake with %s: %v", conn.RemoteAddr(), err)
+			return
+		}
+	}
 
 	up, err := net.DialTimeout("tcp", upstream, 10*time.Second)
 	if err != nil {
@@ -393,21 +406,54 @@ func readCommands(ctx context.Context, cancel context.CancelFunc, lc *local.Clie
 // installationCert loads or creates the per-installation self-signed TLS
 // certificate used when tailnet HTTPS is not enabled. Returns the certificate
 // and the base64 SHA-256 of its SubjectPublicKeyInfo for QR pinning.
+//
+// The certificate's validity must stay well under iOS's hard 825-day limit on
+// TLS server certificates — exceeding it makes iOS abort the handshake even
+// when the app pins the key, while macOS happens to allow it. Certificates are
+// therefore issued for ~13 months and re-issued from the SAME private key
+// before expiry, so the pinned public-key hash — and every existing pairing —
+// survives renewal.
 func installationCert(dir, dnsName string) (tls.Certificate, string, error) {
 	certPath := filepath.Join(dir, "chariot-tls-cert.pem")
 	keyPath := filepath.Join(dir, "chariot-tls-key.pem")
 
-	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
-		leaf, err := x509.ParseCertificate(cert.Certificate[0])
-		if err == nil {
-			return cert, spkiHash(leaf), nil
+	// The key persists for the installation's lifetime (it is what phones pin).
+	var key *ecdsa.PrivateKey
+	if keyPEM, err := os.ReadFile(keyPath); err == nil {
+		if block, _ := pem.Decode(keyPEM); block != nil {
+			key, _ = x509.ParseECPrivateKey(block.Bytes)
+		}
+	}
+	if key == nil {
+		var err error
+		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return tls.Certificate{}, "", err
+		}
+		keyDER, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			return tls.Certificate{}, "", err
+		}
+		keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+		if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+			return tls.Certificate{}, "", err
 		}
 	}
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, "", err
+	// Reuse the stored certificate while it matches the key, names this DNS
+	// name, respects the iOS validity cap, and is not close to expiring.
+	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil {
+			validity := leaf.NotAfter.Sub(leaf.NotBefore)
+			usable := leaf.NotAfter.After(time.Now().Add(30*24*time.Hour)) &&
+				validity <= 825*24*time.Hour &&
+				len(leaf.DNSNames) == 1 && leaf.DNSNames[0] == dnsName
+			if pub, ok := leaf.PublicKey.(*ecdsa.PublicKey); usable && ok && pub.Equal(&key.PublicKey) {
+				return cert, spkiHash(leaf), nil
+			}
+		}
 	}
+
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
 		return tls.Certificate{}, "", err
@@ -417,7 +463,7 @@ func installationCert(dir, dnsName string) (tls.Certificate, string, error) {
 		Subject:               pkix.Name{CommonName: dnsName},
 		DNSNames:              []string{dnsName},
 		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().AddDate(10, 0, 0),
+		NotAfter:              time.Now().AddDate(0, 13, 0),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -426,19 +472,15 @@ func installationCert(dir, dnsName string) (tls.Certificate, string, error) {
 	if err != nil {
 		return tls.Certificate{}, "", err
 	}
-	keyDER, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		return tls.Certificate{}, "", err
-	}
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
 		return tls.Certificate{}, "", err
 	}
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+	keyPEMBytes, err := os.ReadFile(keyPath)
+	if err != nil {
 		return tls.Certificate{}, "", err
 	}
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	cert, err := tls.X509KeyPair(certPEM, keyPEMBytes)
 	if err != nil {
 		return tls.Certificate{}, "", err
 	}

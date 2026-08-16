@@ -82,3 +82,12 @@ targets:
         UILaunchScreen: {}
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+          # Narrow exception scoped to tailnet MagicDNS names only: allows the
+          # app's pinned-key trust decision for the Mac's self-signed cert to
+          # stand when the tailnet has HTTPS certificates disabled. Never a
+          # global exception; the pin in TransportSessionDelegate remains the
+          # trust boundary.
+          NSExceptionDomains:
+            ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true

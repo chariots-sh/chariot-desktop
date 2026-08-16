@@ -62,6 +62,12 @@ final class TransportSessionDelegate: NSObject, URLSessionDelegate {
         }
         let hash = Data(SHA256.hash(data: spki)).base64EncodedString()
         if hash == pin {
+            // The pin is the trust decision; anchor the pinned certificate so
+            // the trust object itself also evaluates cleanly.
+            SecTrustSetAnchorCertificates(trust, [leaf] as CFArray)
+            SecTrustSetAnchorCertificatesOnly(trust, true)
+            var evalError: CFError?
+            _ = SecTrustEvaluateWithError(trust, &evalError)
             completionHandler(.useCredential, URLCredential(trust: trust))
         } else {
             completionHandler(.cancelAuthenticationChallenge, nil)

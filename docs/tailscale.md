@@ -43,6 +43,19 @@ and pins its public-key hash through the QR payload; the phone accepts exactly
 that key for that host and nothing else. TLS validation is never disabled
 globally.
 
+Two iOS-driven constraints on the self-signed path (both handled
+automatically, documented here for maintainers):
+
+- iOS hard-limits TLS server certificate validity; certificates are issued
+  for ~13 months and re-issued from the **same key** before expiry, so the
+  pinned public-key hash — and every existing pairing — survives renewal.
+- iOS 26.6+ overrides an app's server-trust decision for domains under full
+  App Transport Security, even when the app pins the certificate. The phone
+  app therefore carries an ATS exception scoped to `ts.net` subdomains only
+  (`NSExceptionDomains` → `ts.net`), which permits the app's pinned-key
+  verdict to stand. The SPKI pin remains the trust boundary; a mismatched
+  certificate is still rejected, and no global ATS exception exists.
+
 ## Limiting access with Grants
 
 Chariot works with a default (allow-all) tailnet policy. To lock it down, use

@@ -121,6 +121,29 @@ final class PhoneModel: ObservableObject {
 
         // Automated-pairing hook for the E2E harness (simulator).
         let arguments = ProcessInfo.processInfo.arguments
+        // Diagnostic probe: --tls-probe <url> <pin|-> exercises the pinned TLS
+        // path and prints the outcome to the attached console.
+        if let index = arguments.firstIndex(of: "--tls-probe"), arguments.count > index + 2 {
+            let urlString = arguments[index + 1]
+            let pin = arguments[index + 2] == "-" ? nil : arguments[index + 2]
+            Task.detached {
+                let session = URLSession(configuration: .default,
+                                         delegate: TransportSessionDelegate(pinnedSPKIHash: pin),
+                                         delegateQueue: nil)
+                do {
+                    let (data, response) = try await session.data(from: URL(string: urlString)!)
+                    print("[chariot-tls] PROBE \(urlString) ok status=\((response as? HTTPURLResponse)?.statusCode ?? 0) body=\(String(data: data.prefix(120), encoding: .utf8) ?? "")")
+                } catch {
+                    let ns = error as NSError
+                    print("[chariot-tls] PROBE \(urlString) FAIL domain=\(ns.domain) code=\(ns.code)")
+                    var underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError
+                    while let u = underlying {
+                        print("[chariot-tls] PROBE underlying: \(u.domain) \(u.code) ssl=\(u.userInfo["_kCFNetworkCFStreamSSLErrorOriginalValue"] ?? "-")")
+                        underlying = u.userInfo[NSUnderlyingErrorKey] as? NSError
+                    }
+                }
+            }
+        }
         if let index = arguments.firstIndex(of: "--pair-with"), arguments.count > index + 1 {
             pair(payloadJSON: arguments[index + 1])
         } else if let payload = ProcessInfo.processInfo.environment["CHARIOT_PAIRING_JSON"] {
