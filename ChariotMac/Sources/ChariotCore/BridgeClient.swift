@@ -1,0 +1,166 @@
+import Foundation
+import Virtualization
+
+/// Agent runtime state reported by the guest (design goal: the agent is Codex).
+public struct AgentRuntimeStatus: Sendable, Equatable {
+    public let name: String
+    public let installed: Bool
+    public let version: String?
+    public let loggedIn: Bool
+    public let installError: String?
+}
+
+/// Events emitted by the guest bridge over the typed vsock channel.
+public enum BridgeEvent: Sendable {
+    case status(state: String, uptimeSeconds: Int, kernel: String, hostname: String,
+                agent: AgentRuntimeStatus?)
+    case outputDelta(requestID: String, conversationID: String, text: String)
+    case outputCompleted(requestID: String, conversationID: String, exitCode: Int)
+    case oauthRequested(provider: String, purpose: String, authURL: String)
+    case oauthCompleted(success: Bool, message: String)
+    case pong
+    case error(String)
+    case disconnected(String)
+}
+
+/// JSON-lines client for the guest bridge on vsock port 1024 (design §1.4).
+final class BridgeClient: @unchecked Sendable {
+    private let connection: VZVirtioSocketConnection
+    private let fd: Int32
+    private let writeLock = NSLock()
+    private let handler: @Sendable (BridgeEvent) -> Void
+    private var readerThread: Thread?
+
+    init(connection: VZVirtioSocketConnection, handler: @escaping @Sendable (BridgeEvent) -> Void) {
+        self.connection = connection
+        self.fd = connection.fileDescriptor
+        self.handler = handler
+        let thread = Thread { [weak self] in self?.readLoop() }
+        thread.name = "chariot.bridge.reader"
+        readerThread = thread
+        thread.start()
+    }
+
+    func close() {
+        connection.close()
+    }
+
+    // MARK: Sending
+
+    private func sendObject(_ object: [String: Any]) throws {
+        let data = try JSONSerialization.data(withJSONObject: object)
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        var payload = data
+        payload.append(0x0A)
+        let ok = payload.withUnsafeBytes { buffer -> Bool in
+            var offset = 0
+            while offset < buffer.count {
+                let written = write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                if written <= 0 { return false }
+                offset += written
+            }
+            return true
+        }
+        if !ok { throw ChariotError.bridgeUnavailable("write failed: \(String(cString: strerror(errno)))") }
+    }
+
+    func sendConversation(requestID: String, conversationID: String, text: String) throws {
+        try sendObject([
+            "type": "conversation.send",
+            "request_id": requestID,
+            "conversation_id": conversationID,
+            "body": ["text": text]
+        ])
+    }
+
+    func cancel(conversationID: String) throws {
+        try sendObject(["type": "conversation.cancel", "conversation_id": conversationID])
+    }
+
+    func requestStatus() throws {
+        try sendObject(["type": "sandbox.status"])
+    }
+
+    func startLogin() throws {
+        try sendObject(["type": "oauth.start"])
+    }
+
+    func cancelLogin() throws {
+        try sendObject(["type": "oauth.cancel"])
+    }
+
+    func ping() throws {
+        try sendObject(["type": "ping"])
+    }
+
+    // MARK: Receiving
+
+    private func readLoop() {
+        var buffer = Data()
+        var chunk = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let count = read(fd, &chunk, chunk.count)
+            if count <= 0 {
+                handler(.disconnected(count == 0 ? "eof" : String(cString: strerror(errno))))
+                return
+            }
+            buffer.append(contentsOf: chunk[0..<count])
+            while let newline = buffer.firstIndex(of: 0x0A) {
+                let line = buffer.subdata(in: buffer.startIndex..<newline)
+                buffer.removeSubrange(buffer.startIndex...newline)
+                guard !line.isEmpty else { continue }
+                dispatch(line)
+            }
+            if buffer.count > 4 * 1024 * 1024 {
+                handler(.disconnected("oversized bridge frame"))
+                return
+            }
+        }
+    }
+
+    private func dispatch(_ line: Data) {
+        guard let object = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+              let type = object["type"] as? String else {
+            handler(.error("malformed bridge message"))
+            return
+        }
+        switch type {
+        case "sandbox.status":
+            var agent: AgentRuntimeStatus?
+            if let info = object["agent"] as? [String: Any] {
+                agent = AgentRuntimeStatus(name: info["name"] as? String ?? "agent",
+                                           installed: info["installed"] as? Bool ?? false,
+                                           version: info["version"] as? String,
+                                           loggedIn: info["logged_in"] as? Bool ?? false,
+                                           installError: info["install_error"] as? String)
+            }
+            handler(.status(state: object["state"] as? String ?? "unknown",
+                            uptimeSeconds: object["uptime_seconds"] as? Int ?? 0,
+                            kernel: object["kernel"] as? String ?? "?",
+                            hostname: object["hostname"] as? String ?? "?",
+                            agent: agent))
+        case "oauth.requested":
+            handler(.oauthRequested(provider: object["provider"] as? String ?? "?",
+                                    purpose: object["purpose"] as? String ?? "",
+                                    authURL: object["auth_url"] as? String ?? ""))
+        case "oauth.completed":
+            handler(.oauthCompleted(success: object["success"] as? Bool ?? false,
+                                    message: object["message"] as? String ?? ""))
+        case "output.delta":
+            handler(.outputDelta(requestID: object["request_id"] as? String ?? "",
+                                 conversationID: object["conversation_id"] as? String ?? "",
+                                 text: object["text"] as? String ?? ""))
+        case "output.completed":
+            handler(.outputCompleted(requestID: object["request_id"] as? String ?? "",
+                                     conversationID: object["conversation_id"] as? String ?? "",
+                                     exitCode: object["exit_code"] as? Int ?? 0))
+        case "pong":
+            handler(.pong)
+        case "error":
+            handler(.error(object["error"] as? String ?? "unknown bridge error"))
+        default:
+            handler(.error("unknown bridge message type \(type)"))
+        }
+    }
+}

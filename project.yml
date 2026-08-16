@@ -1,0 +1,73 @@
+name: Chariot
+options:
+  bundleIdPrefix: com.protocols
+  deploymentTarget:
+    macOS: "14.0"
+    iOS: "17.0"
+packages:
+  AgentLinkKit:
+    path: AgentLinkKit
+  ChariotMac:
+    path: ChariotMac
+settings:
+  base:
+    DEVELOPMENT_TEAM: 3UGCLFLDJ6
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.9"
+targets:
+  ChariotDesktop:
+    type: application
+    platform: macOS
+    sources:
+      - path: ChariotMac/Sources/ChariotDesktopApp
+      - path: guest/bridge.py
+        buildPhase: resources
+      - path: guest/user-data.template
+        buildPhase: resources
+      - path: build/AppIcon.icns
+        buildPhase: resources
+    dependencies:
+      - package: ChariotMac
+        product: ChariotCore
+      - package: AgentLinkKit
+        product: AgentLinkKit
+      - package: AgentLinkKit
+        product: AgentLinkCloudKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.protocols.chariot.mac
+        CODE_SIGN_ENTITLEMENTS: ChariotMac/ChariotDesktop.entitlements
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_APP_SANDBOX: NO
+    info:
+      path: build/xcodegen/ChariotDesktop-Info.plist
+      properties:
+        CFBundleDisplayName: Chariot Desktop
+        CFBundleIconFile: AppIcon
+        NSPrincipalClass: NSApplication
+        NSHighResolutionCapable: true
+        ChariotCloudKitContainer: iCloud.com.protocols.chariot
+  ChariotMobilePhone:
+    type: application
+    platform: iOS
+    sources:
+      - path: ChariotMobile/Sources
+    dependencies:
+      - package: AgentLinkKit
+        product: AgentLinkKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.protocols.chariot.ios
+        CODE_SIGN_ENTITLEMENTS: ChariotMobile/ChariotMobile.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: build/xcodegen/ChariotMobile-Info.plist
+      properties:
+        CFBundleDisplayName: Chariot
+        NSCameraUsageDescription: Chariot scans the pairing QR code displayed by your Mac.
+        UIBackgroundModes: [remote-notification]
+        UILaunchScreen: {}
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true

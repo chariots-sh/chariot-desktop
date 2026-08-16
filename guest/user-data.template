@@ -1,0 +1,64 @@
+#cloud-config
+hostname: chariot-sandbox
+manage_etc_hosts: true
+
+users:
+  - name: agent
+    gecos: Chariot Agent
+    shell: /bin/bash
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: true
+    ssh_authorized_keys:
+      - __SSH_PUBKEY__
+
+write_files:
+  - path: /opt/chariot/bridge.py
+    permissions: "0755"
+    encoding: b64
+    content: __BRIDGE_B64__
+  - path: /etc/systemd/system/chariot-bridge.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Chariot guest bridge (vsock)
+      After=network.target
+
+      [Service]
+      ExecStartPre=-/sbin/modprobe virtio_vsock
+      ExecStart=/usr/bin/python3 /opt/chariot/bridge.py
+      Restart=always
+      RestartSec=2
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/ssh/sshd_config.d/chariot.conf
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+      AllowAgentForwarding no
+      X11Forwarding no
+      AllowTcpForwarding no
+  - path: /etc/systemd/network/10-chariot.network
+    permissions: "0644"
+    content: |
+      [Match]
+      Name=en*
+
+      [Network]
+      DHCP=yes
+
+runcmd:
+  - mkdir -p /workspace
+  - chown agent:agent /workspace
+  # Persistent NIC management — survives reboots regardless of cloud-init's
+  # first-boot-only network rendering.
+  - systemctl enable --now systemd-networkd systemd-resolved || true
+  # Preinstall the Codex CLI agent runtime (bridge self-heals if this fails).
+  - curl -fsSL -o /tmp/codex.tar.gz https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-aarch64-unknown-linux-musl.tar.gz && tar -xzf /tmp/codex.tar.gz -C /tmp && mv /tmp/codex-aarch64-unknown-linux-musl /usr/local/bin/codex && chmod 755 /usr/local/bin/codex && rm -f /tmp/codex.tar.gz || true
+  - systemctl daemon-reload
+  - systemctl enable --now chariot-bridge.service
+  - systemctl restart ssh || systemctl restart sshd || true
+
+final_message: "chariot guest ready after $UPTIME seconds"
