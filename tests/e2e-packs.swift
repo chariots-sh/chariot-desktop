@@ -8,6 +8,8 @@
 //   4. editing guardian.pack/AGENTS.md lands on the next turn, no rebuild
 //   5. an agent runs a bash tool shipped in its pack
 //   6. reset re-clones guardian, re-seeds MEMORY.md, leaves scribe undisturbed
+//   7. a second turn continues the first one's Codex session
+//   8. the phone sees the agent's reply and none of its working transcript
 // Persona checks that need a signed-in Codex run only when
 // CHARIOT_E2E_CODEX_AUTH points at a host auth.json to install into each VM.
 import Foundation
@@ -272,6 +274,43 @@ struct E2EPacks {
               "AC3: paired device converses with guardian")
         ws.close()
 
+        // One turn the way the phone takes it: its own WebSocket, a sealed
+        // prompt, and only the deltas the Mac chose to forward.
+        var phoneSequence: UInt64 = 1
+        func phoneTurn(_ text: String, timeout: TimeInterval = 300) async throws -> String {
+            let socket = WSClient(url: "ws://127.0.0.1:\(e2ePort)/v2/ws")
+            defer { socket.close() }
+            guard let challenge = await socket.next(), challenge.type == .challenge,
+                  let nonce = challenge.nonce else { return "" }
+            var turnHello = TransportFrame(type: .hello)
+            turnHello.deviceID = identity.deviceID
+            turnHello.instanceID = guardianID
+            turnHello.signature = try TransportAuth.signature(nonce: nonce, deviceID: identity.deviceID,
+                                                              instanceID: guardianID,
+                                                              signingKey: identity.signingKey)
+            try socket.send(turnHello)
+            guard await socket.next()?.type == .welcome else { return "" }
+            phoneSequence += 1
+            let turnPrompt = AgentMessage(conversationID: "default", senderDeviceID: identity.deviceID,
+                                          sequence: phoneSequence, type: .conversationSend,
+                                          body: .object(["text": .string(text)]))
+            var frame = TransportFrame(type: .envelope)
+            frame.envelope = try session.seal(turnPrompt)
+            try socket.send(frame)
+            var output = ""
+            for _ in 0..<80 {
+                guard let received = await socket.next(timeout: timeout), received.type == .envelope,
+                      let envelope = received.envelope,
+                      let message = try? session.open(envelope) else { break }
+                var ack = TransportFrame(type: .ack)
+                ack.messageIDs = [envelope.messageID]
+                try socket.send(ack)
+                if message.type == .outputDelta { output += message.body["text"]?.stringValue ?? "" }
+                if message.type == .outputCompleted { break }
+            }
+            return output
+        }
+
         // The same device must be denied on scribe's endpoint.
         let wsScribe = WSClient(url: "ws://127.0.0.1:\(e2ePort)/v2/ws")
         if let scribeChallenge = await wsScribe.next(), scribeChallenge.type == .challenge {
@@ -369,6 +408,25 @@ struct E2EPacks {
                 "What is the codeword? If you have never been told one, say NO-CODEWORD.", timeout: 300)
             check(!scribeCodeword.contains("BLUEFALCON"),
                   "AC2: guardian's conversation never leaks into scribe's session")
+
+            // …and the other half of that: guardian's own next turn resumes
+            // the same Codex session rather than starting cold.
+            let (_, gRecall) = try await converse(guardianID,
+                "What codeword did I give you? Answer with just the word.", timeout: 300)
+            check(gRecall.contains("BLUEFALCON"),
+                  "AC7: guardian's next turn continues the same session")
+
+            // AC8: the phone gets the reply the agent addressed to its person,
+            // and nothing else. checkin.sh prints GUARDIAN-CHECKIN-OK, so that
+            // token showing up on the phone means the transcript leaked.
+            let phoneReply = try await phoneTurn("""
+                Run `bash /workspace/tools/checkin.sh` now. Keep its output to \
+                yourself — reply with exactly: PHONE-REPLY-OK
+                """)
+            check(phoneReply.contains("PHONE-REPLY-OK"),
+                  "AC8: the phone receives the agent's reply")
+            check(!phoneReply.contains("GUARDIAN-CHECKIN-OK"),
+                  "AC8: the phone never sees the agent's working transcript")
         }
 
         print("\n\(passed) passed, \(failed) failed, \(skipped) skipped")

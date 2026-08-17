@@ -10,11 +10,20 @@ public struct AgentRuntimeStatus: Sendable, Equatable {
     public let installError: String?
 }
 
+/// Which audience a chunk of agent output is for. `reply` is what the agent
+/// deliberately addressed to its person (written through its reply tool) and
+/// is all the phone ever sees; `trace` is the working transcript — commands,
+/// edits, mid-turn chatter — which stays on the Mac.
+public enum OutputChannel: String, Sendable {
+    case reply
+    case trace
+}
+
 /// Events emitted by the guest bridge over the typed vsock channel.
 public enum BridgeEvent: Sendable {
     case status(state: String, uptimeSeconds: Int, kernel: String, hostname: String,
                 agent: AgentRuntimeStatus?)
-    case outputDelta(requestID: String, conversationID: String, text: String)
+    case outputDelta(requestID: String, conversationID: String, channel: OutputChannel, text: String)
     case outputCompleted(requestID: String, conversationID: String, exitCode: Int)
     case oauthRequested(provider: String, purpose: String, authURL: String)
     case oauthCompleted(success: Bool, message: String)
@@ -204,8 +213,12 @@ final class BridgeClient: @unchecked Sendable {
             handler(.oauthCompleted(success: object["success"] as? Bool ?? false,
                                     message: object["message"] as? String ?? ""))
         case "output.delta":
+            // A guest bridge that predates channels sends everything unlabelled;
+            // treat that as a reply so an old sandbox still answers its phone.
+            let channel = (object["channel"] as? String).flatMap(OutputChannel.init(rawValue:)) ?? .reply
             handler(.outputDelta(requestID: object["request_id"] as? String ?? "",
                                  conversationID: object["conversation_id"] as? String ?? "",
+                                 channel: channel,
                                  text: object["text"] as? String ?? ""))
         case "output.completed":
             handler(.outputCompleted(requestID: object["request_id"] as? String ?? "",

@@ -131,6 +131,14 @@ guardian.pack/
   sent raw or as raw DEFLATE (`"encoding": "deflate"`); the hub inflates
   before the guest sees the file. This is how the A-LIST locomo Guardian
   keeps `/workspace/data/alist-archive.json` fresh before every turn.
+- **Replies are deliberate**: a turn's transcript — commands, their output,
+  the agent's mid-turn thinking — is `trace`, and stays on the Mac. Only what
+  the agent writes through its pack's `tools/reply.sh` is `reply`, and only
+  `reply` is forwarded to the phone (a turn that never calls the tool falls
+  back to its final message, so an agent can't go silent).
+- **Turns continue**: the guest bridge records the Codex thread id per
+  conversation under `/var/lib/chariot/threads.json` and resumes it on the
+  next turn, so a conversation survives a bridge reconnect or a VM reboot.
 - A `data` field in pack.json is reserved for Milestone 2 (phone data
   providers) and ignored by this loader.
 
