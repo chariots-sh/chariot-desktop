@@ -88,6 +88,16 @@ jobs:
           test "$(lipo -archs "$APP/Contents/MacOS/Chariot Desktop")" = arm64
           exit $status
 
+      # A signed bundle can pass every static check and still be unable to
+      # start: `codesign --verify --deep --strict` validates each signature
+      # individually and says nothing about whether the process may load them
+      # together. v0.1.0 shipped unlaunchable for exactly that reason. This
+      # builds the ad-hoc bundle the way a release does and runs it.
+      - name: Ad-hoc bundle launches
+        run: |
+          SPARKLE_PUBLIC_ED_KEY=ci-placeholder VERSION=0.0.0-ci ADHOC=1 \
+            scripts/release-app.sh 2>&1 | tail -20
+
   agent-tailnet:
     name: agent-tailnet (Go)
     runs-on: macos-15
