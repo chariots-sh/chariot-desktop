@@ -26,6 +26,14 @@ jobs:
       - name: Loopback transport E2E (pairing, WS auth, replay, revocation)
         run: scripts/e2e-transport.sh
 
+  guest-bridge:
+    name: Guest bridge tests (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bridge unit tests (sessions, reply channel)
+        run: python3 -m unittest discover -s tests -p '*_test.py' -v
+
   ios-build:
     name: iOS simulator build
     runs-on: macos-15

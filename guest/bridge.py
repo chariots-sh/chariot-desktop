@@ -16,6 +16,7 @@ import base64
 import json
 import os
 import pwd
+import re
 import shutil
 import signal
 import socket
@@ -44,12 +45,35 @@ PROTOCOL_VERSION = 1
 MAX_LINE_BYTES = 64 * 1024 * 1024
 OUTPUT_LIMIT_PER_ITEM = 4000
 
+# Two kinds of output.delta (design: the person sees the agent's answer, the
+# Mac sees the work). "reply" is what the agent deliberately addressed to its
+# person — the host forwards only this to the phone. "trace" is the working
+# transcript (commands, edits, mid-turn chatter) and stays on the Mac.
+CHANNEL_REPLY = "reply"
+CHANNEL_TRACE = "trace"
+
+# Codex thread ids, so a conversation survives a bridge or VM restart. Root
+# owned and outside /workspace: the agent must not be able to rewrite its own
+# continuity, and repopulating a pack must not drop it.
+STATE_DIR = "/var/lib/chariot"
+THREADS_FILE = os.path.join(STATE_DIR, "threads.json")
+
+# Drop box the agent writes replies into (see packs/*/tools/reply.sh). One
+# directory per conversation; one file per message, renamed into place so the
+# bridge never reads a half-written message.
+OUTBOX_ROOT = os.path.join(WORKSPACE, ".chariot", "outbox")
+MESSAGE_SUFFIX = ".msg"
+OUTBOX_POLL_SECONDS = 0.25
+
 start_time = time.time()
 state_lock = threading.Lock()
 cancel_procs = {}          # conversation_id -> subprocess.Popen
-conversations_started = set()
+conversation_locks = {}    # conversation_id -> threading.Lock
 login_proc = None
 codex_install_error = None
+
+# Sentinel: the resumed session was unusable, so run the turn again fresh.
+RETRY_FRESH = object()
 
 
 def log(msg):
@@ -72,8 +96,9 @@ def agent_env():
     }
 
 
-def run_as_agent(argv, **kwargs):
+def run_as_agent(argv, extra_env=None, **kwargs):
     info, env = agent_env()
+    env.update(extra_env or {})
     return subprocess.Popen(argv, user=AGENT_USER, group=info.pw_gid, env=env,
                             cwd=WORKSPACE, start_new_session=True, **kwargs)
 
@@ -145,7 +170,131 @@ def sandbox_status():
     }
 
 
+# ------------------------------------------------------- Conversation state
+
+def conversation_lock(conversation_id):
+    """One turn at a time per conversation: two concurrent turns would share a
+    Codex session and an outbox directory, and interleave both."""
+    with state_lock:
+        lock = conversation_locks.get(conversation_id)
+        if lock is None:
+            lock = threading.Lock()
+            conversation_locks[conversation_id] = lock
+        return lock
+
+
+def read_threads():
+    try:
+        with open(THREADS_FILE) as f:
+            threads = json.load(f)
+        return threads if isinstance(threads, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_threads(threads):
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = THREADS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(threads, f)
+        os.replace(tmp, THREADS_FILE)
+    except OSError as e:
+        log(f"could not persist thread ids: {e}")
+
+
+def thread_for(conversation_id):
+    with state_lock:
+        return read_threads().get(conversation_id)
+
+
+def remember_thread(conversation_id, thread_id):
+    with state_lock:
+        threads = read_threads()
+        if threads.get(conversation_id) == thread_id:
+            return
+        threads[conversation_id] = thread_id
+        write_threads(threads)
+
+
+def forget_thread(conversation_id):
+    with state_lock:
+        threads = read_threads()
+        if threads.pop(conversation_id, None) is not None:
+            write_threads(threads)
+
+
+# ------------------------------------------------------------------- Outbox
+
+def outbox_dir(conversation_id):
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", conversation_id or "") or "default"
+    return os.path.join(OUTBOX_ROOT, safe)
+
+
+def reset_outbox(path):
+    """Empty drop box owned by the agent user, ready for one turn's replies."""
+    os.makedirs(path, exist_ok=True)
+    for directory in (os.path.dirname(OUTBOX_ROOT), OUTBOX_ROOT, path):
+        try:
+            info = pwd.getpwnam(AGENT_USER)
+            os.chown(directory, info.pw_uid, info.pw_gid)
+            os.chmod(directory, 0o755)
+        except (OSError, KeyError):
+            pass
+    for name in os.listdir(path):
+        try:
+            os.unlink(os.path.join(path, name))
+        except OSError:
+            pass
+
+
+def drain_outbox(path):
+    """Take every message the agent has finished writing, oldest first. Names
+    are `<nanoseconds>-<pid>.msg`, so lexicographic order is send order."""
+    try:
+        names = sorted(n for n in os.listdir(path) if n.endswith(MESSAGE_SUFFIX))
+    except OSError:
+        return []
+    messages = []
+    for name in names:
+        full = os.path.join(path, name)
+        try:
+            with open(full, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            os.unlink(full)
+        except OSError:
+            continue
+        if text.strip():
+            messages.append(text if text.endswith("\n") else text + "\n")
+    return messages
+
+
 # ---------------------------------------------------------------- Agent turns
+
+def close_pipes(proc):
+    """The bridge is long-lived; a finished turn must not leak its pipes."""
+    for pipe_file in (proc.stdout, proc.stderr):
+        try:
+            if pipe_file:
+                pipe_file.close()
+        except OSError:
+            pass
+
+
+def codex_argv(prompt, thread_id):
+    """Argv for one turn, resuming `thread_id` when we have one.
+
+    `--cd/-C` is not a clap *global* in the Codex CLI, so it is rejected after
+    the `resume` subcommand and the whole turn dies with a usage error. Resumed
+    turns get their working root from the process cwd (/workspace) instead,
+    which is the same directory `-C` names on a fresh run.
+    """
+    flags = ["--json", "--skip-git-repo-check",
+             "--dangerously-bypass-approvals-and-sandbox"]
+    if thread_id:
+        return [CODEX_BIN, "exec", "resume", thread_id] + flags + [prompt]
+    return [CODEX_BIN, "exec"] + flags + ["-C", WORKSPACE, prompt]
+
 
 def summarize_item(item):
     """Map a codex exec --json item to display text (or None to skip)."""
@@ -178,13 +327,14 @@ def run_codex_turn(conn_file, write_lock, request):
     request_id = request.get("request_id", "")
     prompt = request.get("body", {}).get("text", "")
 
-    def delta(text):
+    def delta(text, channel=CHANNEL_TRACE):
         with write_lock:
             send(conn_file, {
                 "type": "output.delta",
                 "version": PROTOCOL_VERSION,
                 "request_id": request_id,
                 "conversation_id": conversation_id,
+                "channel": channel,
                 "text": text,
             })
 
@@ -201,36 +351,75 @@ def run_codex_turn(conn_file, write_lock, request):
             })
 
     # Debug fallback: '!' runs a raw shell command (kept per goal statement).
+    # Its output *is* the answer to an explicit request, so it goes out on the
+    # reply channel rather than the trace.
     if prompt.startswith("!"):
         run_shell_debug(prompt[1:].strip(), conversation_id, delta, completed)
         return
 
     if not codex_installed() and not ensure_codex():
-        delta(f"Codex is not installed in the sandbox: {codex_install_error}\n")
+        delta(f"Codex is not installed in the sandbox: {codex_install_error}\n", CHANNEL_REPLY)
         completed(1)
         return
     if not codex_logged_in():
-        delta("Codex isn't signed in yet. On the Mac: Sandbox → Agent → Sign in Codex.\n")
+        delta("Codex isn't signed in yet. On the Mac: Sandbox → Agent → Sign in Codex.\n",
+              CHANNEL_REPLY)
         completed(1)
         return
 
-    flags = ["--json", "--skip-git-repo-check",
-             "--dangerously-bypass-approvals-and-sandbox", "-C", WORKSPACE]
-    with state_lock:
-        resume = conversation_id in conversations_started
-    argv = [CODEX_BIN, "exec"] + (["resume", "--last"] if resume else []) + flags + [prompt]
+    with conversation_lock(conversation_id):
+        exit_code = execute_codex_turn(conversation_id, prompt, delta)
+        if exit_code is RETRY_FRESH:
+            log("resume failed; retrying with a fresh session")
+            forget_thread(conversation_id)
+            exit_code = execute_codex_turn(conversation_id, prompt, delta)
+            if exit_code is RETRY_FRESH:  # can only happen with a thread id
+                exit_code = 1
+    completed(exit_code)
+
+
+def execute_codex_turn(conversation_id, prompt, delta):
+    """Run one `codex exec` and stream it. Returns the exit code, or
+    RETRY_FRESH when a resumed session never started and the turn is worth
+    retrying without one."""
+    thread_id = thread_for(conversation_id)
+    outbox = outbox_dir(conversation_id)
+    try:
+        reset_outbox(outbox)
+    except OSError as e:
+        log(f"outbox unavailable ({e}); falling back to the final agent message")
 
     try:
-        proc = run_as_agent(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = run_as_agent(codex_argv(prompt, thread_id),
+                            extra_env={"CHARIOT_OUTBOX": outbox},
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except Exception as e:  # noqa: BLE001
-        delta(f"[failed to start codex: {e}]\n")
-        completed(1)
-        return
+        delta(f"[failed to start codex: {e}]\n", CHANNEL_REPLY)
+        return 1
     with state_lock:
         cancel_procs[conversation_id] = proc
 
+    replies = 0
+
+    def flush_outbox():
+        nonlocal replies
+        for message in drain_outbox(outbox):
+            replies += 1
+            delta(message, CHANNEL_REPLY)
+
+    def pump_outbox():
+        # Replies reach the phone while the turn is still working, rather than
+        # arriving in one lump at the end.
+        while proc.poll() is None:
+            flush_outbox()
+            time.sleep(OUTBOX_POLL_SECONDS)
+
+    pump = threading.Thread(target=pump_outbox, daemon=True)
+    pump.start()
+
     exit_code = 0
-    got_output = False
+    thread_started = False
+    last_agent_message = None
     for line in proc.stdout:
         line = line.strip()
         if not line:
@@ -240,45 +429,54 @@ def run_codex_turn(conn_file, write_lock, request):
         except json.JSONDecodeError:
             continue
         etype = evt.get("type", "")
-        if etype in ("item.completed", "item.updated") and etype == "item.completed":
-            text = summarize_item(evt.get("item", {}))
+        if etype == "thread.started":
+            thread_started = True
+            if evt.get("thread_id"):
+                remember_thread(conversation_id, evt["thread_id"])
+        elif etype == "item.completed":
+            item = evt.get("item", {})
+            if (item.get("item_type") or item.get("type")) == "agent_message":
+                last_agent_message = item.get("text") or last_agent_message
+            text = summarize_item(item)
             if text:
-                got_output = True
                 delta(text)
         elif etype == "turn.failed":
             error = (evt.get("error") or {}).get("message", "turn failed")
-            delta(f"[codex: {error}]\n")
+            delta(f"[codex: {error}]\n", CHANNEL_REPLY)
             exit_code = 1
         elif etype == "error":
-            delta(f"[codex: {evt.get('message', 'error')}]\n")
+            delta(f"[codex: {evt.get('message', 'error')}]\n", CHANNEL_REPLY)
             exit_code = 1
     proc.wait()
+    pump.join(timeout=OUTBOX_POLL_SECONDS * 8)
+    flush_outbox()
+
     stderr_tail = proc.stderr.read()[-800:] if proc.stderr else ""
+    close_pipes(proc)
     if proc.returncode != 0:
         exit_code = proc.returncode if proc.returncode > 0 else 1
-        if resume and not got_output:
-            # A broken resume (e.g. no prior session) — retry fresh once.
+        if thread_id and not thread_started:
+            # The session never opened — a stale thread id, or a CLI that
+            # rejected the resume. Worth one clean attempt.
             with state_lock:
-                conversations_started.discard(conversation_id)
                 cancel_procs.pop(conversation_id, None)
-            log("resume failed; retrying with a fresh session")
-            run_codex_turn(conn_file, write_lock, request)
-            return
-        if stderr_tail.strip() and not got_output:
-            delta(f"[codex stderr: {stderr_tail.strip()}]\n")
-    else:
-        with state_lock:
-            conversations_started.add(conversation_id)
-    completed(exit_code)
+            return RETRY_FRESH
+        if stderr_tail.strip() and replies == 0:
+            delta(f"[codex stderr: {stderr_tail.strip()}]\n", CHANNEL_REPLY)
+    if replies == 0 and last_agent_message:
+        # Safety net for a turn that never called its reply tool: better a
+        # slightly raw answer than silence on the phone.
+        delta(last_agent_message + "\n", CHANNEL_REPLY)
+    return exit_code
 
 
 def run_shell_debug(command, conversation_id, delta, completed):
-    delta(f"$ {command}\n")
+    delta(f"$ {command}\n", CHANNEL_REPLY)
     try:
         proc = run_as_agent(["/bin/bash", "-lc", command],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except Exception as e:  # noqa: BLE001
-        delta(f"[failed: {e}]\n")
+        delta(f"[failed: {e}]\n", CHANNEL_REPLY)
         completed(1)
         return
     with state_lock:
@@ -288,7 +486,8 @@ def run_shell_debug(command, conversation_id, delta, completed):
         if not chunk:
             proc.wait()
             break
-        delta(chunk.decode("utf-8", errors="replace"))
+        delta(chunk.decode("utf-8", errors="replace"), CHANNEL_REPLY)
+    close_pipes(proc)
     completed(proc.returncode or 0)
 
 
@@ -525,6 +724,7 @@ def serve(port, handler):
 
 def main():
     os.makedirs(WORKSPACE, exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
     threading.Thread(target=ensure_codex, daemon=True).start()
     threading.Thread(target=serve, args=(SSH_TUNNEL_PORT, tcp_tunnel_handler(22)),
                      daemon=True).start()

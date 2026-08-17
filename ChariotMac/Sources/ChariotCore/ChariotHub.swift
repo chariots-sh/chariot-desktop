@@ -1133,13 +1133,17 @@ public final class ChariotHub: @unchecked Sendable {
                 tunnel?.stop()
             }
             try? bridge?.requestStatus()
-        case .outputDelta(let requestID, _, let text):
+        case .outputDelta(let requestID, _, let channel, let text):
             lock.lock()
             if let (onDelta, _) = localStreams[requestID] {
                 lock.unlock()
+                // The Mac is the debugging seat: it sees the work as well as
+                // the answer.
                 onDelta(text)
                 return
             }
+            // The phone only ever sees what the agent addressed to its person.
+            guard channel == .reply else { lock.unlock(); return }
             if streams[requestID] != nil {
                 streams[requestID]!.buffer += text
                 let needsFlush = !streams[requestID]!.flushScheduled

@@ -173,6 +173,10 @@ artifact.import
 artifact.export.requested
 ```
 
+Each `output.delta` carries a `channel`. `reply` is what the agent deliberately addressed to its person; `trace` is the working transcript of the turn — commands, their output, edits, and mid-turn commentary. The Mac forwards only `reply` to the mobile application and keeps `trace` for its own transcript, so an agent's internal working is never mistaken for its answer. An agent writes a reply through a tool its pack ships rather than by emitting text, and the guest bridge falls back to the turn's final message if no reply was written.
+
+The bridge also records the agent session id per conversation in guest state outside the workspace, so a conversation continues across bridge reconnects, guest restarts, and workspace repopulates rather than starting cold on each message.
+
 The mobile application cannot invoke arbitrary host shell commands. Mobile requests enter the agent protocol and remain subject to the Mac application's validation and approval policies.
 
 ### 1.5 Unlockable developer access with SSH and SCP
