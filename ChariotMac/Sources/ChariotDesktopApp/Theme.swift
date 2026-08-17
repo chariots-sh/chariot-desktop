@@ -103,31 +103,55 @@ struct Chip: View {
     }
 }
 
+/// Both styles read `isEnabled` through a nested view — a ButtonStyle itself
+/// gets no environment. Without this a `.disabled()` button paints exactly like
+/// a live one, so pressing it appears to do nothing at all, with no hint that
+/// the app is refusing rather than failing.
 struct AccentButtonStyle: ButtonStyle {
     var danger = false
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(Theme.mono(12, weight: .medium))
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 7)
-            .background(danger ? Theme.red : Theme.accent)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .opacity(configuration.isPressed ? 0.75 : 1)
+        StyleBody(configuration: configuration, danger: danger)
+    }
+
+    private struct StyleBody: View {
+        let configuration: Configuration
+        let danger: Bool
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            configuration.label
+                .font(Theme.mono(12, weight: .medium))
+                .foregroundStyle(isEnabled ? Color.white : Color.white.opacity(0.4))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background((danger ? Theme.red : Theme.accent).opacity(isEnabled ? 1 : 0.3))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .opacity(configuration.isPressed && isEnabled ? 0.75 : 1)
+        }
     }
 }
 
 struct OutlineButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(Theme.mono(12, weight: .medium))
-            .foregroundStyle(Theme.text)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 7)
-            .background(Theme.card)
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Theme.border, lineWidth: 1))
-            .opacity(configuration.isPressed ? 0.75 : 1)
+        StyleBody(configuration: configuration)
+    }
+
+    private struct StyleBody: View {
+        let configuration: Configuration
+        @Environment(\.isEnabled) private var isEnabled
+
+        var body: some View {
+            configuration.label
+                .font(Theme.mono(12, weight: .medium))
+                .foregroundStyle(isEnabled ? Theme.text : Theme.secondary.opacity(0.6))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(Theme.card)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6)
+                    .stroke(Theme.border.opacity(isEnabled ? 1 : 0.5), lineWidth: 1))
+                .opacity(configuration.isPressed && isEnabled ? 0.75 : 1)
+        }
     }
 }

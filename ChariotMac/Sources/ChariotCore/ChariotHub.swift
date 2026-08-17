@@ -550,7 +550,14 @@ public final class ChariotHub: @unchecked Sendable {
         }
         let tunnel = context.loginTunnel
         lock.unlock()
-        try tunnel?.start()
+        // Without the tunnel the guest never receives the localhost:1455 OAuth
+        // callback. `try tunnel?.start()` silently no-ops when the controller
+        // lookup above failed, which used to leave sign-in apparently underway
+        // — browser open, spinner running — and permanently unable to complete.
+        guard let tunnel else {
+            throw ChariotError.invalidState("could not open the sign-in tunnel into the guest")
+        }
+        try tunnel.start()
         try bridge.startLogin()
         event("\(displayName(of: context)): codex sign-in started; waiting for auth URL from guest")
     }

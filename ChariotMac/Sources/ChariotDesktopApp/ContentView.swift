@@ -343,6 +343,27 @@ struct AgentDetailView: View {
         .padding(.vertical, 12)
     }
 
+    /// Why Codex sign-in cannot start yet, or nil when it can.
+    ///
+    /// Ordered the way the agent actually comes up: the VM boots, the vsock
+    /// bridge connects, then cloud-init finishes installing Codex. First boot
+    /// takes roughly 40 seconds, so all three of these are states a user will
+    /// see in normal use rather than error conditions.
+    private func signInBlocker(_ agent: AgentViewState) -> String? {
+        switch agent.vmState {
+        case .notCreated, .stopped, .failed:
+            return "Press Start first."
+        case .stopping:
+            return "Agent is stopping."
+        case .starting:
+            return "Waiting for the agent to boot…"
+        case .running:
+            if !agent.bridgeConnected { return "Waiting for the guest bridge…" }
+            if !agent.codexInstalled { return "Installing Codex in the guest…" }
+            return nil
+        }
+    }
+
     private func controlsCard(_ agent: AgentViewState) -> some View {
         Card(title: "sandbox", subtitle: "Pack \(agent.packID) · instance \(agent.id.prefix(8))") {
             VStack(alignment: .leading, spacing: 8) {
@@ -370,7 +391,15 @@ struct AgentDetailView: View {
                     } else {
                         Button("Sign in Codex") { model.signInCodex(agent.id) }
                             .buttonStyle(AccentButtonStyle())
-                            .disabled(!agent.codexInstalled || !agent.bridgeConnected)
+                            .disabled(signInBlocker(agent) != nil)
+                        // A greyed-out button still leaves "why?" unanswered,
+                        // and every reason here is temporary — the guest is
+                        // booting, or Codex is still installing. Say which.
+                        if let blocker = signInBlocker(agent) {
+                            Text(blocker)
+                                .font(Theme.mono(11))
+                                .foregroundStyle(Theme.secondary)
+                        }
                     }
                     Spacer()
                 }
