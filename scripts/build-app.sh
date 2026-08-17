@@ -23,7 +23,9 @@ cp "$ROOT/build/agent-tailnet" "$APP/Contents/MacOS/agent-tailnet"
 # → xcodebuild) gets all of this from Xcode instead. This bundle carries no
 # SUFeedURL/SUPublicEDKey, so UpdaterController.isConfigured is false and the
 # updater stays dormant in dev builds.
-SPARKLE="$(find "$ROOT/ChariotMac/.build/artifacts" -maxdepth 6 -type d -name Sparkle.framework | head -1)"
+# `2>/dev/null` and `|| true`: under `set -o pipefail` a find over a directory
+# that does not exist yet aborts before the message below can explain why.
+SPARKLE="$(find "$ROOT/ChariotMac/.build/artifacts" -maxdepth 6 -type d -name Sparkle.framework 2>/dev/null | head -1 || true)"
 if [[ -z "$SPARKLE" ]]; then
   echo "Sparkle.framework not found — run 'swift package resolve' in ChariotMac" >&2
   exit 1
