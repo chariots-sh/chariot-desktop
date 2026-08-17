@@ -55,8 +55,25 @@ runcmd:
   # Persistent NIC management — survives reboots regardless of cloud-init's
   # first-boot-only network rendering.
   - systemctl enable --now systemd-networkd systemd-resolved || true
-  # Preinstall the Codex CLI agent runtime (bridge self-heals if this fails).
-  - curl -fsSL -o /tmp/codex.tar.gz https://github.com/openai/codex/releases/download/rust-v0.147.0/codex-aarch64-unknown-linux-musl.tar.gz && tar -xzf /tmp/codex.tar.gz -C /tmp && mv /tmp/codex-aarch64-unknown-linux-musl /usr/local/bin/codex && chmod 755 /usr/local/bin/codex && rm -f /tmp/codex.tar.gz || true
+  # Preinstall the Codex CLI runtime (bridge self-heals if this fails).
+  #
+  # Both binaries, not just `codex`: bridge.py's codex_installed() requires
+  # every entry in CODEX_BINARIES, so installing one left the agent reporting
+  # installed=false after a successful boot — which in turn disabled the
+  # Sign in Codex button, whose only alternative trigger for the self-heal was
+  # a chat turn the user could not usefully send yet.
+  - |
+    for pair in "codex-aarch64-unknown-linux-musl:/usr/local/bin/codex" \
+                "codex-code-mode-host-aarch64-unknown-linux-musl:/usr/local/bin/codex-code-mode-host"; do
+      asset="${pair%%:*}"
+      dest="${pair##*:}"
+      curl -fsSL -o "/tmp/$asset.tar.gz" \
+        "https://github.com/openai/codex/releases/download/rust-v0.147.0/$asset.tar.gz" \
+        && tar -xzf "/tmp/$asset.tar.gz" -C /tmp \
+        && mv "/tmp/$asset" "$dest" \
+        && chmod 755 "$dest" \
+        && rm -f "/tmp/$asset.tar.gz" || true
+    done
   - systemctl daemon-reload
   - systemctl enable --now chariot-bridge.service
   - systemctl restart ssh || systemctl restart sshd || true

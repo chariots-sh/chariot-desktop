@@ -109,8 +109,29 @@ def codex_installed():
     return all(os.path.exists(p) and os.access(p, os.X_OK) for p in CODEX_BINARIES)
 
 
+def ensure_codex_forever():
+    """Keep trying to install Codex until it is there.
+
+    On first boot this races cloud-init bringing up DHCP, and it used to lose
+    silently: ensure_codex ran once, failed with no route to host, recorded the
+    error and never tried again. Because the sign-in button is gated on
+    `installed`, and the only other callers of ensure_codex are a chat turn or a
+    login attempt, the agent could sit at installed=false indefinitely — with a
+    restart as the only way out.
+    """
+    delay = 2
+    while not codex_installed():
+        if ensure_codex():
+            return
+        time.sleep(delay)
+        # Back off to a minute: a guest with no network yet recovers in
+        # seconds, but one that needs a human (proxy, captive portal) should
+        # not spend the session re-downloading.
+        delay = min(delay * 2, 60)
+
+
 def ensure_codex():
-    """Download the Codex CLI binary if missing (guest has NAT internet)."""
+    """Download any missing Codex binaries (guest has NAT internet)."""
     global codex_install_error
     if codex_installed():
         return True
@@ -725,7 +746,7 @@ def serve(port, handler):
 def main():
     os.makedirs(WORKSPACE, exist_ok=True)
     os.makedirs(STATE_DIR, exist_ok=True)
-    threading.Thread(target=ensure_codex, daemon=True).start()
+    threading.Thread(target=ensure_codex_forever, daemon=True).start()
     threading.Thread(target=serve, args=(SSH_TUNNEL_PORT, tcp_tunnel_handler(22)),
                      daemon=True).start()
     threading.Thread(target=serve, args=(LOGIN_TUNNEL_PORT, tcp_tunnel_handler(LOGIN_CALLBACK_PORT)),

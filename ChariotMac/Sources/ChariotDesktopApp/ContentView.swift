@@ -359,7 +359,14 @@ struct AgentDetailView: View {
             return "Waiting for the agent to boot…"
         case .running:
             if !agent.bridgeConnected { return "Waiting for the guest bridge…" }
-            if !agent.codexInstalled { return "Installing Codex in the guest…" }
+            if !agent.codexInstalled {
+                // The guest records why; showing "Installing…" over a failure
+                // that is actually stuck reads as a hang with no explanation.
+                if let error = agent.codexInstallError, !error.isEmpty {
+                    return "Codex install failed, retrying: \(error)"
+                }
+                return "Installing Codex in the guest…"
+            }
             return nil
         }
     }
