@@ -148,13 +148,23 @@ jobs:
             if [ "$HAS_CERT" != "true" ]; then
               echo "### First launch"
               echo
-              echo "This build is ad-hoc signed rather than notarized, so macOS will"
-              echo "refuse to open it the first time and claim it is damaged. It is not —"
-              echo "that is what macOS says for any app it cannot verify."
+              echo "This build is ad-hoc signed rather than notarized, so macOS blocks the"
+              echo "first launch with *\"Apple could not verify … is free of malware\"*."
+              echo "That is what macOS shows for any app it cannot verify; nothing was found."
               echo
               echo "1. Drag the app to Applications and open it once."
-              echo "2. Open **System Settings → Privacy & Security**, scroll down, and"
-              echo "   click **Open Anyway**."
+              echo "2. On the blocking dialog, click **Done**."
+              echo "   ⚠️ **Not \"Move to Trash\"** — it is the highlighted button and it"
+              echo "   deletes the app."
+              echo "3. Open **System Settings → Privacy & Security**, scroll to Security,"
+              echo "   and click **Open Anyway** next to the Chariot Desktop message."
+              echo "4. Open the app again and click **Open Anyway**."
+              echo
+              echo "Or, in one step:"
+              echo
+              echo '   ```'
+              echo '   xattr -dr com.apple.quarantine "/Applications/Chariot Desktop.app"'
+              echo '   ```'
               echo
               echo "You only do this once. Updates after that are signed, verified, and"
               echo "install without the prompt."

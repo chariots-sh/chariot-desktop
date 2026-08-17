@@ -107,7 +107,16 @@ ARCHIVE_ARGS=(
 if [[ "$SIGN_MODE" == "adhoc" ]]; then
   # An empty team keeps Xcode from demanding a provisioning profile it cannot
   # get; ad-hoc signing needs no team and no profile.
-  ARCHIVE_ARGS+=(DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="")
+  #
+  # The entitlements swap is not cosmetic: under the hardened runtime, library
+  # validation requires embedded frameworks to share the main binary's Team ID,
+  # and ad-hoc signatures have none — so without the exception in this file the
+  # app cannot load Sparkle.framework and dies at launch.
+  ARCHIVE_ARGS+=(
+    DEVELOPMENT_TEAM=""
+    PROVISIONING_PROFILE_SPECIFIER=""
+    CODE_SIGN_ENTITLEMENTS="$ROOT/ChariotMac/ChariotDesktop-adhoc.entitlements"
+  )
 else
   ARCHIVE_ARGS+=(DEVELOPMENT_TEAM="$TEAM_ID")
 fi
@@ -179,6 +188,49 @@ signature_info="$(codesign -dv "$APP" 2>&1 || true)"
 grep -q "Signature=" <<<"$signature_info" \
   || { echo "app is not code signed at all; Sparkle would reject updates from it" >&2; exit 1; }
 
+# --- launch smoke test -------------------------------------------------------
+#
+# Every check above passes on a bundle that cannot start: `codesign --verify
+# --deep --strict` confirms each signature is individually valid, and says
+# nothing about whether the process is allowed to load them *together*. A build
+# with mismatched library-validation rules died at launch with "Library not
+# loaded: @rpath/Sparkle.framework" and shipped anyway, because nothing here
+# ever ran it. So: run it.
+#
+# Pointed at a scratch data directory and an unused port so the smoke test
+# cannot disturb a real install or collide with a running daemon.
+echo "==> Launch smoke test"
+SMOKE_LOG="$OUT/launch-smoke.log"
+SMOKE_DIR="$OUT/smoke-data"
+mkdir -p "$SMOKE_DIR"
+CHARIOT_DATA_DIR="$SMOKE_DIR" \
+CHARIOT_MAILBOX_PORT=18787 \
+CHARIOT_TAILSCALE=0 \
+  "$APP/Contents/MacOS/$APP_NAME" >"$SMOKE_LOG" 2>&1 &
+SMOKE_PID=$!
+# dyld failures happen before main(); a few seconds is plenty.
+perl -e 'select(undef,undef,undef,6)'
+
+smoke_failed=""
+if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
+  smoke_failed="the app exited immediately"
+elif grep -q "Library not loaded\|not valid for use in process" "$SMOKE_LOG" 2>/dev/null; then
+  smoke_failed="dyld could not load an embedded library"
+fi
+kill "$SMOKE_PID" 2>/dev/null || true
+wait "$SMOKE_PID" 2>/dev/null || true
+rm -rf "$SMOKE_DIR"
+
+if [[ -n "$smoke_failed" ]]; then
+  echo >&2
+  echo "Launch smoke test failed: $smoke_failed" >&2
+  echo "--- output ---" >&2
+  head -20 "$SMOKE_LOG" >&2
+  exit 1
+fi
+echo "    launched and stayed up"
+rm -f "$SMOKE_LOG"
+
 # --- notarize (developer-id only) --------------------------------------------
 
 if [[ "$SIGN_MODE" == "developer-id" && "${SKIP_NOTARIZE:-0}" != "1" ]]; then
@@ -204,29 +256,44 @@ cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 
 if [[ "$SIGN_MODE" == "adhoc" ]]; then
-  # Gatekeeper's refusal is worded as though the app is broken ("damaged"),
-  # which reads like a corrupt download rather than a missing signature. Say so
-  # in the DMG, where someone stuck on that dialog will actually look.
+  # The blocking dialog offers "Move to Trash" as its highlighted default and
+  # does not offer "Open Anyway" at all — that button lives in System Settings
+  # and only appears after a launch has been attempted. Anyone following along
+  # in a hurry will press the blue button and delete the app, so lead with that.
   cat > "$STAGE/INSTALL.txt" <<'TXT'
 Installing Chariot Desktop
 ==========================
 
 1. Drag "Chariot Desktop" onto the Applications folder in this window.
-2. Open it once from Applications. macOS will refuse, saying the app is
-   damaged or cannot be verified.
-3. Open System Settings -> Privacy & Security, scroll to the bottom, and
-   click "Open Anyway" next to the message about Chariot Desktop.
-4. Confirm. Chariot Desktop opens, and later launches work normally.
+
+2. Open it once from Applications. macOS blocks it, with:
+
+       "Chariot Desktop" Not Opened
+       Apple could not verify "Chariot Desktop" is free of malware that
+       may harm your Mac or compromise your privacy.
+
+   Click "Done".
+
+   *** Do NOT click "Move to Trash" — it is the highlighted button, and
+   it deletes the app. ***
+
+3. Open System Settings -> Privacy & Security and scroll to Security.
+   There is now a line saying Chariot Desktop was blocked, with an
+   "Open Anyway" button. Click it and authenticate.
+
+4. Open Chariot Desktop again and click "Open Anyway" in the last dialog.
+
+Later launches work normally. You only do this once.
 
 Why: this build is ad-hoc signed rather than signed with an Apple
-Developer ID, so it cannot be notarized and Gatekeeper will not open it
-without explicit permission. The wording about damage is misleading — it
-is what macOS says for any app it cannot verify.
+Developer ID, so it cannot be notarized, and macOS will not run it
+without explicit permission. The message is what macOS shows for any app
+it cannot verify — it is not a claim that anything was found.
 
-You only do this once. Chariot updates itself after that, and updates
-are cryptographically signed and verified before installation.
+Updates after this are cryptographically signed and verified before
+installation, and install without the prompt.
 
-If you prefer the command line, this achieves the same thing:
+Prefer the command line? This does the same thing in one step:
 
     xattr -dr com.apple.quarantine "/Applications/Chariot Desktop.app"
 TXT

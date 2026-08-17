@@ -79,7 +79,11 @@ for nested in "$FW/Versions/B/XPCServices/Downloader.xpc" \
 done
 codesign --force --options runtime --sign - "$FW"
 codesign --force --options runtime --sign - "$APP/Contents/MacOS/agent-tailnet"
+# ChariotDesktop-adhoc.entitlements, not virtualization.entitlements: the
+# hardened runtime validates that embedded frameworks share the main binary's
+# Team ID, and ad-hoc signatures have none — so without the exception in that
+# file the app cannot load Sparkle.framework and dies at launch.
 codesign --force --options runtime --sign - \
-  --entitlements "$ROOT/ChariotMac/virtualization.entitlements" "$APP"
+  --entitlements "$ROOT/ChariotMac/ChariotDesktop-adhoc.entitlements" "$APP"
 codesign --verify --deep --strict "$APP"
 echo "built: $APP"
