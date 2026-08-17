@@ -59,6 +59,10 @@ jobs:
         run: brew install xcodegen
       - name: Generate and build the release target
         run: |
+          # The helper is a gitignored build product, and XcodeGen validates
+          # source paths at generation time — so it must exist before generate,
+          # not just before the build.
+          scripts/build-helper.sh build/agent-tailnet
           xcodegen generate --spec project.yml --project .
           xcodebuild build -project Chariot.xcodeproj -scheme ChariotDesktop \
             -configuration Release -destination "generic/platform=macOS" \

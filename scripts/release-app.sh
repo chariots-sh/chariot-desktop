@@ -81,6 +81,13 @@ echo
 command -v xcodegen >/dev/null || { echo "xcodegen not installed: brew install xcodegen" >&2; exit 1; }
 rm -rf "$OUT"
 mkdir -p "$OUT"
+
+# XcodeGen validates that every source path exists when it generates the
+# project, and the helper is a gitignored build product. The in-target script
+# phase that builds it does not run until the build — too late — so on a clean
+# checkout the helper has to be built first or generation fails outright.
+"$ROOT/scripts/build-helper.sh" "$ROOT/build/agent-tailnet"
+
 xcodegen generate --spec "$ROOT/project.yml" --project "$ROOT" >/dev/null
 
 # --- archive -----------------------------------------------------------------
