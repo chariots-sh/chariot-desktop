@@ -123,4 +123,45 @@ final class TransportServerTests: XCTestCase {
         }.resume()
         wait(for: [done], timeout: 5)
     }
+
+    func testClientVanishingMidResponseDoesNotKillTheProcess() throws {
+        // Regression: writes are raw `write(2)` on the socket, so a peer that
+        // disappears mid-response used to raise SIGPIPE and take the whole app
+        // down (the phone dropping during a multi-MB file.put snapshot). The
+        // write must fail instead, leaving the server able to serve the next
+        // request. Without the SO_NOSIGPIPE guard this kills the test runner.
+        let big = Data(repeating: 0x41, count: 16 * 1024 * 1024)
+        let server = try startServer { _ in .data(big) }
+        defer { server.stop() }
+
+        // Raw socket so we can send a request and hang up before reading — a
+        // URLSession client drains the response for us.
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = server.port.bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connected = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        XCTAssertTrue(connected)
+        let request = Data("GET /big HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".utf8)
+        _ = request.withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        // Close while the 16 MiB response is still being written.
+        Thread.sleep(forTimeInterval: 0.05)
+        Darwin.close(fd)
+
+        // The server survived the broken pipe and still answers.
+        let done = expectation(description: "still serving")
+        URLSession.shared.dataTask(with: URL(string: "http://127.0.0.1:\(server.port)/again")!) { data, response, error in
+            XCTAssertNil(error)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            XCTAssertEqual(data?.count, big.count)
+            done.fulfill()
+        }.resume()
+        wait(for: [done], timeout: 30)
+    }
 }
