@@ -71,9 +71,11 @@ scripts/run-desktop.sh      # launches it with defaults for this checkout
 ```
 
 This is the development build: ad-hoc signed, with the updater inert. For a
-binary that can be published on the web, see
-[docs/distribution.md](docs/distribution.md) — `scripts/release-app.sh` produces
-a Developer ID signed, notarized, stapled DMG.
+binary that can be published on the web, `scripts/release-app.sh` produces a DMG
+with Sparkle auto-update wired up — Developer ID signed and notarized when a
+certificate is available, ad-hoc otherwise (which costs users a one-time
+approval in System Settings on first launch). See
+[docs/distribution.md](docs/distribution.md).
 
 On first launch without a base image, the app shows a setup screen and downloads
 the guest image itself; `CHARIOT_BASE_IMAGE` skips that when you already have
@@ -264,10 +266,13 @@ Official Tailscale iOS app provides the VPN         ▼
   runs; if background receive is needed later, the helper and supervisor move
   into the existing signed background-service architecture with the *same*
   Tailscale identity), artifact import/export UI.
-- **Distribution** is wired but unreleased: the pipeline in
-  [docs/distribution.md](docs/distribution.md) is complete and verified up to
-  the point of signing, which needs a Developer ID Application certificate the
-  team does not yet hold.
+- **Distribution** ships **ad-hoc signed**: a Developer ID Application
+  certificate can only be created by the team's Account Holder, so builds are
+  not notarized and users must allow the first launch in System Settings →
+  Privacy & Security. Auto-update is unaffected, and moving to Developer ID
+  later needs only two repository secrets — Sparkle permits the signing identity
+  to change while the EdDSA key stays the same. See
+  [docs/distribution.md](docs/distribution.md).
 
 ## What was verified end to end
 

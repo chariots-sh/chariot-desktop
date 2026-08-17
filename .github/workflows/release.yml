@@ -3,9 +3,15 @@ name: Release
 # Tag a release to publish it:
 #   git tag v0.2.0 && git push origin v0.2.0
 #
-# Produces a Developer ID signed, notarized, stapled DMG, attaches it to a
-# GitHub release, and publishes the Sparkle appcast to GitHub Pages so existing
-# installs see the update. Required secrets are listed in docs/distribution.md.
+# Signing mode is chosen by whether the DEVELOPER_ID_CERT_P12 secret is set:
+#
+#   set    -> Developer ID signed, notarized, stapled. Opens on a double click.
+#   unset  -> ad-hoc signed. Users must allow the first launch in System
+#             Settings -> Privacy & Security. Auto-update still works.
+#
+# Adding the certificate secrets later switches modes with no other changes;
+# Sparkle accepts the identity change as long as SPARKLE_PRIVATE_KEY stays the
+# same. Required secrets are listed in docs/distribution.md.
 on:
   push:
     tags: ["v*"]
@@ -20,8 +26,10 @@ permissions:
 
 jobs:
   release:
-    name: Build, notarize, publish
+    name: Build and publish
     runs-on: macos-15
+    env:
+      HAS_CERT: ${{ secrets.DEVELOPER_ID_CERT_P12 != '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,9 +55,19 @@ jobs:
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Report signing mode
+        run: |
+          if [ "$HAS_CERT" = "true" ]; then
+            echo "Developer ID mode: the DMG will be notarized and stapled."
+          else
+            echo "::warning::No Developer ID certificate secret is set — building ad-hoc."
+            echo "Users will have to allow the first launch in System Settings."
+          fi
+
       # A dedicated keychain keeps the signing identity off the default one and
       # is discarded with the runner.
       - name: Import Developer ID certificate
+        if: env.HAS_CERT == 'true'
         env:
           CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
           CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
@@ -69,6 +87,7 @@ jobs:
           security find-identity -v -p codesigning "$KEYCHAIN"
 
       - name: Store notarytool credentials
+        if: env.HAS_CERT == 'true'
         env:
           ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
           KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
@@ -81,23 +100,54 @@ jobs:
             --issuer "$ISSUER_ID"
           rm -f "$RUNNER_TEMP/notary.p8"
 
-      - name: Build, sign, notarize, staple
+      # release-app.sh picks ad-hoc automatically when no Developer ID identity
+      # is in the keychain; ADHOC is set explicitly so the intent is visible in
+      # the log rather than inferred.
+      - name: Build, sign, package
         env:
           VERSION: ${{ steps.version.outputs.version }}
           NOTARY_PROFILE: chariot-ci
           SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
-        run: scripts/release-app.sh
+        run: |
+          if [ "$HAS_CERT" != "true" ]; then export ADHOC=1; fi
+          scripts/release-app.sh
 
+      # The key goes in on stdin (Sparkle's documented pattern) so it never
+      # lands on the runner's filesystem.
       - name: Sign the update into the appcast
         env:
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ github.ref_name }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: scripts/make-appcast.sh "build/release/ChariotDesktop-${VERSION}.dmg"
+
+      - name: Compose release notes
+        id: notes
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          echo "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle.key"
-          SPARKLE_PRIVATE_KEY_FILE="$RUNNER_TEMP/sparkle.key" \
-            scripts/make-appcast.sh "build/release/ChariotDesktop-${VERSION}.dmg"
-          rm -f "$RUNNER_TEMP/sparkle.key"
+          DMG="build/release/ChariotDesktop-${VERSION}.dmg"
+          {
+            echo "Apple silicon, macOS 14 or later."
+            echo
+            if [ "$HAS_CERT" != "true" ]; then
+              echo "### First launch"
+              echo
+              echo "This build is ad-hoc signed rather than notarized, so macOS will"
+              echo "refuse to open it the first time and claim it is damaged. It is not —"
+              echo "that is what macOS says for any app it cannot verify."
+              echo
+              echo "1. Drag the app to Applications and open it once."
+              echo "2. Open **System Settings → Privacy & Security**, scroll down, and"
+              echo "   click **Open Anyway**."
+              echo
+              echo "You only do this once. Updates after that are signed, verified, and"
+              echo "install without the prompt."
+              echo
+            fi
+            echo "\`sha256\` \`$(shasum -a 256 "$DMG" | cut -d' ' -f1)\`"
+          } > "$RUNNER_TEMP/notes.md"
+          echo "path=$RUNNER_TEMP/notes.md" >> "$GITHUB_OUTPUT"
 
       # The DMG must exist at its final URL before the appcast that points at it
       # goes live, or an update check in between would 404.
@@ -106,12 +156,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          gh release create "${GITHUB_REF_NAME:-v$VERSION}" \
-            "build/release/ChariotDesktop-${VERSION}.dmg" \
-            --title "Chariot Desktop $VERSION" \
-            --generate-notes \
-            || gh release upload "${GITHUB_REF_NAME:-v$VERSION}" \
-                 "build/release/ChariotDesktop-${VERSION}.dmg" --clobber
+          TAG="${GITHUB_REF_NAME:-v$VERSION}"
+          DMG="build/release/ChariotDesktop-${VERSION}.dmg"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" --clobber
+          else
+            gh release create "$TAG" "$DMG" \
+              --title "Chariot Desktop $VERSION" \
+              --notes-file "${{ steps.notes.outputs.path }}"
+          fi
 
       # Done in a separate worktree so the release build tree is never touched.
       - name: Publish the appcast to GitHub Pages
@@ -136,10 +189,17 @@ jobs:
           git -C "$PAGES" push origin gh-pages
 
       - name: Summary
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
+          DMG="build/release/ChariotDesktop-${VERSION}.dmg"
           {
-            echo "### Chariot Desktop ${{ steps.version.outputs.version }}"
+            echo "### Chariot Desktop $VERSION"
             echo
-            echo "- DMG: \`$(ls build/release/*.dmg)\`"
-            echo "- sha256: \`$(shasum -a 256 build/release/*.dmg | cut -d' ' -f1)\`"
+            if [ "$HAS_CERT" = "true" ]; then
+              echo "- signing: Developer ID, notarized and stapled"
+            else
+              echo "- signing: **ad-hoc** — first launch needs Privacy & Security approval"
+            fi
+            echo "- sha256: \`$(shasum -a 256 "$DMG" | cut -d' ' -f1)\`"
           } >> "$GITHUB_STEP_SUMMARY"

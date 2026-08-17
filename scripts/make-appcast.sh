@@ -42,24 +42,28 @@ else
   echo "==> No published feed yet; creating the first one"
 fi
 
-SIGNING_ARGS=()
-if [[ -n "${SPARKLE_PRIVATE_KEY_FILE:-}" ]]; then
-  SIGNING_ARGS=(--ed-key-file "$SPARKLE_PRIVATE_KEY_FILE")
-else
-  # generate_keys stores the key under this account in the login keychain.
-  SIGNING_ARGS=(--account "ed25519")
-fi
+ARGS=(
+  --download-url-prefix "$DOWNLOAD_PREFIX"
+  --link "https://github.com/$REPO"
+  --maximum-versions 5
+  -o "$STAGE/appcast.xml"
+)
 
-"$GENERATE" \
-  "${SIGNING_ARGS[@]}" \
-  --download-url-prefix "$DOWNLOAD_PREFIX" \
-  --link "https://github.com/$REPO" \
-  --maximum-versions 5 \
-  -o "$STAGE/appcast.xml" \
-  "$STAGE"
+if [[ -n "${SPARKLE_PRIVATE_KEY:-}" ]]; then
+  # Sparkle's own documented CI pattern: the key arrives on stdin, so it never
+  # lands on the runner's filesystem where a later step could pick it up.
+  printf '%s' "$SPARKLE_PRIVATE_KEY" | "$GENERATE" --ed-key-file - "${ARGS[@]}" "$STAGE"
+elif [[ -n "${SPARKLE_PRIVATE_KEY_FILE:-}" ]]; then
+  "$GENERATE" --ed-key-file "$SPARKLE_PRIVATE_KEY_FILE" "${ARGS[@]}" "$STAGE"
+else
+  # No key supplied: generate_appcast falls back to the login keychain, under
+  # the default "ed25519" account that generate_keys writes to.
+  "$GENERATE" "${ARGS[@]}" "$STAGE"
+fi
 
 echo
 echo "appcast: $STAGE/appcast.xml"
 echo "publish this file at $FEED_URL"
 echo
-grep -E "sparkle:(version|shortVersionString|edSignature)|<enclosure" "$STAGE/appcast.xml" | tail -6
+# `|| true`: a grep miss here must not fail a run that already succeeded.
+grep -E "sparkle:(version|shortVersionString|edSignature)|<enclosure" "$STAGE/appcast.xml" | tail -6 || true

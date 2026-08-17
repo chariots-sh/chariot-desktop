@@ -51,6 +51,11 @@ targets:
             # spell out Contents/MacOS or the helper lands beside Contents.
             destination: wrapper
             subpath: Contents/MacOS
+        # Without CodeSignOnCopy, signing the app fails outright with
+        # "code object is not signed at all / In subcomponent: agent-tailnet".
+        # This also gets the helper signed with whatever identity the app uses,
+        # so it is covered by the hardened runtime and notarization.
+        attributes: [CodeSignOnCopy]
     dependencies:
       - package: ChariotMac
         product: ChariotCore
