@@ -8,7 +8,10 @@ let package = Package(
         .library(name: "ChariotCore", targets: ["ChariotCore"])
     ],
     dependencies: [
-        .package(path: "../AgentLinkKit")
+        .package(path: "../AgentLinkKit"),
+        // GUI-only. ChariotCore and chariotd stay Sparkle-free so the headless
+        // daemon and the test targets keep building without it.
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.6")
     ],
     targets: [
         .target(
@@ -21,7 +24,8 @@ let package = Package(
         ),
         .executableTarget(
             name: "ChariotDesktopApp",
-            dependencies: ["ChariotCore", "AgentLinkKit"]
+            dependencies: ["ChariotCore", "AgentLinkKit",
+                           .product(name: "Sparkle", package: "Sparkle")]
         ),
         .testTarget(
             name: "ChariotCoreTests",

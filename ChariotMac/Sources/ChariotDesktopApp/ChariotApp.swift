@@ -19,7 +19,24 @@ struct ChariotApp: App {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 960, minHeight: 620)
+                .task { model.startUpdater() }
         }
+        .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesButton(updater: model.updater)
+            }
+        }
+    }
+}
+
+/// Observes the updater directly so the menu item enables itself the moment
+/// Sparkle is ready — AppModel does not republish the updater's state.
+struct CheckForUpdatesButton: View {
+    @ObservedObject var updater: UpdaterController
+
+    var body: some View {
+        Button("Check for Updates…") { updater.checkForUpdates() }
+            .disabled(!updater.canCheckForUpdates)
     }
 }
 
@@ -68,6 +85,13 @@ struct PackRow: Identifiable, Equatable {
     let version: String
 }
 
+/// First-run base image install, as the setup screen sees it.
+enum SetupPhase {
+    case idle
+    case running(BaseImageProgress)
+    case failed(String)
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var agents: [AgentViewState] = []
@@ -87,7 +111,16 @@ final class AppModel: ObservableObject {
     @Published var tailnetInfo: TailnetInfo?
     @Published var showCreateSheet = false
 
+    /// Blocks the main UI until the guest base image is on disk.
+    @Published var needsBaseImage = false
+    @Published var setupPhase: SetupPhase = .idle
+
     private(set) var hub: ChariotHub?
+    private(set) var updater: UpdaterController!
+    private let baseImage: BaseImageInstaller
+    private var setupTask: Task<Void, Never>?
+    private var setupGeneration = 0
+    private var updaterStarted = false
 
     var macFingerprint: String { hub?.macPublicIdentity.fingerprint ?? "—" }
 
@@ -100,6 +133,9 @@ final class AppModel: ObservableObject {
     }
 
     init() {
+        baseImage = BaseImageInstaller(imagePath: Self.baseImagePath)
+        needsBaseImage = !baseImage.isReady
+
         do {
             let env = ProcessInfo.processInfo.environment
             let defaultRoot = FileManager.default.homeDirectoryForCurrentUser
@@ -162,6 +198,84 @@ final class AppModel: ObservableObject {
         } catch {
             fatalError = "Failed to start Chariot core: \(error)"
         }
+
+        updater = UpdaterController(
+            runningAgentCount: { [weak self] in
+                self?.agents.filter { $0.vmState == .running }.count ?? 0
+            },
+            stopAllAgents: { [weak self] in await self?.stopAllAgents() },
+            log: { [weak self] message in
+                self?.eventLog.append(message)
+                self?.statusLine = message
+            })
+    }
+
+    /// Called once the first window exists — Sparkle should not schedule checks
+    /// before the app has finished launching.
+    func startUpdater() {
+        guard !updaterStarted else { return }
+        updaterStarted = true
+        updater.start()
+    }
+
+    // MARK: First-run base image
+
+    var baseImageVersion: String { baseImage.expectedVersion }
+
+    var baseImageDownloadSize: String {
+        ByteCountFormatter.string(fromByteCount: baseImage.downloadBytes, countStyle: .file)
+    }
+
+    func installBaseImage() {
+        guard setupTask == nil else { return }
+        setupGeneration &+= 1
+        // A cancelled attempt keeps running until its next suspension point, so
+        // every state write below is gated on still being the current attempt —
+        // otherwise cancel-then-retry lets the abandoned task clobber the new
+        // one's progress and drop setupTask, allowing two concurrent installs.
+        let generation = setupGeneration
+        setupPhase = .running(.downloading(received: 0, total: baseImage.downloadBytes))
+        setupTask = Task { [baseImage] in
+            do {
+                try await baseImage.install { progress in
+                    Task { @MainActor in
+                        guard self.setupGeneration == generation else { return }
+                        self.setupPhase = .running(progress)
+                    }
+                }
+                await MainActor.run {
+                    guard self.setupGeneration == generation else { return }
+                    self.setupTask = nil
+                    self.setupPhase = .idle
+                    self.needsBaseImage = false
+                    self.statusLine = "Guest image installed — create an agent to begin."
+                    self.eventLog.append("Guest base image \(baseImage.expectedVersion) installed.")
+                }
+            } catch {
+                let cancelled = Task.isCancelled
+                await MainActor.run {
+                    guard self.setupGeneration == generation else { return }
+                    self.setupTask = nil
+                    self.setupPhase = cancelled ? .idle : .failed("\(error)")
+                }
+            }
+        }
+    }
+
+    func cancelBaseImageInstall() {
+        setupTask?.cancel()
+        setupTask = nil
+        setupGeneration &+= 1
+        setupPhase = .idle
+    }
+
+    /// Brings the whole fleet down; used before an update replaces the bundle.
+    func stopAllAgents() async {
+        guard let hub else { return }
+        for agent in agents where agent.vmState == .running || agent.vmState == .starting {
+            try? await hub.stopAgent(agent.id)
+        }
+        refresh()
     }
 
     /// The bundled helper lives next to the app executable (signed and covered
@@ -181,11 +295,14 @@ final class AppModel: ObservableObject {
         return candidates.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
-    var baseImagePath: String {
+    /// Static so `init` can build the installer before `self` is available.
+    static var baseImagePath: String {
         ProcessInfo.processInfo.environment["CHARIOT_BASE_IMAGE"]
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/ChariotDesktop/base-image.raw").path
     }
+
+    var baseImagePath: String { Self.baseImagePath }
 
     func refresh() {
         guard let hub else { return }

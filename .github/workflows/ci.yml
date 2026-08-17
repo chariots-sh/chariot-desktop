@@ -44,6 +44,46 @@ jobs:
       - name: Build ChariotMobile.app
         run: scripts/build-ios.sh
 
+  release-bundle:
+    name: Release bundle layout (unsigned)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent-tailnet/go.mod
+          cache-dependency-path: agent-tailnet/go.sum
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate and build the release target
+        run: |
+          xcodegen generate --spec project.yml --project .
+          xcodebuild build -project Chariot.xcodeproj -scheme ChariotDesktop \
+            -configuration Release -destination "generic/platform=macOS" \
+            -derivedDataPath build/dd ARCHS=arm64 \
+            MARKETING_VERSION=0.0.0 CURRENT_PROJECT_VERSION=1 \
+            SPARKLE_PUBLIC_ED_KEY=ci-placeholder \
+            CODE_SIGNING_ALLOWED=NO | tail -5
+      # XcodeGen silently drops build phases it does not recognise, which once
+      # produced release bundles with no agent-tailnet in them. Assert the
+      # payload rather than trusting the spec.
+      - name: Assert the shipped bundle is complete
+        run: |
+          APP="build/dd/Build/Products/Release/Chariot Desktop.app"
+          status=0
+          for f in "Contents/MacOS/Chariot Desktop" \
+                   "Contents/MacOS/agent-tailnet" \
+                   "Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle" \
+                   "Contents/Resources/bridge.py" \
+                   "Contents/Resources/user-data.template"; do
+            if [ -e "$APP/$f" ]; then echo "ok   $f"; else echo "MISSING $f"; status=1; fi
+          done
+          test "$(plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist")" = dev.chariot.desktop
+          test "$(lipo -archs "$APP/Contents/MacOS/Chariot Desktop")" = arm64
+          exit $status
+
   agent-tailnet:
     name: agent-tailnet (Go)
     runs-on: macos-15

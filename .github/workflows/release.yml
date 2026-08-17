@@ -1,0 +1,145 @@
+name: Release
+
+# Tag a release to publish it:
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# Produces a Developer ID signed, notarized, stapled DMG, attaches it to a
+# GitHub release, and publishes the Sparkle appcast to GitHub Pages so existing
+# installs see the update. Required secrets are listed in docs/distribution.md.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without the leading v)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, notarize, publish
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # release-app.sh derives the build number from rev-list
+
+      - name: Select latest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent-tailnet/go.mod
+          cache-dependency-path: agent-tailnet/go.sum
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A dedicated keychain keeps the signing identity off the default one and
+      # is discarded with the runner.
+      - name: Import Developer ID certificate
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Store notarytool credentials
+        env:
+          ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          PRIVATE_KEY: ${{ secrets.NOTARY_PRIVATE_KEY }}
+        run: |
+          echo "$PRIVATE_KEY" > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool store-credentials chariot-ci \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$KEY_ID" \
+            --issuer "$ISSUER_ID"
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      - name: Build, sign, notarize, staple
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTARY_PROFILE: chariot-ci
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+        run: scripts/release-app.sh
+
+      - name: Sign the update into the appcast
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ github.ref_name }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          echo "$SPARKLE_PRIVATE_KEY" > "$RUNNER_TEMP/sparkle.key"
+          SPARKLE_PRIVATE_KEY_FILE="$RUNNER_TEMP/sparkle.key" \
+            scripts/make-appcast.sh "build/release/ChariotDesktop-${VERSION}.dmg"
+          rm -f "$RUNNER_TEMP/sparkle.key"
+
+      # The DMG must exist at its final URL before the appcast that points at it
+      # goes live, or an update check in between would 404.
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "${GITHUB_REF_NAME:-v$VERSION}" \
+            "build/release/ChariotDesktop-${VERSION}.dmg" \
+            --title "Chariot Desktop $VERSION" \
+            --generate-notes \
+            || gh release upload "${GITHUB_REF_NAME:-v$VERSION}" \
+                 "build/release/ChariotDesktop-${VERSION}.dmg" --clobber
+
+      # Done in a separate worktree so the release build tree is never touched.
+      - name: Publish the appcast to GitHub Pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          PAGES="$RUNNER_TEMP/pages"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git worktree add "$PAGES" origin/gh-pages
+            git -C "$PAGES" checkout -B gh-pages
+          else
+            git worktree add --detach "$PAGES"
+            git -C "$PAGES" checkout --orphan gh-pages
+            git -C "$PAGES" rm -rf . >/dev/null 2>&1 || true
+          fi
+          cp build/appcast/appcast.xml "$PAGES/appcast.xml"
+          git -C "$PAGES" add appcast.xml
+          git -C "$PAGES" commit -m "appcast: Chariot Desktop ${{ steps.version.outputs.version }}"
+          git -C "$PAGES" push origin gh-pages
+
+      - name: Summary
+        run: |
+          {
+            echo "### Chariot Desktop ${{ steps.version.outputs.version }}"
+            echo
+            echo "- DMG: \`$(ls build/release/*.dmg)\`"
+            echo "- sha256: \`$(shasum -a 256 build/release/*.dmg | cut -d' ' -f1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
