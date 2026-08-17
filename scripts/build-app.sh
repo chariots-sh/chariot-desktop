@@ -33,6 +33,10 @@ fi
 cp -R "$SPARKLE" "$APP/Contents/Frameworks/"
 install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/Chariot Desktop"
 cp "$ROOT/guest/bridge.py" "$ROOT/guest/user-data.template" "$APP/Contents/Resources/"
+# Sample packs, seeded into the data directory on first run (PackLoader
+# .seedBundledPacks). Without them New Agent has nothing to offer.
+rm -rf "$APP/Contents/Resources/packs"
+cp -R "$ROOT/packs" "$APP/Contents/Resources/packs"
 if [[ ! -f "$ROOT/build/AppIcon.icns" ]]; then
   swift "$ROOT/scripts/gen-icon.swift" "$ROOT/build/icon-1024.png"
   mkdir -p "$ROOT/build/AppIcon.iconset"
