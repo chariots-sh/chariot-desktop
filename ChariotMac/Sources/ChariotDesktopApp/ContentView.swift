@@ -18,6 +18,10 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Theme.bg)
             .preferredColorScheme(.dark)
+        } else if model.needsBaseImage {
+            // Nothing in the fleet UI works without the guest image, so setup
+            // takes the whole window rather than sitting behind an empty list.
+            FirstRunView()
         } else {
             NavigationSplitView {
                 VStack(alignment: .leading, spacing: 0) {

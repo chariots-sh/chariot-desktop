@@ -9,11 +9,18 @@ packages:
     path: AgentLinkKit
   ChariotMac:
     path: ChariotMac
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.9.6
 settings:
   base:
     DEVELOPMENT_TEAM: 3UGCLFLDJ6
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "5.9"
+    # Shipped versions come from the release script / CI (git tag), so a local
+    # `xcodegen && xcodebuild` still produces a coherent bundle.
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
 targets:
   ChariotDesktop:
     type: application
@@ -33,25 +40,49 @@ targets:
         buildPhase: resources
       - path: build/AppIcon.icns
         buildPhase: resources
+      # The embedded Tailscale node ships beside the app executable, where
+      # AppModel.helperURL() looks for it. This must be a source-level
+      # copyFiles phase: a target-level `copyFiles:` key is silently ignored
+      # by XcodeGen, which produced release bundles with no helper at all.
+      - path: build/agent-tailnet
+        buildPhase:
+          copyFiles:
+            # `wrapper` is the .app root, not Contents — the subpath has to
+            # spell out Contents/MacOS or the helper lands beside Contents.
+            destination: wrapper
+            subpath: Contents/MacOS
+        # Without CodeSignOnCopy, signing the app fails outright with
+        # "code object is not signed at all / In subcomponent: agent-tailnet".
+        # This also gets the helper signed with whatever identity the app uses,
+        # so it is covered by the hardened runtime and notarization.
+        attributes: [CodeSignOnCopy]
     dependencies:
       - package: ChariotMac
         product: ChariotCore
       - package: AgentLinkKit
         product: AgentLinkKit
-    copyFiles:
-      # The embedded Tailscale node ships beside the app executable; Xcode
-      # code-signs embedded binaries with the app, so it is covered by the
-      # hardened runtime and notarization.
-      - destination: executables
-        files:
-          - path: build/agent-tailnet
-            codeSign: true
+      # Sparkle.framework is embedded and signed by Xcode; the updater refuses
+      # any feed item whose Developer ID team does not match the running app.
+      - package: Sparkle
+        product: Sparkle
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.protocols.chariot.mac
+        PRODUCT_BUNDLE_IDENTIFIER: dev.chariot.desktop
+        # Matches the bundle build-app.sh produces, and the name the release
+        # script and DMG expect.
+        PRODUCT_NAME: Chariot Desktop
         CODE_SIGN_ENTITLEMENTS: ChariotMac/ChariotDesktop.entitlements
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_APP_SANDBOX: NO
+        # Virtualization.framework with an ARM64 Linux guest is Apple silicon
+        # only; there is no meaningful x86_64 slice to ship.
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
+        # Sparkle wiring. Both are injected by scripts/release-app.sh from the
+        # environment; the release script refuses to build with the key empty,
+        # so an unsigned feed can never ship.
+        SPARKLE_FEED_URL: https://chariots-sh.github.io/chariot-desktop/appcast.xml
+        SPARKLE_PUBLIC_ED_KEY: ""
     info:
       path: build/xcodegen/ChariotDesktop-Info.plist
       properties:
@@ -59,6 +90,18 @@ targets:
         CFBundleIconFile: AppIcon
         NSPrincipalClass: NSApplication
         NSHighResolutionCapable: true
+        LSMinimumSystemVersion: "14.0"
+        # Sparkle orders releases by these two; without them every build
+        # reports 1.0/1 and no update ever looks newer.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSApplicationCategoryType: public.app-category.developer-tools
+        SUFeedURL: $(SPARKLE_FEED_URL)
+        SUPublicEDKey: $(SPARKLE_PUBLIC_ED_KEY)
+        # Chariot decides when to check (see UpdaterController): a check that
+        # lands mid-session must not offer to relaunch while VMs are running.
+        SUEnableAutomaticChecks: true
+        SUScheduledCheckInterval: 86400
   ChariotMobilePhone:
     type: application
     platform: iOS

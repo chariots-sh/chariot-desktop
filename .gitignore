@@ -2,6 +2,14 @@
 # Never commit.
 chariot-data/
 
+# Signing material. The Sparkle key is what every installed copy trusts to
+# authenticate updates, so committing it would let anyone who can read the repo
+# ship a signed update to every user. `generate_keys -x` writes it here by
+# default, which is exactly where `git add -A` would otherwise pick it up.
+sparkle-private-key.txt
+*.p12
+*.p8
+
 # Guest base images (multi-GB) and local test instances.
 guest-images/
 

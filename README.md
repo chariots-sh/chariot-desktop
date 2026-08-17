@@ -43,6 +43,7 @@ Current state:
 | Sample packs | `packs/` | `guardian.pack` (health companion) and `scribe.pack` (note-taker): pack format v1 examples with personas, seeds, and tools. |
 | Scripts | `scripts/` | Build/run/E2E helpers. |
 | Docs | `docs/tailscale.md` | Tailnet onboarding, HTTPS, Grants policy examples, key expiry, troubleshooting. |
+| Docs | `docs/distribution.md` | Developer ID signing, notarization, DMG packaging, Sparkle auto-update, guest-image mirroring. |
 
 ## Requirements
 
@@ -51,12 +52,16 @@ Current state:
 - ~10 GB disk for the guest image and instance disks
 - A [Tailscale](https://tailscale.com) account (free for personal use); the
   official Tailscale app on the iPhone
-- The Debian ARM64 cloud image (raw): downloaded automatically to
-  `guest-images/debian-12-genericcloud-arm64.raw` by the E2E script, or:
+- The Debian ARM64 cloud image. Released builds download it on first run; for a
+  checkout, the E2E script fetches it to
+  `guest-images/debian-12-genericcloud-arm64.raw`, or:
   ```bash
-  curl -L -o guest-images/debian-12-genericcloud-arm64.raw \
-    https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.raw
+  curl -L -o guest-images/debian-12-genericcloud-arm64.tar.xz \
+    https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-arm64.tar.xz
+  tar -xJf guest-images/debian-12-genericcloud-arm64.tar.xz -C guest-images
   ```
+  (198 MB compressed rather than 3 GB for the raw file; it expands to the same
+  sparse image.)
 
 ## Quick start (GUI)
 
@@ -64,6 +69,17 @@ Current state:
 scripts/build-app.sh        # builds build/Chariot Desktop.app (incl. agent-tailnet, ad-hoc signed)
 scripts/run-desktop.sh      # launches it with defaults for this checkout
 ```
+
+This is the development build: ad-hoc signed, with the updater inert. For a
+binary that can be published on the web, `scripts/release-app.sh` produces a DMG
+with Sparkle auto-update wired up — Developer ID signed and notarized when a
+certificate is available, ad-hoc otherwise (which costs users a one-time
+approval in System Settings on first launch). See
+[docs/distribution.md](docs/distribution.md).
+
+On first launch without a base image, the app shows a setup screen and downloads
+the guest image itself; `CHARIOT_BASE_IMAGE` skips that when you already have
+one (which `scripts/run-desktop.sh` sets for this checkout).
 
 In the app: **Tailscale → Sign in to Tailscale** authenticates the embedded
 node (one browser login; the identity persists). The sidebar lists your
@@ -249,7 +265,14 @@ Official Tailscale iOS app provides the VPN         ▼
   background helper/SMAppService (the helper runs while the app or daemon
   runs; if background receive is needed later, the helper and supervisor move
   into the existing signed background-service architecture with the *same*
-  Tailscale identity), artifact import/export UI, notarized distribution.
+  Tailscale identity), artifact import/export UI.
+- **Distribution** ships **ad-hoc signed**: a Developer ID Application
+  certificate can only be created by the team's Account Holder, so builds are
+  not notarized and users must allow the first launch in System Settings →
+  Privacy & Security. Auto-update is unaffected, and moving to Developer ID
+  later needs only two repository secrets — Sparkle permits the signing identity
+  to change while the EdDSA key stays the same. See
+  [docs/distribution.md](docs/distribution.md).
 
 ## What was verified end to end
 
