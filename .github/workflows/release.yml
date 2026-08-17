@@ -107,7 +107,12 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           NOTARY_PROFILE: chariot-ci
-          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          # The public key is not sensitive — it ships inside the app — so a
+          # repository variable is the natural home for it. Accept a secret of
+          # the same name too: an unset `vars.` reference silently becomes an
+          # empty string, and the resulting failure ("set SPARKLE_PUBLIC_ED_KEY")
+          # does not point at the real cause.
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY || secrets.SPARKLE_PUBLIC_ED_KEY }}
         run: |
           if [ "$HAS_CERT" != "true" ]; then export ADHOC=1; fi
           scripts/release-app.sh

@@ -143,9 +143,15 @@ workflow into Developer ID mode with no other change.
 | `NOTARY_KEY_ID` | secret | API key id |
 | `NOTARY_PRIVATE_KEY` | secret | contents of the `.p8` |
 | `SPARKLE_PRIVATE_KEY` | secret | exported EdDSA private key |
-| `SPARKLE_PUBLIC_ED_KEY` | variable | EdDSA public key |
+| `SPARKLE_PUBLIC_ED_KEY` | variable *or* secret | EdDSA public key |
 
 `DEVELOPER_ID_CERT_P12` is what the workflow branches on: unset means ad-hoc.
+
+The public key is not sensitive — it ships inside the app — so a *variable* is
+its natural home, and keeping it visible makes it easy to confirm a build was
+signed against the key you think it was. The workflow falls back to a *secret*
+of the same name, because an unset `vars.` reference silently becomes an empty
+string and the resulting failure does not point at the real cause.
 
 ## Cutting a release
 
