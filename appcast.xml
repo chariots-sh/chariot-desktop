@@ -3,6 +3,16 @@
     <channel>
         <title>Chariot Desktop</title>
         <item>
+            <title>0.1.3</title>
+            <pubDate>Mon, 17 Aug 2026 23:01:37 +0000</pubDate>
+            <link>https://github.com/chariots-sh/chariot-desktop</link>
+            <sparkle:version>33</sparkle:version>
+            <sparkle:shortVersionString>0.1.3</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/chariots-sh/chariot-desktop/releases/download/v0.1.3/ChariotDesktop-0.1.3.dmg" length="20119542" type="application/octet-stream" sparkle:edSignature="vGzSefvpmUk1zq/SFyQMQf6IwgsUdQGE+94tC+H+JI6QFVIokZy9ri+7vythJb4SGrymFFXDaLFIaJG182utBA=="/>
+        </item>
+        <item>
             <title>0.1.2</title>
             <pubDate>Mon, 17 Aug 2026 22:29:35 +0000</pubDate>
             <link>https://github.com/chariots-sh/chariot-desktop</link>
