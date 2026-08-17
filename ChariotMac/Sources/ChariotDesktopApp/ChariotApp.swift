@@ -153,6 +153,19 @@ final class AppModel: ObservableObject {
             }
 
             let hub = try ChariotHub(paths: ChariotPaths(dataDirectory: dataDir, guestResources: guestResources))
+
+            // A downloaded app starts with an empty packs directory, so New
+            // Agent would offer nothing to create. Copy the samples shipped in
+            // the bundle; existing folders are left alone, since packs are
+            // user-editable content.
+            if let bundledPacks = Bundle.main.resourceURL?.appendingPathComponent("packs") {
+                let seeded = PackLoader.seedBundledPacks(from: bundledPacks,
+                                                         into: hub.paths.packsDirectory)
+                if !seeded.isEmpty {
+                    eventLog.append("Installed sample packs: \(seeded.joined(separator: ", "))")
+                }
+            }
+
             hub.autoApprovePairing = false
             hub.defaultBaseImagePath = baseImagePath
             self.hub = hub
