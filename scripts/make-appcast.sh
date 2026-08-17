@@ -24,9 +24,25 @@ TAG="${TAG:-v$VERSION}"
 FEED_URL="${SPARKLE_FEED_URL:-https://chariots-sh.github.io/chariot-desktop/appcast.xml}"
 DOWNLOAD_PREFIX="https://github.com/$REPO/releases/download/$TAG/"
 
-GENERATE="$(find "$ROOT/ChariotMac/.build/artifacts" -type f -name generate_appcast | head -1)"
+# generate_appcast ships inside Sparkle's SPM binary artifact. `2>/dev/null`
+# and `|| true` matter: the directory does not exist until the package has been
+# resolved, and under `set -o pipefail` a failing find aborts the script before
+# the diagnostics below can run.
+find_tool() {
+  find "$ROOT/ChariotMac/.build/artifacts" -type f -name "$1" 2>/dev/null | head -1 || true
+}
+
+GENERATE="$(find_tool generate_appcast)"
 if [[ -z "$GENERATE" ]]; then
-  echo "generate_appcast not found — run 'swift package resolve' in ChariotMac" >&2
+  # A release built with xcodebuild resolves packages into DerivedData, never
+  # into ChariotMac/.build, so on a fresh runner this artifact is simply absent.
+  # Fetch it rather than making the caller know that.
+  echo "==> Fetching Sparkle's release tools"
+  swift package resolve --package-path "$ROOT/ChariotMac" >/dev/null
+  GENERATE="$(find_tool generate_appcast)"
+fi
+if [[ -z "$GENERATE" ]]; then
+  echo "generate_appcast not found even after resolving Sparkle in ChariotMac" >&2
   exit 1
 fi
 
