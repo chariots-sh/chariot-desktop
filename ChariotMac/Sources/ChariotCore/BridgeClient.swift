@@ -38,6 +38,7 @@ final class BridgeClient: @unchecked Sendable {
         self.connection = connection
         self.fd = connection.fileDescriptor
         self.handler = handler
+        disableSIGPIPE(on: fd)
         let thread = Thread { [weak self] in self?.readLoop() }
         thread.name = "chariot.bridge.reader"
         readerThread = thread

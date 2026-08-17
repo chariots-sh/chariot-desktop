@@ -79,6 +79,7 @@ final class DeveloperAccess: @unchecked Sendable {
         while isActive {
             let client = accept(listenerFD, nil, nil)
             guard client >= 0 else { break }
+            disableSIGPIPE(on: client)
             Task { [weak self] in
                 await self?.tunnel(clientFD: client)
             }
@@ -89,6 +90,7 @@ final class DeveloperAccess: @unchecked Sendable {
         do {
             let connection = try await controller.connectSocket(port: 1023, timeout: 10)
             let guestFD = connection.fileDescriptor
+            disableSIGPIPE(on: guestFD)
             let copyAll: @Sendable (Int32, Int32) -> Void = { src, dst in
                 var buf = [UInt8](repeating: 0, count: 65536)
                 outer: while true {

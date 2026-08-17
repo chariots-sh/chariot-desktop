@@ -15,6 +15,7 @@ final class WebSocketConnection: @unchecked Sendable {
 
     init(fd: Int32) {
         self.fd = fd
+        disableSIGPIPE(on: fd)
     }
 
     static func acceptKey(for clientKey: String) -> String {

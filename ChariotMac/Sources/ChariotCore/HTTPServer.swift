@@ -89,6 +89,7 @@ final class HTTPServer: @unchecked Sendable {
         while running {
             let client = accept(listenerFD, nil, nil)
             guard client >= 0 else { break }
+            disableSIGPIPE(on: client)
             let thread = Thread { [weak self] in self?.handle(client: client) }
             thread.name = "chariot.http.connection"
             thread.start()

@@ -7,6 +7,10 @@ import ChariotCore
 //   chariotd --data-dir <dir> --base-image <raw> --guest-resources <dir>
 //            [--port 8787] [--no-vm] [--no-tailscale] [--tailnet-helper <path>]
 
+// Before any socket exists: a peer vanishing mid-write must fail the write,
+// not kill the daemon.
+ignoreSIGPIPE()
+
 var dataDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/ChariotDesktop").path
 var baseImage = ""

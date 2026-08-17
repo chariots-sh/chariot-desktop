@@ -8,6 +8,12 @@ struct ChariotApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @StateObject private var model = AppModel()
 
+    init() {
+        // Before any socket exists: a peer vanishing mid-write must fail the
+        // write, not kill the app.
+        ignoreSIGPIPE()
+    }
+
     var body: some Scene {
         WindowGroup("Chariot Desktop") {
             ContentView()
