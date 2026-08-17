@@ -182,4 +182,74 @@ final class PackLoaderTests: XCTestCase {
         let packs = PackLoader.availablePacks(in: packsDir)
         XCTAssertEqual(packs.map(\.directoryName), ["a-guardian.pack", "b-scribe.pack"])
     }
+
+    // MARK: Seeding bundled packs
+    //
+    // A downloaded app starts with an empty packs directory; without seeding,
+    // New Agent has nothing to offer and the app is unusable out of the box.
+
+    /// The bundled packs stand in for Contents/Resources/packs.
+    private func makeBundledPacks() throws -> URL {
+        let bundled = packsDir.appendingPathComponent("bundled", isDirectory: true)
+        try FileManager.default.createDirectory(at: bundled, withIntermediateDirectories: true)
+        for name in ["guardian.pack", "scribe.pack"] {
+            let dir = bundled.appendingPathComponent(name)
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try #"{ "id": "\#(name)", "name": "\#(name)", "version": "1", "workspace": [] }"#
+                .write(to: dir.appendingPathComponent("pack.json"), atomically: true, encoding: .utf8)
+            try "bundled".write(to: dir.appendingPathComponent("AGENTS.md"),
+                                atomically: true, encoding: .utf8)
+        }
+        return bundled
+    }
+
+    func testSeedingPopulatesAnEmptyPacksDirectory() throws {
+        let bundled = try makeBundledPacks()
+        let destination = packsDir.appendingPathComponent("data-packs")
+
+        let seeded = PackLoader.seedBundledPacks(from: bundled, into: destination)
+
+        XCTAssertEqual(seeded.sorted(), ["guardian.pack", "scribe.pack"])
+        XCTAssertEqual(PackLoader.availablePacks(in: destination).map(\.directoryName),
+                       ["guardian.pack", "scribe.pack"])
+    }
+
+    /// Packs are user-editable — an edit lands on the agent's next turn — so a
+    /// pack already on disk must never be replaced by the bundled copy.
+    func testSeedingNeverOverwritesAnEditedPack() throws {
+        let bundled = try makeBundledPacks()
+        let destination = packsDir.appendingPathComponent("data-packs")
+        PackLoader.seedBundledPacks(from: bundled, into: destination)
+
+        let edited = destination.appendingPathComponent("guardian.pack/AGENTS.md")
+        try "user's own persona".write(to: edited, atomically: true, encoding: .utf8)
+
+        let seeded = PackLoader.seedBundledPacks(from: bundled, into: destination)
+
+        XCTAssertTrue(seeded.isEmpty, "a second launch must not re-seed")
+        XCTAssertEqual(try String(contentsOf: edited, encoding: .utf8), "user's own persona")
+    }
+
+    /// Only .pack folders are copied; anything else in Resources stays put.
+    func testSeedingIgnoresNonPackEntries() throws {
+        let bundled = try makeBundledPacks()
+        try "not a pack".write(to: bundled.appendingPathComponent("README.md"),
+                               atomically: true, encoding: .utf8)
+        let destination = packsDir.appendingPathComponent("data-packs")
+
+        let seeded = PackLoader.seedBundledPacks(from: bundled, into: destination)
+
+        XCTAssertEqual(seeded.sorted(), ["guardian.pack", "scribe.pack"])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("README.md").path))
+    }
+
+    /// A missing bundle directory (dev builds run from the build tree) is not
+    /// an error — the app still starts, just without samples.
+    func testSeedingFromMissingDirectoryIsHarmless() {
+        let destination = packsDir.appendingPathComponent("data-packs")
+        let seeded = PackLoader.seedBundledPacks(
+            from: packsDir.appendingPathComponent("does-not-exist"), into: destination)
+        XCTAssertTrue(seeded.isEmpty)
+    }
 }

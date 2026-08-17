@@ -38,6 +38,16 @@ targets:
         buildPhase: resources
       - path: guest/user-data.template
         buildPhase: resources
+      # Sample packs, copied into the data directory on first run. Without
+      # these a downloaded app has nothing to create an agent from.
+      #
+      # `type: folder` makes this a folder reference, copied whole. Without it
+      # XcodeGen adds each file individually and the build fails on collisions
+      # — every pack has its own AGENTS.md, SOUL.md and pack.json, which would
+      # all flatten onto the same path in Resources.
+      - path: packs
+        type: folder
+        buildPhase: resources
       - path: build/AppIcon.icns
         buildPhase: resources
       # The embedded Tailscale node ships beside the app executable, where

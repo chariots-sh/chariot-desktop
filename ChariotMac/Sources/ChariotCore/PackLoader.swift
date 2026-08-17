@@ -203,6 +203,42 @@ public enum PackLoader {
         return pack
     }
 
+    /// Copies sample packs shipped inside the app bundle into the packs
+    /// directory, and returns the names it added.
+    ///
+    /// A downloaded app has an empty packs directory, so without this there is
+    /// nothing to create an agent from and the New Agent sheet is empty — the
+    /// same shape of problem as shipping without the guest base image.
+    ///
+    /// Only packs whose folder is absent are copied. Packs are user-editable
+    /// content — editing one lands on the agent's next turn — so an existing
+    /// folder is never overwritten, and deleting a bundled pack makes it come
+    /// back on next launch rather than staying deleted. That trade favours the
+    /// common case (a fresh install needs packs) over the rare one (someone
+    /// wants the samples gone).
+    @discardableResult
+    public static func seedBundledPacks(from bundledDirectory: URL,
+                                        into packsDirectory: URL) -> [String] {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(
+            at: bundledDirectory, includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]) else { return [] }
+
+        var seeded: [String] = []
+        for source in entries where source.pathExtension == "pack" {
+            let destination = packsDirectory.appendingPathComponent(source.lastPathComponent)
+            guard !fm.fileExists(atPath: destination.path) else { continue }
+            do {
+                try fm.createDirectory(at: packsDirectory, withIntermediateDirectories: true)
+                try fm.copyItem(at: source, to: destination)
+                seeded.append(source.lastPathComponent)
+            } catch {
+                ChariotLog.log("could not seed pack \(source.lastPathComponent): \(error)")
+            }
+        }
+        return seeded
+    }
+
     /// Every valid pack in the packs directory, sorted by folder name.
     /// Invalid folders are skipped (and logged) so one broken pack never
     /// hides the rest.
