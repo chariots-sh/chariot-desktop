@@ -119,9 +119,13 @@ enum SeedBuilder {
                   && npm install -g openclaw@2026.6.11 || true
             """
         case .hermes:
+            // python3-venv first: Debian ships python3 without ensurepip, so
+            // a bare `python3 -m venv` creates a pip-less husk.
             return """
               - |
-                python3 -m venv /opt/hermes \\
+                apt-get update \\
+                  && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv \\
+                  && python3 -m venv /opt/hermes \\
                   && /opt/hermes/bin/pip install --no-cache-dir hermes-agent==0.18.0 || true
             """
         case .muse:

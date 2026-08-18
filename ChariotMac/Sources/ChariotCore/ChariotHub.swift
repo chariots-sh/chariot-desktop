@@ -1933,7 +1933,10 @@ public final class ChariotHub: @unchecked Sendable {
         } catch {
             return .error(503, "\(error)")
         }
-        if semaphore.wait(timeout: .now() + 180) == .timedOut {
+        // 10 minutes, not 3: a local 30B model at ~12 tok/s legitimately
+        // spends several minutes on one tool-loop turn (observed in the M6
+        // matrix); phone chat streams and has no such cap.
+        if semaphore.wait(timeout: .now() + 600) == .timedOut {
             return .error(504, "agent timed out")
         }
         return .json(["output": collector.text, "exit_code": collector.exitCode])

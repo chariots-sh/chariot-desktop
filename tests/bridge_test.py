@@ -370,12 +370,15 @@ class AdapterParsingTests(BridgeTestCase):
         self.assertEqual(bridge.OpenclawHarness._extract_reply(nested), "only")
         self.assertEqual(bridge.OpenclawHarness._extract_reply({}), "")
 
-    def test_zeroclaw_transcript_drops_prompts_and_ansi(self):
-        raw = "\x1b[32m> \x1b[0m\nhello there\n> \n  \nfinal line\n"
+    def test_zeroclaw_transcript_strips_banner_and_prompt_markers(self):
+        raw = ("🦀 ZeroClaw Interactive Mode\nType /help for commands.\n\n"
+               "\x1b[32m> \x1b[0m\n> hello there\n> \n  \nfinal line\n")
+        # "> "-prefixed lines are the REPL's responses — the prefix goes, the
+        # text stays (dropping those lines ate the actual replies).
         self.assertEqual(bridge.ZeroclawHarness._clean_stdout(raw),
                          "hello there\nfinal line")
 
-    def test_codex_config_wire_follows_the_power_source(self):
+    def test_codex_config_always_uses_the_responses_wire(self):
         home = os.path.join(self.tmp.name, "agent-home")
         os.makedirs(home)
         real_home, real_chown = bridge.agent_home, bridge.chown_to_agent
@@ -390,10 +393,10 @@ class AdapterParsingTests(BridgeTestCase):
             local_toml = open(os.path.join(home, ".codex", "config.toml")).read()
         finally:
             bridge.agent_home, bridge.chown_to_agent = real_home, real_chown
-        # The chariot proxy speaks the Responses wire; local servers (Ollama)
-        # only speak chat completions.
+        # Codex 0.147.0 removed `wire_api = "chat"`; both upstreams (the
+        # chariot proxy and Ollama's /v1/responses) speak Responses.
         self.assertIn('wire_api = "responses"', chariot_toml)
-        self.assertIn('wire_api = "chat"', local_toml)
+        self.assertIn('wire_api = "responses"', local_toml)
         self.assertIn('env_key = "CHARIOT_API_KEY"', chariot_toml)
         self.assertNotIn("chariot-broker", chariot_toml)  # no literal keys on disk
 

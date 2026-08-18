@@ -21,6 +21,7 @@ attaches the real credential. The guest never holds a Chariot token.
 """
 
 import base64
+import glob
 import json
 import os
 import pwd
@@ -446,12 +447,12 @@ class CodexHarness(Harness):
         """API-powered codex: ~/.codex/config.toml names the loopback broker
         as a custom provider (port of images/codex/render-config.mjs). The key
         is env-indirected — the dummy broker key, never a real credential.
-        The chariot proxy speaks the Responses wire; typical local servers
-        (Ollama) only speak chat completions, so the wire follows the power
-        source."""
+        Always the Responses wire: codex 0.147.0 removed `wire_api = "chat"`,
+        and both upstreams speak Responses (the chariot proxy's passthrough,
+        and Ollama's /v1/responses — verified in the M6 matrix)."""
         if power_source(cfg) == "chatgpt":
             return  # ChatGPT flow: codex manages ~/.codex itself after login.
-        wire = "responses" if power_source(cfg) == "chariot" else "chat"
+        wire = "responses"
         model = cfg.get("model", "")
         config_dir = os.path.join(agent_home(), ".codex")
         os.makedirs(config_dir, exist_ok=True)
@@ -627,6 +628,14 @@ class ZeroclawHarness(Harness):
         config_dir = os.path.join(agent_home(), ".zeroclaw")
         os.makedirs(config_dir, exist_ok=True)
         chown_to_agent(config_dir)
+        # The backend's shell allowlist (provisioning._SHELL_ALLOWED_COMMANDS):
+        # without allowed_commands the daemon's default policy blocks even
+        # `bash`, which silently kills the reply.sh contract.
+        commands = ", ".join(f'"{c}"' for c in [
+            "sh", "bash", "python3", "curl", "wget", "cat", "echo", "printf",
+            "ls", "head", "tail", "wc", "grep", "sed", "awk", "cut", "tr",
+            "sort", "uniq", "base64", "date", "env", "test", "true", "false",
+        ])
         path = os.path.join(config_dir, "config.toml")
         with open(path, "w") as f:
             f.write(f"""schema_version = 2
@@ -641,6 +650,7 @@ model = {json.dumps(cfg.get("model", ""))}
 [autonomy]
 level = "full"
 max_actions_per_hour = 1000
+allowed_commands = [{commands}]
 
 [agent]
 max_tool_iterations = 50
@@ -668,8 +678,16 @@ provider = "duckduckgo"
         session_file = os.path.join(sessions_dir, safe_conversation_name(conversation_id) + ".json")
         flattened = prompt.replace("\n", "\\n")
         code, stdout, stderr = self.run_collected(
-            [self.BIN, "agent", "--session-state-file", session_file],
-            extra_env={"ZEROCLAW_WORKSPACE": WORKSPACE, "CHARIOT_OUTBOX": outbox},
+            # --config-dir is explicit because zeroclaw's own config-root
+            # resolution is environment-sensitive (observed resolving to
+            # "/.zeroclaw" under the bridge's direct spawn even with HOME and
+            # ZEROCLAW_DATA_DIR set); the flag is deterministic.
+            [self.BIN, "agent",
+             "--config-dir", os.path.join(agent_home(), ".zeroclaw"),
+             "--session-state-file", session_file],
+            extra_env={"ZEROCLAW_WORKSPACE": WORKSPACE,
+                       "ZEROCLAW_DATA_DIR": agent_home(),
+                       "CHARIOT_OUTBOX": outbox},
             stdin_text=f"{flattened}\n/exit\n",
             register_proc=register_proc)
         cleaned = self._clean_stdout(stdout)
@@ -682,10 +700,19 @@ provider = "duckduckgo"
 
     @staticmethod
     def _clean_stdout(stdout):
-        """The REPL transcript minus prompts, ANSI color, and the banner."""
+        """The REPL transcript minus ANSI color, the banner, and prompt
+        markers. Response lines arrive prefixed with the "> " prompt, so the
+        prefix is stripped rather than the line dropped (dropping them ate
+        the actual replies)."""
         text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stdout or "")
-        lines = [ln for ln in text.splitlines()
-                 if ln.strip() and not ln.strip().startswith(">")]
+        lines = []
+        for line in text.splitlines():
+            line = line.strip()
+            while line.startswith(">"):
+                line = line[1:].lstrip()
+            if not line or line.startswith("🦀") or line == "Type /help for commands.":
+                continue
+            lines.append(line)
         return "\n".join(lines).strip()
 
 
@@ -693,12 +720,41 @@ provider = "duckduckgo"
 
 class OpenclawHarness(Harness):
     """OpenClaw via npm (Node 24 from NodeSource), pinned to the backend's
-    verified version. Turn shape ports images/openclaw/turn.mjs."""
+    verified version. Turn shape ports images/openclaw/turn.mjs; like the
+    backend image's entrypoint (`exec openclaw gateway`), the bridge keeps a
+    long-lived `openclaw gateway` daemon running — per-turn auto-spawned
+    gateways proved flaky. The reply contract is stdout-first here (the
+    backend's turn.mjs posts extracted payload text); reply.sh still works
+    when the model uses it, via the shared outbox pump."""
 
     name = "openclaw"
     BIN = "/usr/local/bin/openclaw"
     VERSION_PIN = "2026.6.11"
     NODESOURCE = "https://deb.nodesource.com/setup_24.x"
+
+    def __init__(self):
+        super().__init__()
+        self._gateway = None
+
+    def _ensure_gateway(self, outbox):
+        with state_lock:
+            if self._gateway is not None and self._gateway.poll() is None:
+                return
+        proc = run_as_agent(["openclaw", "gateway"],
+                            extra_env={"CHARIOT_OUTBOX": outbox},
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with state_lock:
+            self._gateway = proc
+        time.sleep(2)  # accept the websocket before the first turn
+
+    def _stop_gateway(self):
+        with state_lock:
+            proc, self._gateway = self._gateway, None
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except OSError:
+                pass
 
     def installed(self):
         return shutil.which("openclaw") is not None
@@ -736,16 +792,21 @@ class OpenclawHarness(Harness):
         return self._version_from(["openclaw", "--version"])
 
     def render_config(self, cfg):
-        """~/.openclaw/openclaw.json (port of images/openclaw/render-config.mjs,
-        gateway section dropped — the bridge delivers turns directly)."""
+        """~/.openclaw/openclaw.json — a full port of
+        images/openclaw/render-config.mjs, gateway section included: the
+        `openclaw agent` CLI opens a websocket to its own loopback gateway
+        and refuses to run without configured credentials (the dummy broker
+        key doubles as the gateway token, exactly as the backend image uses
+        the agent token)."""
         base_url = cfg.get("base_url", BROKER_BASE_URL)
         model = cfg.get("model", "")
+        token = cfg.get("api_key", "chariot-broker")
         config = {
             "models": {
                 "providers": {
                     "chariot": {
                         "baseUrl": base_url,
-                        "apiKey": cfg.get("api_key", "chariot-broker"),
+                        "apiKey": token,
                         "api": "openai-completions",
                         "request": {"allowPrivateNetwork": True},
                         "models": [{
@@ -760,7 +821,15 @@ class OpenclawHarness(Harness):
                     }
                 }
             },
-            "agents": {"defaults": {"model": f"chariot/{model}"}},
+            # The shared /workspace, not OpenClaw's ~/.openclaw/workspace
+            # default: packs (and the reply.sh contract) live there.
+            "agents": {"defaults": {"model": f"chariot/{model}",
+                                    "workspace": WORKSPACE}},
+            "gateway": {
+                "mode": "local",
+                "port": 42617,
+                "auth": {"mode": "token", "token": token},
+            },
         }
         config_dir = os.path.join(agent_home(), ".openclaw")
         os.makedirs(config_dir, exist_ok=True)
@@ -770,6 +839,19 @@ class OpenclawHarness(Harness):
             json.dump(config, f, indent=2)
             f.write("\n")
         chown_to_agent(path)
+        # OpenClaw scopes its file/shell tools to its own workspace dir and
+        # canonicalizes paths (a symlink out of it reads as "not in your
+        # workspace"). A root bind mount makes the shared /workspace (packs,
+        # tools/reply.sh) BE that workspace — same inode, no escape to
+        # detect. Idempotent across re-configures.
+        ws_dir = os.path.join(config_dir, "workspace")
+        os.makedirs(ws_dir, exist_ok=True)
+        chown_to_agent(ws_dir)
+        if not os.path.ismount(ws_dir):
+            subprocess.run(["mount", "--bind", WORKSPACE, ws_dir],
+                           check=False, capture_output=True)
+        # Config changed → the running gateway must reread it.
+        self._stop_gateway()
 
     @staticmethod
     def _extract_reply(parsed):
@@ -785,6 +867,7 @@ class OpenclawHarness(Harness):
 
     def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc, outbox):
         self.last_agent_message = None
+        self._ensure_gateway(outbox)
         session = "chariot-" + safe_conversation_name(conversation_id)
         code, stdout, stderr = self.run_collected(
             ["openclaw", "agent", "--session-id", session, "--message", prompt, "--json"],
@@ -889,21 +972,30 @@ class HermesHarness(Harness):
     RUNNER = "/opt/chariot/hermes_turn.py"
 
     def installed(self):
-        return os.path.exists(os.path.join(self.VENV, "bin", "python"))
+        # The venv's bin/python appears even when venv creation failed halfway
+        # (Debian ships python3 without ensurepip); the package itself is the
+        # real marker.
+        return bool(glob.glob(os.path.join(
+            self.VENV, "lib", "python*", "site-packages", "run_agent*")))
 
     def ensure(self):
         if self.installed():
             return True
         try:
             log(f"installing hermes-agent {self.VERSION_PIN} (venv)…")
-            subprocess.run(["python3", "-m", "venv", self.VENV], check=True,
+            # Debian's python3 has no ensurepip until python3-venv is present,
+            # and the fresh cloud image has no apt lists until update runs.
+            apt_env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+            subprocess.run(["apt-get", "update"], check=True,
+                           capture_output=True, timeout=600, env=apt_env)
+            subprocess.run(["apt-get", "install", "-y", "python3-venv"],
+                           check=True, capture_output=True, timeout=600, env=apt_env)
+            subprocess.run(["python3", "-m", "venv", "--clear", self.VENV], check=True,
                            capture_output=True, timeout=300)
             subprocess.run([os.path.join(self.VENV, "bin", "pip"), "install",
                             "--no-cache-dir", f"hermes-agent=={self.VERSION_PIN}"],
                            check=True, capture_output=True, timeout=1800)
-            os.makedirs(os.path.dirname(self.RUNNER), exist_ok=True)
-            with open(self.RUNNER, "w") as f:
-                f.write(HERMES_RUNNER)
+            self._write_runner()
             self.install_error = None
             log("hermes installed")
             return True
@@ -920,10 +1012,17 @@ class HermesHarness(Harness):
     def version(self):
         return self.VERSION_PIN if self.installed() else None
 
+    def _write_runner(self):
+        os.makedirs(os.path.dirname(self.RUNNER), exist_ok=True)
+        with open(self.RUNNER, "w") as f:
+            f.write(HERMES_RUNNER)
+
     def render_config(self, cfg):
         """~/.hermes/config.yaml (port of images/hermes/turn.py::
         ensure_hermes_config). context_length is pinned because the broker
-        exposes no /models to probe."""
+        exposes no /models to probe. The runner is (re)written here too —
+        cloud-init preinstalls the venv, so ensure() may never run."""
+        self._write_runner()
         config_dir = os.path.join(agent_home(), ".hermes")
         os.makedirs(config_dir, exist_ok=True)
         chown_to_agent(config_dir)
