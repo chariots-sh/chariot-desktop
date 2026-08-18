@@ -48,6 +48,11 @@ write_files:
 
       [Network]
       DHCP=yes
+  # Which harness this agent runs; the bridge selects its adapter from this
+  # before the host's first agent.configure arrives.
+  - path: /etc/chariot/harness
+    permissions: "0644"
+    content: __HARNESS__
 
 runcmd:
   - mkdir -p /workspace
@@ -55,25 +60,9 @@ runcmd:
   # Persistent NIC management — survives reboots regardless of cloud-init's
   # first-boot-only network rendering.
   - systemctl enable --now systemd-networkd systemd-resolved || true
-  # Preinstall the Codex CLI runtime (bridge self-heals if this fails).
-  #
-  # Both binaries, not just `codex`: bridge.py's codex_installed() requires
-  # every entry in CODEX_BINARIES, so installing one left the agent reporting
-  # installed=false after a successful boot — which in turn disabled the
-  # Sign in Codex button, whose only alternative trigger for the self-heal was
-  # a chat turn the user could not usefully send yet.
-  - |
-    for pair in "codex-aarch64-unknown-linux-musl:/usr/local/bin/codex" \
-                "codex-code-mode-host-aarch64-unknown-linux-musl:/usr/local/bin/codex-code-mode-host"; do
-      asset="${pair%%:*}"
-      dest="${pair##*:}"
-      curl -fsSL -o "/tmp/$asset.tar.gz" \
-        "https://github.com/openai/codex/releases/download/rust-v0.147.0/$asset.tar.gz" \
-        && tar -xzf "/tmp/$asset.tar.gz" -C /tmp \
-        && mv "/tmp/$asset" "$dest" \
-        && chmod 755 "$dest" \
-        && rm -f "/tmp/$asset.tar.gz" || true
-    done
+  # Preinstall the chosen harness runtime (every step `|| true` — the bridge's
+  # ensure_harness_forever self-heals a first boot that loses the DHCP race).
+__HARNESS_INSTALL__
   - systemctl daemon-reload
   - systemctl enable --now chariot-bridge.service
   - systemctl restart ssh || systemctl restart sshd || true

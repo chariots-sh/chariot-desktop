@@ -37,7 +37,8 @@ enum SeedBuilder {
         try handle.truncate(atOffset: sizeBytes)
     }
 
-    static func createSeedISO(instance: InstancePaths, guestResources: URL) throws {
+    static func createSeedISO(instance: InstancePaths, guestResources: URL,
+                              harness: HarnessKind = .codex) throws {
         let fm = FileManager.default
 
         if !fm.fileExists(atPath: instance.accessKey.path) {
@@ -53,6 +54,8 @@ enum SeedBuilder {
         let userData = template
             .replacingOccurrences(of: "__SSH_PUBKEY__", with: publicKey)
             .replacingOccurrences(of: "__BRIDGE_B64__", with: bridge.base64EncodedString())
+            .replacingOccurrences(of: "__HARNESS__", with: harness.rawValue)
+            .replacingOccurrences(of: "__HARNESS_INSTALL__", with: installBlock(for: harness))
 
         let work = fm.temporaryDirectory.appendingPathComponent("chariot-seed-\(UUID().uuidString)")
         let cidata = work.appendingPathComponent("cidata")
@@ -71,5 +74,62 @@ enum SeedBuilder {
         try run("/usr/bin/hdiutil", ["makehybrid", "-quiet", "-iso", "-joliet",
                                      "-default-volume-name", "cidata",
                                      "-o", instance.seedISO.path, cidata.path])
+    }
+
+    /// The chosen harness's cloud-init preinstall, substituted for
+    /// __HARNESS_INSTALL__ (a runcmd list item, so two-space indented). Every
+    /// step tolerates failure — bridge.py's ensure_harness_forever self-heals,
+    /// exactly as the codex install always has. Pins mirror the backend
+    /// images (ProtocolsBackend chariot/images/*/Dockerfile).
+    static func installBlock(for harness: HarnessKind) -> String {
+        switch harness {
+        case .codex:
+            // Both binaries, not just `codex`: the bridge's installed() check
+            // requires every entry, so installing one left the agent at
+            // installed=false after a successful boot.
+            return """
+              - |
+                for pair in "codex-aarch64-unknown-linux-musl:/usr/local/bin/codex" \\
+                            "codex-code-mode-host-aarch64-unknown-linux-musl:/usr/local/bin/codex-code-mode-host"; do
+                  asset="${pair%%:*}"
+                  dest="${pair##*:}"
+                  curl -fsSL -o "/tmp/$asset.tar.gz" \\
+                    "https://github.com/openai/codex/releases/download/rust-v0.147.0/$asset.tar.gz" \\
+                    && tar -xzf "/tmp/$asset.tar.gz" -C /tmp \\
+                    && mv "/tmp/$asset" "$dest" \\
+                    && chmod 755 "$dest" \\
+                    && rm -f "/tmp/$asset.tar.gz" || true
+                done
+            """
+        case .zeroclaw:
+            return """
+              - |
+                curl -fsSL -o /tmp/zeroclaw.tar.gz \\
+                  "https://github.com/zeroclaw-labs/zeroclaw/releases/download/v0.7.5/zeroclaw-aarch64-unknown-linux-musl.tar.gz" \\
+                  && tar -xzf /tmp/zeroclaw.tar.gz -C /tmp \\
+                  && mv /tmp/zeroclaw /usr/local/bin/zeroclaw \\
+                  && chmod 755 /usr/local/bin/zeroclaw \\
+                  && rm -f /tmp/zeroclaw.tar.gz || true
+            """
+        case .openclaw:
+            return """
+              - |
+                curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \\
+                  && DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs \\
+                  && npm install -g openclaw@2026.6.11 || true
+            """
+        case .hermes:
+            return """
+              - |
+                python3 -m venv /opt/hermes \\
+                  && /opt/hermes/bin/pip install --no-cache-dir hermes-agent==0.18.0 || true
+            """
+        case .muse:
+            return """
+              - |
+                MUSE_INSTALL_DIR=/usr/local/bin MUSE_NO_MODIFY_PATH=1 MUSE_NO_AUTO_UPDATE=1 \\
+                  bash -c 'curl -fsSL https://dev.meta.ai/install.sh | bash' || true
+            """
+        }
     }
 }

@@ -81,6 +81,8 @@ final class AgentContext {
     var replayWindows: [String: ReplayWindow] = [:]
     var loginTunnel: VsockPortForwarder?
     var developerAccess: DeveloperAccess?
+    /// Host-side model endpoint broker for API-powered agents (vsock 8090).
+    var modelBroker: ModelBroker?
     var packInstalled: [String: String] = [:]
 
     init(key: String, record: AgentRecord?, vmInstanceID: SandboxID?,

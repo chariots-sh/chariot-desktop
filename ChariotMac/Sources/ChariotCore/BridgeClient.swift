@@ -42,6 +42,8 @@ final class BridgeClient: @unchecked Sendable {
     // file.put replies correlated by request ID (Milestone 1: pack pushes).
     private let putLock = NSLock()
     private var pendingFilePuts: [String: @Sendable (Result<Bool, ChariotError>) -> Void] = [:]
+    // agent.configure acks, correlated the same way.
+    private var pendingConfigures: [String: @Sendable (Result<Void, ChariotError>) -> Void] = [:]
 
     init(connection: VZVirtioSocketConnection, handler: @escaping @Sendable (BridgeEvent) -> Void) {
         self.connection = connection
@@ -141,6 +143,33 @@ final class BridgeClient: @unchecked Sendable {
         }
     }
 
+    /// Push the agent's power configuration into the guest: the bridge
+    /// persists it outside /workspace, renders the harness-native config, and
+    /// starts its loopback model forwarder before acking.
+    func configure(_ settings: [String: Any], timeout: TimeInterval = 20) async throws {
+        let requestID = UUID().uuidString.lowercased()
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            putLock.lock()
+            pendingConfigures[requestID] = { cont.resume(with: $0) }
+            putLock.unlock()
+            var object = settings
+            object["type"] = "agent.configure"
+            object["request_id"] = requestID
+            do {
+                try sendObject(object)
+            } catch {
+                resolveConfigure(requestID: requestID,
+                                 result: .failure(.bridgeUnavailable("agent.configure send failed: \(error)")))
+                return
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak self] in
+                self?.resolveConfigure(requestID: requestID,
+                                       result: .failure(.bridgeUnavailable(
+                                          "agent.configure timed out — guest bridge may predate harness support (Reset the agent)")))
+            }
+        }
+    }
+
     /// Resolution is exactly-once: whichever of reply / send-failure / timeout
     /// removes the pending entry first gets to resume the continuation.
     private func resolveFilePut(requestID: String, result: Result<Bool, ChariotError>) {
@@ -150,12 +179,22 @@ final class BridgeClient: @unchecked Sendable {
         completion?(result)
     }
 
+    private func resolveConfigure(requestID: String, result: Result<Void, ChariotError>) {
+        putLock.lock()
+        let completion = pendingConfigures.removeValue(forKey: requestID)
+        putLock.unlock()
+        completion?(result)
+    }
+
     private func failAllFilePuts(_ reason: String) {
         putLock.lock()
-        let pending = pendingFilePuts.values
+        let pendingPuts = pendingFilePuts.values
         pendingFilePuts.removeAll()
+        let pendingConfs = pendingConfigures.values
+        pendingConfigures.removeAll()
         putLock.unlock()
-        pending.forEach { $0(.failure(.bridgeUnavailable(reason))) }
+        pendingPuts.forEach { $0(.failure(.bridgeUnavailable(reason))) }
+        pendingConfs.forEach { $0(.failure(.bridgeUnavailable(reason))) }
     }
 
     // MARK: Receiving
@@ -231,6 +270,14 @@ final class BridgeClient: @unchecked Sendable {
             } else {
                 resolveFilePut(requestID: requestID,
                                result: .failure(.io(object["error"] as? String ?? "file.put failed")))
+            }
+        case "agent.configure.result":
+            let requestID = object["request_id"] as? String ?? ""
+            if object["ok"] as? Bool == true {
+                resolveConfigure(requestID: requestID, result: .success(()))
+            } else {
+                resolveConfigure(requestID: requestID,
+                                 result: .failure(.io(object["error"] as? String ?? "agent.configure failed")))
             }
         case "pong":
             handler(.pong)

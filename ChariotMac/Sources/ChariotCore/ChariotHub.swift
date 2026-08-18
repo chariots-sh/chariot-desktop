@@ -333,9 +333,10 @@ public final class ChariotHub: @unchecked Sendable {
         event("\(record.displayName): model set to \(model ?? "(default)")")
     }
 
-    /// Placeholder until M3 wires `agent.configure`: harness configs render
-    /// at boot from the seed, so a model change lands on next start.
-    private func pushAgentConfigIfConnected(_ context: AgentContext) async {}
+    private func pushAgentConfigIfConnected(_ context: AgentContext) async {
+        guard synchronized({ context.bridge }) != nil else { return }
+        await pushAgentConfig(context)
+    }
 
     public func agentRecords() -> [AgentRecord] {
         lock.lock(); defer { lock.unlock() }
@@ -388,7 +389,56 @@ public final class ChariotHub: @unchecked Sendable {
         guard let vm = context.vmInstanceID else { throw ChariotError.invalidState("no instance") }
         try await backend.start(vm)
         try await connectBridge(context)
+        try startBrokerIfNeeded(context)
+        await pushAgentConfig(context)
         await syncPack(context)
+    }
+
+    /// API-powered agents get their model endpoint brokered by the host: a
+    /// vsock listener on port 8090 that rewrites and forwards each guest
+    /// connection to the chariot proxy (token attached here, never in the
+    /// guest) or the user's local model server.
+    private func startBrokerIfNeeded(_ context: AgentContext) throws {
+        guard let record = synchronized({ context.record }),
+              record.effectivePowerSource != .chatgpt,
+              let vm = context.vmInstanceID else { return }
+        let power = try resolvePower(record: record, settings: account.hostSettings().localModel)
+        let credential = ChariotAgentCredential.load(
+            from: InstancePaths(directory: paths.instanceDirectory(record.instanceID)).chariotCredential)
+        let route = try ModelBrokerRoute.forPower(power,
+                                                  agentCredential: credential,
+                                                  backendBaseURL: ChariotAccountClient().baseURL)
+        let broker = ModelBroker(route: route, label: record.displayName)
+        let controller = try backend.controller(for: vm)
+        controller.listen(port: 8090) { connection in
+            broker.handle(fd: connection.fileDescriptor) { connection.close() }
+        }
+        synchronized { context.modelBroker = broker }
+        event("\(record.displayName): model broker up (\(power.source.rawValue) → \(route.upstreamHost))")
+    }
+
+    /// Push the agent's power configuration to the guest bridge so it renders
+    /// the harness-native config and starts its loopback forwarder. ChatGPT
+    /// codex agents skip this — their guest flow is unchanged, and an old
+    /// (pre-harness) guest bridge keeps working for them.
+    private func pushAgentConfig(_ context: AgentContext) async {
+        guard let record = synchronized({ context.record }),
+              record.effectivePowerSource != .chatgpt,
+              let bridge = synchronized({ context.bridge }) else { return }
+        do {
+            let power = try resolvePower(record: record, settings: account.hostSettings().localModel)
+            var settings: [String: Any] = [
+                "harness": record.effectiveHarness.rawValue,
+                "power_source": power.source.rawValue,
+                "base_url": "http://127.0.0.1:8090/v1",
+                "api_key": "chariot-broker"
+            ]
+            if let model = power.model { settings["model"] = model }
+            try await bridge.configure(settings)
+            event("\(record.displayName): guest configured (\(record.effectiveHarness.rawValue)/\(power.source.rawValue))")
+        } catch {
+            event("\(record.displayName): agent.configure failed: \(error)")
+        }
     }
 
     private func stop(_ context: AgentContext) async throws {
@@ -415,6 +465,12 @@ public final class ChariotHub: @unchecked Sendable {
         context.developerAccess = nil
         context.loginTunnel?.stop()
         context.loginTunnel = nil
+        if context.modelBroker != nil {
+            context.modelBroker = nil
+            if let vm = context.vmInstanceID, let controller = try? backend.controller(for: vm) {
+                controller.stopListening(port: 8090)
+            }
+        }
     }
 
     private func connectBridge(_ context: AgentContext) async throws {
