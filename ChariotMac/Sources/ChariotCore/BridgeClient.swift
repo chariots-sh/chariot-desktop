@@ -1,5 +1,6 @@
 import Foundation
 import Virtualization
+import AgentLinkKit
 
 /// Agent runtime state reported by the guest (design goal: the agent is Codex).
 public struct AgentRuntimeStatus: Sendable, Equatable {
@@ -25,6 +26,11 @@ public enum BridgeEvent: Sendable {
                 agent: AgentRuntimeStatus?)
     case outputDelta(requestID: String, conversationID: String, channel: OutputChannel, text: String)
     case outputCompleted(requestID: String, conversationID: String, exitCode: Int)
+    // A turn asked to run a tool on the paired phone (packs/*/tools/phone.sh).
+    // `turnRequestID` is the conversation.send request the turn belongs to —
+    // it names the phone the call routes to.
+    case toolCall(requestID: String, turnRequestID: String, conversationID: String,
+                  name: String, arguments: JSONValue)
     case oauthRequested(provider: String, purpose: String, authURL: String)
     case oauthCompleted(success: Bool, message: String)
     case pong
@@ -78,13 +84,31 @@ final class BridgeClient: @unchecked Sendable {
         if !ok { throw ChariotError.bridgeUnavailable("write failed: \(String(cString: strerror(errno)))") }
     }
 
-    func sendConversation(requestID: String, conversationID: String, text: String) throws {
+    func sendConversation(requestID: String, conversationID: String, text: String,
+                          attachments: [String] = []) throws {
+        var body: [String: Any] = ["text": text]
+        // Omitted when empty so an old guest bridge sees the exact same frame
+        // it always has.
+        if !attachments.isEmpty { body["attachments"] = attachments }
         try sendObject([
             "type": "conversation.send",
             "request_id": requestID,
             "conversation_id": conversationID,
-            "body": ["text": text]
+            "body": body
         ])
+    }
+
+    /// Relay the phone's answer (or the hub's timeout) for one tool call the
+    /// guest emitted; the polling pack script inside the VM is waiting on it.
+    func sendToolResult(requestID: String, ok: Bool, output: String?, error: String?) throws {
+        var object: [String: Any] = [
+            "type": "tool.result",
+            "request_id": requestID,
+            "ok": ok
+        ]
+        if let output { object["output"] = output }
+        if let error { object["error"] = error }
+        try sendObject(object)
     }
 
     func cancel(conversationID: String) throws {
@@ -224,6 +248,20 @@ final class BridgeClient: @unchecked Sendable {
             handler(.outputCompleted(requestID: object["request_id"] as? String ?? "",
                                      conversationID: object["conversation_id"] as? String ?? "",
                                      exitCode: object["exit_code"] as? Int ?? 0))
+        case "tool.call":
+            // Round-trip the untyped JSONSerialization dict through Codable to
+            // get the schema-flexible JSONValue the envelope layer speaks.
+            var arguments = JSONValue.object([:])
+            if let dict = object["arguments"] as? [String: Any],
+               let data = try? JSONSerialization.data(withJSONObject: dict),
+               let decoded = try? JSONDecoder().decode(JSONValue.self, from: data) {
+                arguments = decoded
+            }
+            handler(.toolCall(requestID: object["request_id"] as? String ?? "",
+                              turnRequestID: object["turn_request_id"] as? String ?? "",
+                              conversationID: object["conversation_id"] as? String ?? "",
+                              name: object["name"] as? String ?? "",
+                              arguments: arguments))
         case "file.put.result":
             let requestID = object["request_id"] as? String ?? ""
             if object["ok"] as? Bool == true {

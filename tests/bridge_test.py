@@ -50,16 +50,49 @@ emit({"type": "item.completed",
                "command": "cat /workspace/data/alist-archive.json",
                "aggregated_output": "SECRET-ARCHIVE-INTERNALS", "exit_code": 0}})
 
-if mode != "no-reply":
+def send_reply(text):
     outbox = os.environ["CHARIOT_OUTBOX"]
     os.makedirs(outbox, exist_ok=True)
+    stamp = "%d-%d" % (time.time_ns(), os.getpid())
+    part = os.path.join(outbox, "." + stamp + ".part")
+    with open(part, "w") as f:
+        f.write(text)
+    os.rename(part, os.path.join(outbox, stamp + ".msg"))
+    time.sleep(0.001)  # distinct nanosecond stamps keep the order stable
+
+# Tool-call modes drop a request the way tools/phone.sh does (atomic rename
+# to *.req), then poll for the *.res answer and echo it into the reply.
+def call_phone_tool(request_text, call_id, wait_seconds):
+    tooldir = os.environ["CHARIOT_TOOLCALLS"]
+    os.makedirs(tooldir, exist_ok=True)
+    part = os.path.join(tooldir, "." + call_id + ".part")
+    with open(part, "w") as f:
+        f.write(request_text)
+    os.rename(part, os.path.join(tooldir, call_id + ".req"))
+    res = os.path.join(tooldir, call_id + ".res")
+    deadline = time.time() + wait_seconds
+    while time.time() < deadline:
+        if os.path.exists(res):
+            with open(res) as f:
+                return f.read()
+        time.sleep(0.01)
+    return "TOOL-TIMEOUT"
+
+if mode == "tool-call":
+    result = call_phone_tool(json.dumps({"request_id": "call-1", "name": "log_water",
+                                         "arguments": {"millilitres": 600}}),
+                             "call-1", wait_seconds=5)
+    send_reply("TOOL-RESULT:" + result)
+elif mode == "bad-tool-call":
+    result = call_phone_tool("{this is not json", "call-bad", wait_seconds=5)
+    send_reply("TOOL-RESULT:" + result)
+elif mode == "tool-call-no-answer":
+    call_phone_tool(json.dumps({"request_id": "call-lost", "name": "day_summary",
+                                "arguments": {}}), "call-lost", wait_seconds=0.1)
+    send_reply("GAVE-UP-WAITING")
+elif mode != "no-reply":
     for text in (["first", "second"] if mode == "two-replies" else ["VISIBLE-ANSWER"]):
-        stamp = "%d-%d" % (time.time_ns(), os.getpid())
-        part = os.path.join(outbox, "." + stamp + ".part")
-        with open(part, "w") as f:
-            f.write(text)
-        os.rename(part, os.path.join(outbox, stamp + ".msg"))
-        time.sleep(0.001)  # distinct nanosecond stamps keep the order stable
+        send_reply(text)
 
 emit({"type": "item.completed",
       "item": {"id": "i1", "type": "agent_message", "text": "INLINE-FINAL-MESSAGE"}})
@@ -85,6 +118,7 @@ class BridgeTestCase(unittest.TestCase):
         patches = {
             "WORKSPACE": self.workspace,
             "OUTBOX_ROOT": os.path.join(self.workspace, ".chariot", "outbox"),
+            "TOOLCALL_ROOT": os.path.join(self.workspace, ".chariot", "toolcalls"),
             "STATE_DIR": os.path.join(root, "state"),
             "THREADS_FILE": os.path.join(root, "state", "threads.json"),
             "CODEX_BIN": codex,
@@ -97,6 +131,7 @@ class BridgeTestCase(unittest.TestCase):
             self.addCleanup(setattr, bridge, name, original)
         bridge.conversation_locks.clear()
         bridge.cancel_procs.clear()
+        bridge.pending_tool_calls.clear()
 
     def _run_unprivileged(self, argv, extra_env=None, **kwargs):
         env = dict(os.environ)
@@ -104,7 +139,8 @@ class BridgeTestCase(unittest.TestCase):
         return subprocess.Popen([sys.executable] + argv[:1] + argv[1:], env=env,
                                 cwd=self.workspace, start_new_session=True, **kwargs)
 
-    def run_turn(self, prompt="hello", conversation_id="default", mode="ok"):
+    def run_turn(self, prompt="hello", conversation_id="default", mode="ok",
+                 attachments=()):
         """One turn; returns (exit code, [(channel, text), …])."""
         seen = []
 
@@ -113,7 +149,8 @@ class BridgeTestCase(unittest.TestCase):
 
         os.environ["FAKE_CODEX_MODE"] = mode
         try:
-            code = bridge.execute_codex_turn(conversation_id, prompt, delta)
+            code = bridge.execute_codex_turn(conversation_id, prompt, delta,
+                                             attachments=attachments)
         finally:
             os.environ.pop("FAKE_CODEX_MODE", None)
         return code, seen
@@ -140,6 +177,28 @@ class CodexArgvTests(BridgeTestCase):
         self.assertNotIn("-C", argv)
         self.assertNotIn("--cd", argv)
         self.assertEqual(argv[-1], "hi")
+
+    def test_images_ride_dash_i_on_fresh_and_resume(self):
+        images = ["/workspace/data/attachments/a.png", "/workspace/data/attachments/b.jpg"]
+        for thread_id in (None, "thread-42"):
+            argv = bridge.codex_argv("hi", thread_id, images=images)
+            self.assertEqual(argv.count("-i"), 2)
+            for image in images:
+                self.assertEqual(argv[argv.index(image) - 1], "-i",
+                                 "each image needs its own -i flag")
+            self.assertEqual(argv[-1], "hi", "the prompt stays positional, after -i")
+
+    def test_only_existing_images_are_handed_to_dash_i(self):
+        present = os.path.join(self.workspace, "photo.png")
+        with open(present, "w") as f:
+            f.write("png")
+        document = os.path.join(self.workspace, "report.pdf")
+        with open(document, "w") as f:
+            f.write("pdf")
+        missing = os.path.join(self.workspace, "never-uploaded.png")
+        # Non-images and files whose upload never landed are prompt-only.
+        self.assertEqual(bridge.split_attachments([present, document, missing]),
+                         [present])
 
 
 class ThreadStateTests(BridgeTestCase):
@@ -254,6 +313,116 @@ class TurnTests(BridgeTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.replies(seen), ["VISIBLE-ANSWER\n"])
         self.assertEqual(bridge.thread_for("default"), "thread-fresh")
+
+
+class AttachmentTests(BridgeTestCase):
+    def test_attachments_reach_the_prompt_and_images_reach_argv(self):
+        present = os.path.join(self.workspace, "meal.png")
+        with open(present, "w") as f:
+            f.write("png")
+        document = os.path.join(self.workspace, "labs.pdf")
+        with open(document, "w") as f:
+            f.write("pdf")
+
+        argv_seen = []
+        real_run = bridge.run_as_agent
+
+        def record(argv, **kwargs):
+            argv_seen.append(argv)
+            return real_run(argv, **kwargs)
+
+        bridge.run_as_agent = record
+        try:
+            code, _seen = self.run_turn(prompt="what do you see?",
+                                        attachments=[present, document])
+        finally:
+            bridge.run_as_agent = real_run
+
+        self.assertEqual(code, 0)
+        argv = argv_seen[0]
+        # The image gets pixels; the document is prompt-only.
+        self.assertEqual(argv[argv.index("-i") + 1], present)
+        self.assertEqual(argv.count("-i"), 1)
+        prompt = argv[-1]
+        self.assertIn("what do you see?", prompt)
+        self.assertIn("[Attached files from your person's phone:", prompt)
+        # Every attachment is listed by path, images included, so the model
+        # can re-open them with tools.
+        self.assertIn(present, prompt)
+        self.assertIn(document, prompt)
+
+
+class ToolCallTests(BridgeTestCase):
+    """The reverse RPC dropbox: phone.sh-style *.req files become tool.call
+    events, tool.result answers land as *.res files, and nothing survives the
+    turn that nobody is polling for."""
+
+    def tool_turn(self, mode, emit, request_id="turn-1"):
+        seen = []
+
+        def delta(text, channel=bridge.CHANNEL_TRACE):
+            seen.append((channel, text))
+
+        os.environ["FAKE_CODEX_MODE"] = mode
+        try:
+            code = bridge.execute_codex_turn("default", "hello", delta,
+                                             request_id=request_id, emit=emit)
+        finally:
+            os.environ.pop("FAKE_CODEX_MODE", None)
+        return code, seen
+
+    def test_tool_call_round_trip(self):
+        events = []
+
+        def emit(obj):
+            events.append(obj)
+            if obj.get("type") == "tool.call":
+                # The host answering mid-turn, while the script still polls.
+                bridge.handle_tool_result({"request_id": obj["request_id"],
+                                           "ok": True, "output": "logged 600 ml"})
+
+        code, seen = self.tool_turn("tool-call", emit)
+        self.assertEqual(code, 0)
+
+        calls = [e for e in events if e.get("type") == "tool.call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["request_id"], "call-1")
+        self.assertEqual(calls[0]["turn_request_id"], "turn-1")
+        self.assertEqual(calls[0]["conversation_id"], "default")
+        self.assertEqual(calls[0]["name"], "log_water")
+        self.assertEqual(calls[0]["arguments"], {"millilitres": 600})
+
+        reply = "".join(self.replies(seen))
+        self.assertIn("TOOL-RESULT:", reply)
+        self.assertIn('"ok": true', reply)
+        self.assertIn("logged 600 ml", reply)
+        self.assertEqual(bridge.pending_tool_calls, {})
+
+    def test_malformed_request_fails_fast_without_reaching_the_host(self):
+        events = []
+        code, seen = self.tool_turn("bad-tool-call", events.append)
+        self.assertEqual(code, 0)
+        self.assertEqual([e for e in events if e.get("type") == "tool.call"], [])
+        reply = "".join(self.replies(seen))
+        self.assertIn("malformed request", reply)
+        self.assertEqual(bridge.pending_tool_calls, {})
+
+    def test_unanswered_calls_are_dropped_when_the_turn_ends(self):
+        events = []
+        code, seen = self.tool_turn("tool-call-no-answer", events.append)
+        self.assertEqual(code, 0)
+        calls = [e for e in events if e.get("type") == "tool.call"]
+        self.assertEqual([c["request_id"] for c in calls], ["call-lost"])
+        self.assertIn("GAVE-UP-WAITING", "".join(self.replies(seen)))
+        # The teardown sweep dropped the pending call…
+        self.assertEqual(bridge.pending_tool_calls, {})
+        # …so a result arriving after the turn is dropped, not written into
+        # the dead dropbox.
+        bridge.handle_tool_result({"request_id": "call-lost", "ok": True,
+                                   "output": "too late"})
+        leftovers = [n for n in os.listdir(bridge.toolcalls_dir("default"))
+                     if n.endswith(".res")]
+        self.assertEqual(leftovers, [])
 
 
 class SummarizeItemTests(BridgeTestCase):
