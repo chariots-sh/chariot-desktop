@@ -44,6 +44,9 @@ public final class ChariotHub: @unchecked Sendable {
     public var macDisplayName: String
     /// Base image used when creating agents (and the legacy instance).
     public var defaultBaseImagePath: String?
+    /// Chariot-account link: sign-in, external-agent registration, and the
+    /// app-level local-model defaults.
+    public private(set) lazy var account = ChariotAccountManager(paths: paths)
     private let lock = NSRecursiveLock()
 
     // Fleet: canonical context key (instance UUID or "default") → context.
@@ -255,21 +258,42 @@ public final class ChariotHub: @unchecked Sendable {
     /// Create an agent from a pack: mint the instance UUID (the durable
     /// identity), clone the base image with the pack's VM sizing, and record
     /// it in the fleet index. The VM is not started here.
+    ///
+    /// The harness and power source are fixed at creation. Chariot-powered
+    /// agents register with the backend FIRST (fail fast when signed out or
+    /// offline) so the proxy token exists before any disk is cloned.
     public func createAgent(fromPackDirectory packDirectoryName: String,
-                            displayName: String? = nil) async throws -> AgentRecord {
+                            displayName: String? = nil,
+                            harness: HarnessKind = .codex,
+                            powerSource: PowerSourceKind = .chatgpt,
+                            model: String? = nil,
+                            localBaseURL: String? = nil) async throws -> AgentRecord {
         guard let baseImage = defaultBaseImagePath, !baseImage.isEmpty else {
             throw ChariotError.invalidState("no base image configured")
         }
         let pack = try PackLoader.load(at: paths.packsDirectory.appendingPathComponent(packDirectoryName))
         let instanceID = UUID().uuidString.lowercased()
-        _ = try await backend.createInstance(configuration: pack.configuration(baseImagePath: baseImage),
-                                             id: instanceID)
-        let record = AgentRecord(instanceID: instanceID,
+        var record = AgentRecord(instanceID: instanceID,
                                  packID: pack.manifest.id,
                                  displayName: displayName ?? pack.manifest.name,
                                  packDirectoryName: packDirectoryName,
                                  createdAt: Date())
+        record.harness = harness
+        record.powerSource = powerSource
+        record.model = model
+        record.localBaseURL = localBaseURL
+        // Validates the combination (chatgpt ⇒ codex; local needs a base URL
+        // + model somewhere in the chain) before anything durable happens.
+        _ = try resolvePower(record: record, settings: account.hostSettings().localModel)
+
         let instance = InstancePaths(directory: paths.instanceDirectory(instanceID))
+        if powerSource == .chariot {
+            _ = try await account.registerAgent(displayName: record.displayName,
+                                                instanceDirectory: instance.directory)
+        }
+        var configuration = pack.configuration(baseImagePath: baseImage)
+        configuration.harness = harness.rawValue
+        _ = try await backend.createInstance(configuration: configuration, id: instanceID)
         synchronized {
             agentIndex.append(record)
             contexts[instanceID] = AgentContext(key: instanceID,
@@ -279,9 +303,39 @@ public final class ChariotHub: @unchecked Sendable {
                                                 packStateURL: instance.packState)
         }
         persistAgentIndex()
-        event("agent \(record.displayName) created from \(packDirectoryName) (instance \(instanceID.prefix(8)))")
+        event("agent \(record.displayName) created from \(packDirectoryName) "
+              + "(\(harness.rawValue)/\(powerSource.rawValue), instance \(instanceID.prefix(8)))")
         return record
     }
+
+    /// Update one agent's model override: persist, mirror to the backend for
+    /// chariot agents (the proxy re-resolves per call), and re-push the guest
+    /// config when the bridge is up so the next turn uses it.
+    public func setAgentModel(_ instanceID: String, model: String?) async throws {
+        let context = try requireContext(instanceID)
+        guard var record = synchronized({ context.record }) else {
+            throw ChariotError.invalidState("legacy context has no record")
+        }
+        record.model = model
+        _ = try resolvePower(record: record, settings: account.hostSettings().localModel)
+        synchronized {
+            context.record = record
+            if let index = agentIndex.firstIndex(where: { $0.instanceID == record.instanceID }) {
+                agentIndex[index] = record
+            }
+        }
+        persistAgentIndex()
+        if record.effectivePowerSource == .chariot {
+            await account.mirrorAgentModel(
+                instanceDirectory: paths.instanceDirectory(record.instanceID), model: model)
+        }
+        await pushAgentConfigIfConnected(context)
+        event("\(record.displayName): model set to \(model ?? "(default)")")
+    }
+
+    /// Placeholder until M3 wires `agent.configure`: harness configs render
+    /// at boot from the seed, so a model change lands on next start.
+    private func pushAgentConfigIfConnected(_ context: AgentContext) async {}
 
     public func agentRecords() -> [AgentRecord] {
         lock.lock(); defer { lock.unlock() }
@@ -532,6 +586,14 @@ public final class ChariotHub: @unchecked Sendable {
     /// brokered dance runs at a time: the OAuth redirect port is fixed.
     public func startCodexLogin(instanceID: String? = nil) throws {
         let context = try requireContext(instanceID)
+        // The brokered OAuth dance is only meaningful for chatgpt-powered
+        // codex agents; API-powered agents have nothing to sign in to. This
+        // guard also keeps the fleet-wide one-sign-in lock codex-only.
+        if let record = synchronized({ context.record }),
+           record.effectivePowerSource != .chatgpt {
+            throw ChariotError.invalidState(
+                "\(record.displayName) is powered by \(record.effectivePowerSource.rawValue); ChatGPT sign-in does not apply")
+        }
         lock.lock()
         let bridge = context.bridge
         let busy = contexts.values.contains { $0 !== context && $0.loginTunnel != nil }
@@ -1533,11 +1595,24 @@ public final class ChariotHub: @unchecked Sendable {
             guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String],
                   let packDir = object["pack_dir"] else { return .error(400, "pack_dir required") }
             let name = object["name"]
+            guard let harness = HarnessKind(rawValue: object["harness"] ?? "codex") else {
+                return .error(400, "unknown harness")
+            }
+            guard let power = PowerSourceKind(rawValue: object["power_source"] ?? "chatgpt") else {
+                return .error(400, "unknown power_source")
+            }
+            let model = object["model"]
+            let localBaseURL = object["local_base_url"]
             let collector = OutputCollector()
             let result = runBlocking { [weak self] in
                 guard let self else { return "error: hub gone" }
                 do {
-                    let record = try await self.createAgent(fromPackDirectory: packDir, displayName: name)
+                    let record = try await self.createAgent(fromPackDirectory: packDir,
+                                                            displayName: name,
+                                                            harness: harness,
+                                                            powerSource: power,
+                                                            model: model,
+                                                            localBaseURL: localBaseURL)
                     collector.append(record.instanceID)
                     return "ok"
                 } catch {
@@ -1556,12 +1631,19 @@ public final class ChariotHub: @unchecked Sendable {
                     "vm_state": summary.vmState.rawValue,
                     "bridge_connected": summary.bridgeConnected,
                     "epoch": Int(summary.epoch),
+                    "harness": summary.record.effectiveHarness.rawValue,
+                    "power_source": summary.record.effectivePowerSource.rawValue,
+                    "model": summary.record.model ?? "",
                     "devices": pairedDevices(instanceID: summary.record.instanceID).map { device -> [String: Any] in
                         ["id": device.id, "name": device.name, "revoked": device.revoked,
                          "fingerprint": device.fingerprint]
                     }
                 ]
                 if let status = summary.agentStatus {
+                    // Generic keys; the codex_* names stay for E2E compat.
+                    payload["agent_installed"] = status.installed
+                    payload["agent_ready"] = status.loggedIn
+                    payload["agent_name"] = status.name
                     payload["codex_installed"] = status.installed
                     payload["codex_logged_in"] = status.loggedIn
                     payload["codex_version"] = status.version ?? ""
@@ -1682,6 +1764,45 @@ public final class ChariotHub: @unchecked Sendable {
             }
         case ("POST", "conversation"):
             return runConversation(request, instanceID: nil)
+        case ("GET", "chariot"):
+            switch account.signInState {
+            case .signedOut:
+                return .json(["signed_in": false, "state": "signed_out"])
+            case .pending(let approveURL):
+                return .json(["signed_in": false, "state": "pending", "approve_url": approveURL])
+            case .signedIn(let email):
+                return .json(["signed_in": true, "state": "signed_in", "email": email ?? ""])
+            case .failed(let message):
+                return .json(["signed_in": false, "state": "failed", "error": message])
+            }
+        case ("POST", "chariot") where rest.count == 2 && rest[1] == "login":
+            let collector = OutputCollector()
+            let result = runBlocking(timeout: 30) { [weak self] in
+                guard let self else { return "error: hub gone" }
+                do {
+                    let url = try await self.account.startSignIn()
+                    collector.append(url.absoluteString)
+                    return "ok"
+                } catch {
+                    return "error: \(error)"
+                }
+            }
+            guard result == "ok" else { return .error(502, result) }
+            return .json(["approve_url": collector.text])
+        case ("POST", "chariot") where rest.count == 2 && rest[1] == "logout":
+            account.signOut()
+            return .json(["signed_in": false])
+        case ("POST", "settings") where rest.count == 2 && rest[1] == "local-model":
+            guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String] else {
+                return .error(400, "malformed body")
+            }
+            do {
+                try account.setLocalModelDefaults(baseURL: object["base_url"], model: object["model"])
+            } catch {
+                return .error(500, "\(error)")
+            }
+            let saved = account.hostSettings().localModel
+            return .json(["base_url": saved?.baseURL ?? "", "model": saved?.model ?? ""])
         default:
             return .error(404, "not found")
         }
@@ -1721,6 +1842,22 @@ public final class ChariotHub: @unchecked Sendable {
             return runConversation(request, instanceID: instanceID)
         case ("POST", "login"):
             return startLoginAndAwaitURL(instanceID: instanceID)
+        case ("POST", "model"):
+            guard let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: String?] else {
+                return .error(400, "malformed body")
+            }
+            let model = object["model"] ?? nil
+            let result = runBlocking { [weak self] in
+                guard let self else { return "error: hub gone" }
+                do {
+                    try await self.setAgentModel(instanceID, model: model)
+                    return "ok"
+                } catch {
+                    return "error: \(error)"
+                }
+            }
+            guard result == "ok" else { return .error(400, result) }
+            return .json(["model": model ?? ""])
         default:
             return .error(404, "not found")
         }

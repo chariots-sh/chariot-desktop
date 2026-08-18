@@ -18,6 +18,10 @@ public struct ChariotPaths: Sendable {
     public var packsDirectory: URL { dataDirectory.appendingPathComponent("packs") }
     /// Fleet index: the created agents (instance UUID → pack provenance).
     public var agentsIndex: URL { dataDirectory.appendingPathComponent("agents.json") }
+    /// App-level defaults (local model server); non-secret.
+    public var hostSettings: URL { dataDirectory.appendingPathComponent("settings.json") }
+    /// The signed-in Chariot account credential (0600).
+    public var chariotAccount: URL { identityDirectory.appendingPathComponent("chariot-account.json") }
 
     public func instanceDirectory(_ id: SandboxID) -> URL {
         instancesDirectory.appendingPathComponent(id)
@@ -49,4 +53,7 @@ public struct InstancePaths: Sendable {
     public var deviceRegistry: URL { directory.appendingPathComponent("devices.json") }
     /// Checksums of the last pack content installed into the guest.
     public var packState: URL { directory.appendingPathComponent("pack-state.json") }
+    /// Chariot-account power source: the backend registration + proxy bearer
+    /// token for this agent (0600, host-only — never synced into the guest).
+    public var chariotCredential: URL { directory.appendingPathComponent("chariot-agent.json") }
 }
