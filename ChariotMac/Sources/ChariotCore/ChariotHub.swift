@@ -130,6 +130,21 @@ public final class ChariotHub: @unchecked Sendable {
     private var localStreams: [String: (@Sendable (String) -> Void, @Sendable (Int) -> Void)] = [:]
     private let flushQueue = DispatchQueue(label: "chariot.hub.flush")
 
+    // Phone tool calls in flight (guest → phone → guest): request ID → who
+    // may answer and which guest gets the result. Exactly-once discipline as
+    // in BridgeClient.resolveFilePut: whoever removes the entry first — the
+    // phone's result, the timeout, or bridge loss — decides the outcome.
+    private struct PendingToolCall {
+        var recipientDeviceID: String
+        var contextKey: String
+        var conversationID: String
+    }
+    private var pendingToolCalls: [String: PendingToolCall] = [:]
+    /// Kept inside phone.sh's 30s poll so the model hears "no answer" from
+    /// the Mac rather than the script timing out blind. Internal (not
+    /// private) so tests can shrink it.
+    var toolCallTimeout: TimeInterval = 25
+
     public init(paths: ChariotPaths, displayName: String = Host.current().localizedName ?? "Mac") throws {
         self.paths = paths
         try paths.ensureDirectories()
@@ -431,7 +446,8 @@ public final class ChariotHub: @unchecked Sendable {
     /// guest. `failure` fires instead of the normal completion path when the
     /// bridge is gone or the send fails.
     private func dispatchTurn(_ context: AgentContext, requestID: String, conversationID: String,
-                              text: String, failure: @escaping @Sendable (String) -> Void) {
+                              text: String, attachments: [String] = [],
+                              failure: @escaping @Sendable (String) -> Void) {
         Task { [weak self] in
             guard let self else { return }
             await self.syncPack(context)
@@ -441,11 +457,22 @@ public final class ChariotHub: @unchecked Sendable {
             }
             do {
                 try bridge.sendConversation(requestID: requestID,
-                                            conversationID: conversationID, text: text)
+                                            conversationID: conversationID, text: text,
+                                            attachments: attachments)
             } catch {
                 failure("\(error)")
             }
         }
+    }
+
+    /// Attachment paths cross the same trust boundary as `file.write` paths
+    /// and get the same guard: guest paths under /workspace only, no
+    /// traversal. Offending entries are dropped rather than failing the turn
+    /// — the prompt text still goes through.
+    static func sanitizedAttachments(_ body: JSONValue) -> [String] {
+        guard case .array(let items)? = body["attachments"] else { return [] }
+        return items.compactMap(\.stringValue)
+            .filter { $0.hasPrefix("/workspace/") && !$0.contains("..") }
     }
 
     // MARK: Tailscale node
@@ -991,7 +1018,8 @@ public final class ChariotHub: @unchecked Sendable {
                                                 conversationID: message.conversationID)
             lock.unlock()
             dispatchTurn(context, requestID: message.messageID,
-                         conversationID: message.conversationID, text: text) { [weak self] error in
+                         conversationID: message.conversationID, text: text,
+                         attachments: Self.sanitizedAttachments(message.body)) { [weak self] error in
                 guard let self else { return }
                 self.lock.lock()
                 let stream = self.streams.removeValue(forKey: message.messageID)
@@ -1063,6 +1091,27 @@ public final class ChariotHub: @unchecked Sendable {
                 try? self.sendToDevice(deviceID, context: context, type: .fileWriteResult,
                                        conversationID: conversationID, body: .object(body))
             }
+        case .toolResult:
+            // The phone answered a tool call. Late and unknown ids are logged
+            // and dropped (the Mac already timed out, or the turn ended); the
+            // envelope is still acked — reprocessing it later can't help.
+            let requestID = message.body["request_id"]?.stringValue ?? ""
+            lock.lock()
+            let pending = pendingToolCalls[requestID]
+            lock.unlock()
+            guard let pending else {
+                event("tool result for unknown/expired call \(requestID.prefix(8)) from \(entry.displayName) — dropped")
+                return
+            }
+            // Only the phone the call was addressed to may answer it.
+            guard pending.recipientDeviceID == entry.identity.deviceID else {
+                event("tool result for \(requestID.prefix(8)) from a device it was not sent to — dropped")
+                return
+            }
+            resolveToolCall(requestID: requestID,
+                            ok: message.body["ok"]?.boolValue ?? false,
+                            output: message.body["output"]?.stringValue,
+                            error: message.body["error"]?.stringValue)
         case .sandboxStatus:
             lock.lock()
             let status = context.lastGuestStatus
@@ -1183,6 +1232,9 @@ public final class ChariotHub: @unchecked Sendable {
                                   body: .object(["exit_code": .number(Double(exitCode)),
                                                  "request_id": .string(requestID)]))
             }
+        case .toolCall(let requestID, let turnRequestID, let conversationID, let name, let arguments):
+            handleToolCall(context, requestID: requestID, turnRequestID: turnRequestID,
+                           conversationID: conversationID, name: name, arguments: arguments)
         case .pong:
             break
         case .error(let message):
@@ -1191,6 +1243,9 @@ public final class ChariotHub: @unchecked Sendable {
             event("\(displayName(of: context)): bridge disconnected: \(reason)")
             lock.lock()
             context.bridge = nil
+            // In-flight tool calls have nowhere to deliver their result now —
+            // and the guest scripts polling for them died with the bridge.
+            pendingToolCalls = pendingToolCalls.filter { $0.value.contextKey != context.key }
             lock.unlock()
             // Reconnect while the VM is still running (e.g. guest service restart).
             if let vm = context.vmInstanceID, backend.state(of: vm) == .running {
@@ -1200,6 +1255,86 @@ public final class ChariotHub: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Route one guest tool call to the paired phone and arm its timeout.
+    private func handleToolCall(_ context: AgentContext, requestID: String, turnRequestID: String,
+                                conversationID: String, name: String, arguments: JSONValue) {
+        lock.lock()
+        // Resolve the recipient the way output deltas do: the phone whose
+        // conversation.send started this turn. A locally started turn (Mac
+        // UI, admin harness) has no stream — fall back to the context's sole
+        // unrevoked device, since the tools act on that person's phone either
+        // way. Zero or several devices is ambiguous: refuse rather than guess.
+        var recipient = streams[turnRequestID]?.recipientDeviceID
+        if recipient == nil {
+            let active = context.registry.devices.filter { $0.revokedAt == nil }
+            if active.count == 1 { recipient = active[0].identity.deviceID }
+        }
+        let bridge = context.bridge
+        guard let recipient else {
+            lock.unlock()
+            event("\(displayName(of: context)): tool call \(name) refused — no phone to run it on")
+            try? bridge?.sendToolResult(requestID: requestID, ok: false, output: nil,
+                                        error: "no phone paired")
+            return
+        }
+        pendingToolCalls[requestID] = PendingToolCall(recipientDeviceID: recipient,
+                                                      contextKey: context.key,
+                                                      conversationID: conversationID)
+        lock.unlock()
+        event("\(displayName(of: context)): tool call \(name) (\(requestID.prefix(8))) → phone")
+        do {
+            // expires_at guards the durable mailbox: a phone that connects
+            // after the Mac gave up must drop the call, not execute it.
+            try sendToDevice(recipient, context: context, type: .toolCall,
+                             conversationID: conversationID,
+                             body: .object(["request_id": .string(requestID),
+                                            "name": .string(name),
+                                            "arguments": arguments,
+                                            "turn_id": .string(turnRequestID),
+                                            "expires_at": .number(Date().timeIntervalSince1970 + toolCallTimeout)]))
+        } catch {
+            resolveToolCall(requestID: requestID, ok: false, output: nil,
+                            error: "could not reach the phone: \(error)")
+            return
+        }
+        flushQueue.asyncAfter(deadline: .now() + toolCallTimeout) { [weak self] in
+            guard let self else { return }
+            if self.resolveToolCall(requestID: requestID, ok: false, output: nil,
+                                    error: "phone did not respond") {
+                self.event("tool call \(name) (\(requestID.prefix(8))): phone did not respond in time")
+            }
+        }
+    }
+
+    /// Exactly-once resolution of a pending tool call: forwards to the guest
+    /// only when this call actually removed the entry (returns true then).
+    @discardableResult
+    private func resolveToolCall(requestID: String, ok: Bool, output: String?,
+                                 error: String?) -> Bool {
+        lock.lock()
+        let pending = pendingToolCalls.removeValue(forKey: requestID)
+        let bridge = pending.flatMap { contexts[$0.contextKey]?.bridge }
+        lock.unlock()
+        guard pending != nil else { return false }
+        // A vanished bridge leaves nowhere to answer; the guest-side sweep
+        // already dropped the call when its turn ended.
+        try? bridge?.sendToolResult(requestID: requestID, ok: ok, output: output, error: error)
+        return true
+    }
+
+    /// Test seam: feed a bridge event as if the guest for `instanceID`
+    /// emitted it (handleBridgeEvent itself needs the internal AgentContext).
+    func _injectBridgeEvent(instanceID: String?, _ bridgeEvent: BridgeEvent) {
+        guard let context = try? requireContext(instanceID) else { return }
+        handleBridgeEvent(context, bridgeEvent)
+    }
+
+    /// Test seam: whether a tool call is still awaiting its result.
+    func _hasPendingToolCall(_ requestID: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return pendingToolCalls[requestID] != nil
     }
 
     private func flushStream(requestID: String, final: Bool) {

@@ -2,6 +2,24 @@ import Foundation
 
 /// Application-level message types carried inside encrypted envelopes and over
 /// the host↔guest bridge (design §1.4, §7).
+///
+/// Body schemas for the phone-data surface (all fields snake_case; `body` is a
+/// schema-flexible JSON object, so additions here are wire-compatible):
+///
+/// - `conversation.send`: `{"text": String, "attachments": [String]?}` —
+///   `attachments` lists absolute guest paths under `/workspace/data/attachments/`
+///   that the sender uploaded via `file.write` before this message. Optional;
+///   receivers that predate it ignore the key.
+/// - `tool.call` (Mac → phone): `{"request_id": String, "name": String,
+///   "arguments": {…}, "turn_id": String?, "expires_at": Number?}` —
+///   `turn_id` is the `message_id` of the `conversation.send` whose turn issued
+///   the call, so the phone can attribute results to the visible conversation.
+///   `expires_at` (Unix seconds) lets a late-delivered phone drop a stale call
+///   instead of executing it after the Mac has already timed out.
+/// - `tool.result` (phone → Mac): `{"request_id": String, "ok": Bool,
+///   "output": String, "user_visible_summary": String?, "error": String?}` —
+///   `output` is the text handed back to the model; `user_visible_summary`, when
+///   present, is the line the phone rendered into its own transcript.
 public enum AgentMessageType: String, Codable, Sendable {
     case conversationSend = "conversation.send"
     case conversationCancel = "conversation.cancel"
@@ -15,6 +33,8 @@ public enum AgentMessageType: String, Codable, Sendable {
     case deviceRevoked = "device.revoked"
     case fileWrite = "file.write"
     case fileWriteResult = "file.write.result"
+    case toolCall = "tool.call"
+    case toolResult = "tool.result"
     case ack = "ack"
 }
 

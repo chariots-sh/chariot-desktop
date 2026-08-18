@@ -65,10 +65,23 @@ OUTBOX_ROOT = os.path.join(WORKSPACE, ".chariot", "outbox")
 MESSAGE_SUFFIX = ".msg"
 OUTBOX_POLL_SECONDS = 0.25
 
+# Drop box for phone tool calls (see packs/*/tools/phone.sh): the agent writes
+# `<id>.req`, the host answers on the phone, and the result comes back as
+# `<id>.res` for the polling script. Same rename-into-place discipline as the
+# outbox.
+TOOLCALL_ROOT = os.path.join(WORKSPACE, ".chariot", "toolcalls")
+REQUEST_SUFFIX = ".req"
+RESULT_SUFFIX = ".res"
+
+# Attachment images ride `codex exec -i` so the model gets pixels; anything
+# else is referenced by path in the prompt only.
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp"}
+
 start_time = time.time()
 state_lock = threading.Lock()
 cancel_procs = {}          # conversation_id -> subprocess.Popen
 conversation_locks = {}    # conversation_id -> threading.Lock
+pending_tool_calls = {}    # request_id -> toolcalls dir awaiting a .res
 login_proc = None
 codex_install_error = None
 
@@ -247,15 +260,22 @@ def forget_thread(conversation_id):
 
 # ------------------------------------------------------------------- Outbox
 
+def safe_conversation_name(conversation_id):
+    return re.sub(r"[^A-Za-z0-9._-]", "_", conversation_id or "") or "default"
+
+
 def outbox_dir(conversation_id):
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", conversation_id or "") or "default"
-    return os.path.join(OUTBOX_ROOT, safe)
+    return os.path.join(OUTBOX_ROOT, safe_conversation_name(conversation_id))
 
 
-def reset_outbox(path):
-    """Empty drop box owned by the agent user, ready for one turn's replies."""
+def toolcalls_dir(conversation_id):
+    return os.path.join(TOOLCALL_ROOT, safe_conversation_name(conversation_id))
+
+
+def reset_dropbox(path, root):
+    """Empty drop box owned by the agent user, ready for one turn."""
     os.makedirs(path, exist_ok=True)
-    for directory in (os.path.dirname(OUTBOX_ROOT), OUTBOX_ROOT, path):
+    for directory in (os.path.dirname(root), root, path):
         try:
             info = pwd.getpwnam(AGENT_USER)
             os.chown(directory, info.pw_uid, info.pw_gid)
@@ -267,6 +287,11 @@ def reset_outbox(path):
             os.unlink(os.path.join(path, name))
         except OSError:
             pass
+
+
+def reset_outbox(path):
+    """Empty drop box owned by the agent user, ready for one turn's replies."""
+    reset_dropbox(path, OUTBOX_ROOT)
 
 
 def drain_outbox(path):
@@ -290,6 +315,44 @@ def drain_outbox(path):
     return messages
 
 
+# --------------------------------------------------------- Phone tool calls
+
+def write_tool_result(dirpath, call_id, payload):
+    """Answer one phone.sh call: atomic write-then-rename of `<id>.res`, owned
+    by the agent user so the polling script can unlink it."""
+    try:
+        os.makedirs(dirpath, exist_ok=True)
+        part = os.path.join(dirpath, f".{call_id}.part")
+        with open(part, "w") as f:
+            json.dump(payload, f)
+        try:
+            info = pwd.getpwnam(AGENT_USER)
+            os.chown(part, info.pw_uid, info.pw_gid)
+        except (OSError, KeyError):
+            pass
+        os.replace(part, os.path.join(dirpath, call_id + RESULT_SUFFIX))
+    except OSError as e:
+        log(f"could not deliver tool result {call_id}: {e}")
+
+
+def handle_tool_result(request):
+    """Host relayed the phone's answer for one in-flight tool call. Unknown or
+    late ids (the turn already ended, or the host timed out and answered
+    first) are dropped — the script that asked is no longer polling."""
+    request_id = request.get("request_id", "")
+    with state_lock:
+        dirpath = pending_tool_calls.pop(request_id, None)
+    if dirpath is None:
+        log(f"tool.result for unknown request {request_id!r}; dropped")
+        return
+    write_tool_result(dirpath, request_id, {
+        "ok": bool(request.get("ok")),
+        "output": request.get("output") or "",
+        "user_visible_summary": request.get("user_visible_summary"),
+        "error": request.get("error"),
+    })
+
+
 # ---------------------------------------------------------------- Agent turns
 
 def close_pipes(proc):
@@ -302,19 +365,32 @@ def close_pipes(proc):
             pass
 
 
-def codex_argv(prompt, thread_id):
+def codex_argv(prompt, thread_id, images=()):
     """Argv for one turn, resuming `thread_id` when we have one.
 
     `--cd/-C` is not a clap *global* in the Codex CLI, so it is rejected after
     the `resume` subcommand and the whole turn dies with a usage error. Resumed
     turns get their working root from the process cwd (/workspace) instead,
-    which is the same directory `-C` names on a fresh run.
+    which is the same directory `-C` names on a fresh run. `-i` *is* accepted
+    on both the fresh and resume forms (verified against rust-v0.147.0).
     """
     flags = ["--json", "--skip-git-repo-check",
              "--dangerously-bypass-approvals-and-sandbox"]
+    for image in images:
+        flags += ["-i", image]
     if thread_id:
         return [CODEX_BIN, "exec", "resume", thread_id] + flags + [prompt]
     return [CODEX_BIN, "exec"] + flags + ["-C", WORKSPACE, prompt]
+
+
+def split_attachments(paths):
+    """The image attachments worth handing to `codex -i`: recognized image
+    extension and actually on disk. Everything else (documents, files whose
+    upload never landed) stays prompt-only — the model can still open a listed
+    path with its own tools, but a missing path on `-i` would fail the turn."""
+    return [p for p in paths
+            if os.path.splitext(p)[1].lower() in IMAGE_EXTENSIONS
+            and os.path.exists(p)]
 
 
 def summarize_item(item):
@@ -347,17 +423,21 @@ def run_codex_turn(conn_file, write_lock, request):
     conversation_id = request.get("conversation_id", "default")
     request_id = request.get("request_id", "")
     prompt = request.get("body", {}).get("text", "")
+    attachments = request.get("body", {}).get("attachments") or []
+
+    def emit(obj):
+        with write_lock:
+            send(conn_file, obj)
 
     def delta(text, channel=CHANNEL_TRACE):
-        with write_lock:
-            send(conn_file, {
-                "type": "output.delta",
-                "version": PROTOCOL_VERSION,
-                "request_id": request_id,
-                "conversation_id": conversation_id,
-                "channel": channel,
-                "text": text,
-            })
+        emit({
+            "type": "output.delta",
+            "version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "channel": channel,
+            "text": text,
+        })
 
     def completed(code):
         with state_lock:
@@ -389,30 +469,50 @@ def run_codex_turn(conn_file, write_lock, request):
         return
 
     with conversation_lock(conversation_id):
-        exit_code = execute_codex_turn(conversation_id, prompt, delta)
+        exit_code = execute_codex_turn(conversation_id, prompt, delta,
+                                       attachments=attachments,
+                                       request_id=request_id, emit=emit)
         if exit_code is RETRY_FRESH:
             log("resume failed; retrying with a fresh session")
             forget_thread(conversation_id)
-            exit_code = execute_codex_turn(conversation_id, prompt, delta)
+            exit_code = execute_codex_turn(conversation_id, prompt, delta,
+                                           attachments=attachments,
+                                           request_id=request_id, emit=emit)
             if exit_code is RETRY_FRESH:  # can only happen with a thread id
                 exit_code = 1
     completed(exit_code)
 
 
-def execute_codex_turn(conversation_id, prompt, delta):
+def execute_codex_turn(conversation_id, prompt, delta, attachments=(),
+                       request_id="", emit=None):
     """Run one `codex exec` and stream it. Returns the exit code, or
     RETRY_FRESH when a resumed session never started and the turn is worth
-    retrying without one."""
+    retrying without one. `emit` sends a raw guest→host object (tool.call
+    forwarding); without it, phone tool calls are answered with an immediate
+    failure so the calling script does not sit out its timeout."""
     thread_id = thread_for(conversation_id)
     outbox = outbox_dir(conversation_id)
+    toolcalls = toolcalls_dir(conversation_id)
     try:
         reset_outbox(outbox)
     except OSError as e:
         log(f"outbox unavailable ({e}); falling back to the final agent message")
+    try:
+        reset_dropbox(toolcalls, TOOLCALL_ROOT)
+    except OSError as e:
+        log(f"toolcalls dropbox unavailable ({e}); phone tools disabled this turn")
+
+    if attachments:
+        # The model always gets the paths — for images, -i below additionally
+        # gives it the pixels — so it can re-open any attachment with tools.
+        listing = "\n".join(f"- {p}" for p in attachments)
+        prompt = f"{prompt}\n\n[Attached files from your person's phone:\n{listing}\n]"
 
     try:
-        proc = run_as_agent(codex_argv(prompt, thread_id),
-                            extra_env={"CHARIOT_OUTBOX": outbox},
+        proc = run_as_agent(codex_argv(prompt, thread_id,
+                                       images=split_attachments(attachments)),
+                            extra_env={"CHARIOT_OUTBOX": outbox,
+                                       "CHARIOT_TOOLCALLS": toolcalls},
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except Exception as e:  # noqa: BLE001
         delta(f"[failed to start codex: {e}]\n", CHANNEL_REPLY)
@@ -428,11 +528,55 @@ def execute_codex_turn(conversation_id, prompt, delta):
             replies += 1
             delta(message, CHANNEL_REPLY)
 
+    def flush_toolcalls():
+        # Requests the agent's phone.sh dropped since the last scan. Read and
+        # unlink first: a request must never be forwarded twice.
+        try:
+            names = sorted(n for n in os.listdir(toolcalls)
+                           if n.endswith(REQUEST_SUFFIX))
+        except OSError:
+            return
+        for name in names:
+            full = os.path.join(toolcalls, name)
+            try:
+                with open(full, encoding="utf-8", errors="replace") as f:
+                    raw = f.read()
+                os.unlink(full)
+            except OSError:
+                continue
+            call_id = name[:-len(REQUEST_SUFFIX)]
+            try:
+                call = json.loads(raw)
+                tool_name = call["name"]
+                arguments = call.get("arguments")
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                call_id = call.get("request_id") or call_id
+            except (ValueError, KeyError, TypeError):
+                # Fail the script fast; the filename is the only id we have.
+                write_tool_result(toolcalls, call_id,
+                                  {"ok": False, "output": "",
+                                   "error": "malformed request"})
+                continue
+            if emit is None:
+                write_tool_result(toolcalls, call_id,
+                                  {"ok": False, "output": "",
+                                   "error": "tool channel unavailable"})
+                continue
+            with state_lock:
+                pending_tool_calls[call_id] = toolcalls
+            emit({"type": "tool.call", "version": PROTOCOL_VERSION,
+                  "request_id": call_id, "turn_request_id": request_id,
+                  "conversation_id": conversation_id, "name": tool_name,
+                  "arguments": arguments})
+
     def pump_outbox():
         # Replies reach the phone while the turn is still working, rather than
-        # arriving in one lump at the end.
+        # arriving in one lump at the end — and tool calls only make sense
+        # mid-turn, while their script is still polling.
         while proc.poll() is None:
             flush_outbox()
+            flush_toolcalls()
             time.sleep(OUTBOX_POLL_SECONDS)
 
     pump = threading.Thread(target=pump_outbox, daemon=True)
@@ -471,6 +615,14 @@ def execute_codex_turn(conversation_id, prompt, delta):
     proc.wait()
     pump.join(timeout=OUTBOX_POLL_SECONDS * 8)
     flush_outbox()
+    # Final sweep: a request written in the turn's last instant still goes out
+    # (its answer will be dropped below, but the phone may act on it). Then
+    # drop the calls nobody is polling for anymore — a result arriving after
+    # this would otherwise write into a dead dropbox.
+    flush_toolcalls()
+    with state_lock:
+        for rid in [rid for rid, d in pending_tool_calls.items() if d == toolcalls]:
+            pending_tool_calls.pop(rid, None)
 
     stderr_tail = proc.stderr.read()[-800:] if proc.stderr else ""
     close_pipes(proc)
@@ -681,6 +833,10 @@ def handle_agent_connection(conn):
                     # Inline (not threaded): pack pushes stay ordered ahead of
                     # any conversation.send that follows them.
                     handle_file_put(conn_file, write_lock, request)
+                elif rtype == "tool.result":
+                    # Inline like file.put: just a dropbox write, and the
+                    # polling script is waiting on it.
+                    handle_tool_result(request)
                 elif rtype == "oauth.start":
                     threading.Thread(target=start_login,
                                      args=(conn_file, write_lock), daemon=True).start()

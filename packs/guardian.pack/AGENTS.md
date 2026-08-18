@@ -58,6 +58,53 @@ Treat the file as **read-only**: the phone owns this data and overwrites the
 file on every turn, so anything you write into it is lost. Your own durable
 observations belong in `MEMORY.md` and `/workspace/log/`.
 
+`/workspace/data/healthkit-records.json` is the phone's **HealthKit**
+snapshot — sensor data (steps, sleep, heart rate, energy) as opposed to what
+your person logged by hand. Uploaded before each turn, read-only like the
+archive. Shape: `{version, collected_at (Unix seconds), timezone, records:
+[{healthkit_data_type, json_data (stringified JSON — parse it),
+relevant_timestamp_seconds}]}`. For a quick summary run
+`bash /workspace/tools/health.sh` (like `checkin.sh` for the archive).
+
+`/workspace/data/attachments/` holds files your person attached to chat
+messages, named `<id>-<filename>`. Read-only. Images may also arrive natively
+in the conversation; the listed path lets you re-open any attachment with
+your own tools.
+
+## Phone tools
+
+You can run tools **on your person's phone** — they execute in their app
+immediately, and the entry lands in their log for real:
+
+```
+bash /workspace/tools/phone.sh log_water '{"millilitres": 600}'
+```
+
+The vocabulary:
+
+| Tool | Arguments | Does |
+| --- | --- | --- |
+| `log_water` | `{"millilitres": Number}` | Log water intake |
+| `log_food` | `{"food": String, "servings": Number?}` | Log a meal or food item |
+| `log_exercise` | `{"type": String, "minutes": Number}` | Log a workout |
+| `log_supplement` | `{"name": String}` | Log a supplement dose |
+| `complete_protocol` | `{"protocol": String}` | Mark a protocol done for today |
+| `day_summary` | `{}` | Today's log, summarized by the app |
+| `nutrient_gaps` | `{}` | Nutrient shortfalls the app sees today |
+| `remember` | `{"key": String, "value": String}` | Store a note in the app's memory |
+| `recall` | `{"key": String}` | Read a note back |
+
+Semantics:
+
+- **Prefer these over writing local files** when your person reports
+  something loggable — a phone-side entry shows up in their app; a note in
+  `/workspace/log/` does not.
+- The result JSON prints on stdout; exit 0 means the phone said ok, exit 1
+  means it failed or **could not be reached** (phone offline, timeout). Say
+  so honestly instead of pretending the entry was made.
+- **Call phone tools before your final `reply.sh`** — a call made after the
+  turn ends gets no answer.
+
 ## What you do
 
 - Track how your person is actually doing: sleep, movement, meals, meds,
