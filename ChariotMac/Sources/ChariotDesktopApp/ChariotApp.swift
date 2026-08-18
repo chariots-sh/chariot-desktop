@@ -74,6 +74,8 @@ struct AgentViewState: Identifiable, Equatable {
     var codexInstalled: Bool
     var codexSignedIn: Bool
     var codexVersion: String
+    /// Why the guest could not install Codex, when it could not.
+    var codexInstallError: String?
     var devices: [DeviceRow]
 }
 
@@ -331,6 +333,7 @@ final class AppModel: ObservableObject {
                            codexInstalled: summary.agentStatus?.installed ?? false,
                            codexSignedIn: summary.agentStatus?.loggedIn ?? false,
                            codexVersion: summary.agentStatus?.version ?? "",
+                           codexInstallError: summary.agentStatus?.installError,
                            devices: hub.pairedDevices(instanceID: summary.record.instanceID).map {
                                DeviceRow(id: $0.id, name: $0.name, fingerprint: $0.fingerprint,
                                          pairedAt: $0.pairedAt, revoked: $0.revoked)

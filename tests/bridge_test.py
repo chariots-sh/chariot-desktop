@@ -268,5 +268,56 @@ class SummarizeItemTests(BridgeTestCase):
         self.assertIsNone(bridge.summarize_item({"type": "reasoning", "text": "thinking"}))
 
 
+class CodexInstallTests(unittest.TestCase):
+    """The startup install must survive losing the race with DHCP.
+
+    It used to run once: a first-boot failure left `installed` false for the
+    life of the VM, which disabled the Sign in Codex button, whose only other
+    path to triggering a retry was a chat turn the user could not yet send.
+    Restarting the VM was the sole way out.
+    """
+
+    def setUp(self):
+        self._ensure = bridge.ensure_codex
+        self._installed = bridge.codex_installed
+        self._sleep = bridge.time.sleep
+        bridge.time.sleep = lambda _seconds: None
+
+    def tearDown(self):
+        bridge.ensure_codex = self._ensure
+        bridge.codex_installed = self._installed
+        bridge.time.sleep = self._sleep
+
+    def test_retries_until_the_install_succeeds(self):
+        attempts = []
+        installed = {"value": False}
+
+        def flaky():
+            attempts.append(1)
+            # Fails twice — no route to host while cloud-init configures the
+            # NIC — then succeeds.
+            if len(attempts) < 3:
+                return False
+            installed["value"] = True
+            return True
+
+        bridge.ensure_codex = flaky
+        bridge.codex_installed = lambda: installed["value"]
+
+        bridge.ensure_codex_forever()
+
+        self.assertEqual(len(attempts), 3)
+        self.assertTrue(installed["value"])
+
+    def test_does_nothing_when_already_installed(self):
+        called = []
+        bridge.ensure_codex = lambda: called.append(1) or True
+        bridge.codex_installed = lambda: True
+
+        bridge.ensure_codex_forever()
+
+        self.assertEqual(called, [], "a healthy guest must not re-download")
+
+
 if __name__ == "__main__":
     unittest.main()
