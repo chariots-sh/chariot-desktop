@@ -219,4 +219,48 @@ final class VMController: NSObject, VZVirtualMachineDelegate, @unchecked Sendabl
             }
         }
     }
+
+    // Guest-initiated vsock connections (the model broker): one listener per
+    // host port. Listeners die with the machine; the hub re-installs them on
+    // every start.
+    private var socketListeners: [UInt32: SocketListenerDelegate] = [:]
+
+    func listen(port: UInt32, handler: @escaping @Sendable (VZVirtioSocketConnection) -> Void) {
+        queue.async {
+            guard let vm = self.machine,
+                  let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else { return }
+            let delegate = SocketListenerDelegate(handler: handler)
+            socketDevice.setSocketListener(delegate.listener, forPort: port)
+            self.socketListeners[port] = delegate
+        }
+    }
+
+    func stopListening(port: UInt32) {
+        queue.async {
+            if let vm = self.machine,
+               let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice {
+                socketDevice.removeSocketListener(forPort: port)
+            }
+            self.socketListeners[port] = nil
+        }
+    }
+}
+
+/// Accepts guest-initiated vsock connections and hands each to the handler.
+private final class SocketListenerDelegate: NSObject, VZVirtioSocketListenerDelegate, @unchecked Sendable {
+    let listener = VZVirtioSocketListener()
+    private let handler: @Sendable (VZVirtioSocketConnection) -> Void
+
+    init(handler: @escaping @Sendable (VZVirtioSocketConnection) -> Void) {
+        self.handler = handler
+        super.init()
+        listener.delegate = self
+    }
+
+    func listener(_ listener: VZVirtioSocketListener,
+                  shouldAcceptNewConnection connection: VZVirtioSocketConnection,
+                  from socketDevice: VZVirtioSocketDevice) -> Bool {
+        handler(connection)
+        return true
+    }
 }

@@ -7,15 +7,21 @@ public struct SandboxConfiguration: Codable, Sendable {
     public var memoryBytes: UInt64
     public var diskBytes: UInt64
     public var baseImagePath: String
+    /// Harness to preinstall via cloud-init (HarnessKind rawValue). Persisted
+    /// in configuration.json so Reset rebuilds the same seed; nil = codex
+    /// (configurations written before harness selection existed).
+    public var harness: String?
 
     public init(cpuCount: Int = 2,
                 memoryBytes: UInt64 = 2 * 1024 * 1024 * 1024,
                 diskBytes: UInt64 = 8 * 1024 * 1024 * 1024,
-                baseImagePath: String) {
+                baseImagePath: String,
+                harness: String? = nil) {
         self.cpuCount = cpuCount
         self.memoryBytes = memoryBytes
         self.diskBytes = diskBytes
         self.baseImagePath = baseImagePath
+        self.harness = harness
     }
 }
 

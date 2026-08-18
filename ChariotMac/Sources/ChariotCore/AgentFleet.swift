@@ -14,6 +14,20 @@ public struct AgentRecord: Codable, Sendable, Equatable {
     /// Folder name under `<data-dir>/packs/`, e.g. "guardian.pack".
     public var packDirectoryName: String
     public var createdAt: Date
+    /// Harness + power source chosen at creation. Optional so agents.json
+    /// written before this feature decodes unchanged: nil means the original
+    /// codex-with-ChatGPT shape (see `effectiveHarness`/`effectivePowerSource`).
+    public var harness: HarnessKind?
+    public var powerSource: PowerSourceKind?
+    /// Per-agent model override; nil defers to the app default (local power)
+    /// or the harness default. For chariot power the backend re-resolves per
+    /// call, this is what the harness config names.
+    public var model: String?
+    /// Per-agent local-server override; nil defers to the app default.
+    public var localBaseURL: String?
+
+    public var effectiveHarness: HarnessKind { harness ?? .codex }
+    public var effectivePowerSource: PowerSourceKind { powerSource ?? .chatgpt }
 
     enum CodingKeys: String, CodingKey {
         case instanceID = "instance_id"
@@ -21,6 +35,10 @@ public struct AgentRecord: Codable, Sendable, Equatable {
         case displayName = "display_name"
         case packDirectoryName = "pack_directory"
         case createdAt = "created_at"
+        case harness
+        case powerSource = "power_source"
+        case model
+        case localBaseURL = "local_base_url"
     }
 }
 
@@ -63,6 +81,8 @@ final class AgentContext {
     var replayWindows: [String: ReplayWindow] = [:]
     var loginTunnel: VsockPortForwarder?
     var developerAccess: DeveloperAccess?
+    /// Host-side model endpoint broker for API-powered agents (vsock 8090).
+    var modelBroker: ModelBroker?
     var packInstalled: [String: String] = [:]
 
     init(key: String, record: AgentRecord?, vmInstanceID: SandboxID?,

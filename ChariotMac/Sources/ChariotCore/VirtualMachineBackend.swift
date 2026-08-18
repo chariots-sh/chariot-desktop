@@ -66,7 +66,8 @@ public final class VirtualMachineBackend: SandboxBackend, @unchecked Sendable {
                                            destination: instance.writableDisk,
                                            sizeBytes: configuration.diskBytes)
         ChariotLog.log("instance \(id): building cloud-init seed")
-        try SeedBuilder.createSeedISO(instance: instance, guestResources: paths.guestResources)
+        try SeedBuilder.createSeedISO(instance: instance, guestResources: paths.guestResources,
+                                      harness: configuration.harness.flatMap(HarnessKind.init(rawValue:)) ?? .codex)
         return id
     }
 
@@ -112,7 +113,10 @@ public final class VirtualMachineBackend: SandboxBackend, @unchecked Sendable {
         try SeedBuilder.createWritableDisk(base: URL(fileURLWithPath: configuration.baseImagePath),
                                            destination: instance.writableDisk,
                                            sizeBytes: configuration.diskBytes)
-        try SeedBuilder.createSeedISO(instance: instance, guestResources: paths.guestResources)
+        // The persisted configuration carries the harness, so Reset rebuilds
+        // the same seed the agent was created with.
+        try SeedBuilder.createSeedISO(instance: instance, guestResources: paths.guestResources,
+                                      harness: configuration.harness.flatMap(HarnessKind.init(rawValue:)) ?? .codex)
         ChariotLog.log("instance \(id): reset complete")
     }
 

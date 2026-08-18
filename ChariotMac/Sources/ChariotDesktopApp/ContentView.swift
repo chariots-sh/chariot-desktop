@@ -59,6 +59,7 @@ struct ContentView: View {
                             .padding(.vertical, 2)
                         }
                         Section("system") {
+                            SidebarRow(icon: "person.crop.circle", title: "Chariot Account").tag("chariot")
                             SidebarRow(icon: "network", title: "Tailscale").tag("tailscale")
                             SidebarRow(icon: "list.bullet.rectangle", title: "Activity").tag("log")
                         }
@@ -71,6 +72,7 @@ struct ContentView: View {
             } detail: {
                 Group {
                     switch selection {
+                    case "chariot": ChariotAccountView()
                     case "tailscale": TailscaleView()
                     case "log": ActivityView()
                     case .some(let tag) where tag.hasPrefix("agent:"):
@@ -144,7 +146,14 @@ struct AgentSidebarRow: View {
 
     var subtitle: String {
         guard agent.vmState == .running else { return agent.vmState.rawValue }
-        return agent.codexSignedIn ? "codex signed in" : "codex signed out"
+        switch agent.powerSource {
+        case .chatgpt:
+            return agent.agentReady ? "codex signed in" : "codex signed out"
+        case .chariot:
+            return "\(agent.harness.rawValue) · chariot"
+        case .local:
+            return "\(agent.harness.rawValue) · local"
+        }
     }
 
     var body: some View {
@@ -233,45 +242,142 @@ struct FleetHomeView: View {
 
 struct CreateAgentSheet: View {
     @EnvironmentObject var model: AppModel
+    @State private var selectedPack: String?
+    @State private var harness: HarnessKind = .codex
+    @State private var power: PowerSourceKind = .chatgpt
+    @State private var modelOverride = ""
+    @State private var localBaseURL = ""
+
+    private var chariotSignedIn: Bool {
+        if case .signedIn = model.chariotSignIn { return true }
+        return false
+    }
+
+    /// ChatGPT is codex-only; when the harness changes away from codex, the
+    /// power picker moves off it rather than offering an invalid combination.
+    private var availablePowers: [PowerSourceKind] {
+        harness.supportsChatGPTLogin ? [.chatgpt, .chariot, .local] : [.chariot, .local]
+    }
+
+    private func powerLabel(_ power: PowerSourceKind) -> String {
+        switch power {
+        case .chatgpt: return "ChatGPT sign-in"
+        case .chariot: return "Chariot account"
+        case .local: return "Local model"
+        }
+    }
+
+    private var createBlocker: String? {
+        guard selectedPack != nil else { return "Choose a pack." }
+        if power == .chariot && !chariotSignedIn {
+            return "Sign in to your Chariot account first (sidebar → Chariot Account)."
+        }
+        if power == .local {
+            let base = localBaseURL.isEmpty ? model.localModelDefaultBaseURL : localBaseURL
+            if base.isEmpty { return "Enter a local server URL (e.g. http://127.0.0.1:11434/v1)." }
+            let modelName = modelOverride.isEmpty ? model.localModelDefaultModel : modelOverride
+            if modelName.isEmpty && harness.defaultModel == nil { return "Enter a model name." }
+        }
+        return nil
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             SectionHash(title: "new agent")
-            Text("Create an agent from a pack")
+            Text("Create an agent")
                 .font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.text)
             if model.packs.isEmpty {
                 Text("No packs found in\n\(model.hub?.paths.packsDirectory.path ?? "-")\n\nDrop a pack folder (e.g. guardian.pack) there and reopen this sheet.")
                     .font(Theme.mono(11)).foregroundStyle(Theme.secondary)
             } else {
+                Text("PACK").font(Theme.mono(10)).foregroundStyle(Theme.secondary)
                 ForEach(model.packs) { pack in
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(pack.name).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
-                            Text("\(pack.packID) · v\(pack.version) · \(pack.dir)")
-                                .font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                    Button {
+                        selectedPack = pack.dir
+                    } label: {
+                        HStack {
+                            Image(systemName: selectedPack == pack.dir ? "circle.inset.filled" : "circle")
+                                .foregroundStyle(selectedPack == pack.dir ? Theme.accent : Theme.secondary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(pack.name).font(.system(size: 13, weight: .semibold)).foregroundStyle(Theme.text)
+                                Text("\(pack.packID) · v\(pack.version) · \(pack.dir)")
+                                    .font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                            }
+                            Spacer()
                         }
-                        Spacer()
-                        Button("Create") {
-                            model.createAgent(fromPack: pack.dir)
-                            model.showCreateSheet = false
-                        }
-                        .buttonStyle(AccentButtonStyle())
                     }
-                    .padding(.vertical, 4)
-                    if pack.id != model.packs.last?.id {
-                        Divider().overlay(Theme.border)
+                    .buttonStyle(.plain)
+                    .padding(.vertical, 2)
+                }
+
+                Divider().overlay(Theme.border)
+                Text("HARNESS").font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                Picker("", selection: $harness) {
+                    ForEach(HarnessKind.allCases, id: \.self) { kind in
+                        Text(kind.displayName).tag(kind)
                     }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .onChange(of: harness) {
+                    if !availablePowers.contains(power) { power = .chariot }
+                }
+
+                Text("POWERED BY").font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                Picker("", selection: $power) {
+                    ForEach(availablePowers, id: \.self) { kind in
+                        Text(powerLabel(kind)).tag(kind)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+
+                switch power {
+                case .chatgpt:
+                    Text("You'll sign in with your ChatGPT account after the agent boots; the credential lives only inside its sandbox.")
+                        .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                case .chariot:
+                    Text(chariotSignedIn
+                         ? "Model calls are metered to your Chariot account. Leave the model empty to use your account default."
+                         : "Sign in to your Chariot account first (sidebar → Chariot Account).")
+                        .font(.system(size: 11))
+                        .foregroundStyle(chariotSignedIn ? Theme.secondary : Theme.amber)
+                    TextField("model override (optional, e.g. openai/gpt-mini-latest)", text: $modelOverride)
+                        .textFieldStyle(.roundedBorder).font(Theme.mono(11))
+                case .local:
+                    TextField("server URL — default: \(model.localModelDefaultBaseURL.isEmpty ? "none set" : model.localModelDefaultBaseURL)",
+                              text: $localBaseURL)
+                        .textFieldStyle(.roundedBorder).font(Theme.mono(11))
+                    TextField("model — default: \(model.localModelDefaultModel.isEmpty ? (harness.defaultModel ?? "none set") : model.localModelDefaultModel)",
+                              text: $modelOverride)
+                        .textFieldStyle(.roundedBorder).font(Theme.mono(11))
+                    Text("Point this at any OpenAI-compatible server on your Mac (Ollama, LM Studio, llama-server). The guest reaches it only through the app's broker — it stays bound to localhost.")
+                        .font(.system(size: 11)).foregroundStyle(Theme.secondary)
                 }
             }
             HStack {
+                if let blocker = createBlocker, selectedPack != nil {
+                    Text(blocker).font(Theme.mono(10)).foregroundStyle(Theme.amber)
+                }
                 Spacer()
                 Button("Close") { model.showCreateSheet = false }
                     .buttonStyle(OutlineButtonStyle())
                     .keyboardShortcut(.cancelAction)
+                Button("Create") {
+                    guard let pack = selectedPack else { return }
+                    model.createAgent(fromPack: pack,
+                                      harness: harness,
+                                      powerSource: power,
+                                      model: modelOverride.isEmpty ? nil : modelOverride,
+                                      localBaseURL: localBaseURL.isEmpty ? nil : localBaseURL)
+                    model.showCreateSheet = false
+                }
+                .buttonStyle(AccentButtonStyle())
+                .disabled(createBlocker != nil)
             }
         }
         .padding(24)
-        .frame(width: 460)
+        .frame(width: 520)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
     }
@@ -284,6 +390,8 @@ struct AgentDetailView: View {
     let agentID: String
     @State private var draft = ""
     @State private var showControls = false
+    /// Unsaved model-override edit; nil = showing the persisted value.
+    @State private var modelDraft: String?
 
     var agent: AgentViewState? { model.agent(agentID) }
 
@@ -327,8 +435,13 @@ struct AgentDetailView: View {
             SectionHash(title: agent.name.lowercased())
             Chip(text: agent.vmState.rawValue, color: stateColor)
             if agent.bridgeConnected {
-                Chip(text: agent.codexSignedIn ? "codex signed in" : "codex signed out",
-                     color: agent.codexSignedIn ? Theme.green : Theme.amber)
+                if agent.powerSource == .chatgpt {
+                    Chip(text: agent.agentReady ? "codex signed in" : "codex signed out",
+                         color: agent.agentReady ? Theme.green : Theme.amber)
+                } else {
+                    Chip(text: "\(agent.harness.rawValue) · \(agent.powerSource.rawValue)",
+                         color: agent.agentReady ? Theme.green : Theme.amber)
+                }
             }
             if model.busyAgents.contains(agent.id) { ProgressView().controlSize(.small) }
             Spacer()
@@ -343,13 +456,15 @@ struct AgentDetailView: View {
         .padding(.vertical, 12)
     }
 
-    /// Why Codex sign-in cannot start yet, or nil when it can.
+    /// Why the harness is not usable yet, or nil when it is.
     ///
     /// Ordered the way the agent actually comes up: the VM boots, the vsock
-    /// bridge connects, then cloud-init finishes installing Codex. First boot
-    /// takes roughly 40 seconds, so all three of these are states a user will
-    /// see in normal use rather than error conditions.
+    /// bridge connects, then cloud-init finishes installing the harness.
+    /// First boot takes roughly 40 seconds (longer for npm-installed
+    /// harnesses), so these are states a user will see in normal use rather
+    /// than error conditions.
     private func signInBlocker(_ agent: AgentViewState) -> String? {
+        let harnessName = agent.harness.displayName
         switch agent.vmState {
         case .notCreated, .stopped, .failed:
             return "Press Start first."
@@ -359,20 +474,21 @@ struct AgentDetailView: View {
             return "Waiting for the agent to boot…"
         case .running:
             if !agent.bridgeConnected { return "Waiting for the guest bridge…" }
-            if !agent.codexInstalled {
+            if !agent.agentInstalled {
                 // The guest records why; showing "Installing…" over a failure
                 // that is actually stuck reads as a hang with no explanation.
-                if let error = agent.codexInstallError, !error.isEmpty {
-                    return "Codex install failed, retrying: \(error)"
+                if let error = agent.agentInstallError, !error.isEmpty {
+                    return "\(harnessName) install failed, retrying: \(error)"
                 }
-                return "Installing Codex in the guest…"
+                return "Installing \(harnessName) in the guest…"
             }
             return nil
         }
     }
 
     private func controlsCard(_ agent: AgentViewState) -> some View {
-        Card(title: "sandbox", subtitle: "Pack \(agent.packID) · instance \(agent.id.prefix(8))") {
+        Card(title: "sandbox",
+             subtitle: "Pack \(agent.packID) · \(agent.harness.displayName) · instance \(agent.id.prefix(8))") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Button("Start") { model.startAgent(agent.id) }
@@ -388,32 +504,74 @@ struct AgentDetailView: View {
                         .help("Re-clone the disk and repopulate the workspace from the pack")
                 }
                 Divider().overlay(Theme.border)
-                HStack(spacing: 8) {
-                    if agent.codexSignedIn {
-                        Chip(text: "codex \(agent.codexVersion)", color: Theme.green)
-                    } else if model.signInProgress.contains(agent.id) {
-                        ProgressView().controlSize(.small)
-                        Button("Cancel sign-in") { model.cancelSignIn(agent.id) }
-                            .buttonStyle(OutlineButtonStyle())
-                    } else {
-                        Button("Sign in Codex") { model.signInCodex(agent.id) }
-                            .buttonStyle(AccentButtonStyle())
-                            .disabled(signInBlocker(agent) != nil)
-                        // A greyed-out button still leaves "why?" unanswered,
-                        // and every reason here is temporary — the guest is
-                        // booting, or Codex is still installing. Say which.
-                        if let blocker = signInBlocker(agent) {
-                            Text(blocker)
-                                .font(Theme.mono(11))
-                                .foregroundStyle(Theme.secondary)
-                        }
-                    }
-                    Spacer()
+                if agent.powerSource == .chatgpt {
+                    chatgptRow(agent)
+                    Text("Sign-in uses your ChatGPT account via the browser; the session lives only inside this agent's sandbox and is erased by Reset.")
+                        .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                } else {
+                    powerRow(agent)
                 }
-                Text("Sign-in uses your ChatGPT account via the browser; the session lives only inside this agent's sandbox and is erased by Reset.")
-                    .font(.system(size: 11)).foregroundStyle(Theme.secondary)
             }
         }
+    }
+
+    @ViewBuilder
+    private func chatgptRow(_ agent: AgentViewState) -> some View {
+        HStack(spacing: 8) {
+            if agent.agentReady {
+                Chip(text: "codex \(agent.agentVersion)", color: Theme.green)
+            } else if model.signInProgress.contains(agent.id) {
+                ProgressView().controlSize(.small)
+                Button("Cancel sign-in") { model.cancelSignIn(agent.id) }
+                    .buttonStyle(OutlineButtonStyle())
+            } else {
+                Button("Sign in Codex") { model.signInCodex(agent.id) }
+                    .buttonStyle(AccentButtonStyle())
+                    .disabled(signInBlocker(agent) != nil)
+                // A greyed-out button still leaves "why?" unanswered,
+                // and every reason here is temporary — the guest is
+                // booting, or the harness is still installing. Say which.
+                if let blocker = signInBlocker(agent) {
+                    Text(blocker)
+                        .font(Theme.mono(11))
+                        .foregroundStyle(Theme.secondary)
+                }
+            }
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private func powerRow(_ agent: AgentViewState) -> some View {
+        HStack(spacing: 8) {
+            Chip(text: agent.powerSource == .chariot ? "chariot account" : "local model",
+                 color: agent.agentReady ? Theme.green : Theme.amber)
+            if let blocker = signInBlocker(agent) {
+                Text(blocker).font(Theme.mono(11)).foregroundStyle(Theme.secondary)
+            } else if !agent.agentVersion.isEmpty {
+                Text(agent.agentVersion).font(Theme.mono(11)).foregroundStyle(Theme.secondary)
+            }
+            Spacer()
+        }
+        HStack(spacing: 8) {
+            TextField("model — empty = default", text: Binding(
+                get: { modelDraft ?? agent.model },
+                set: { modelDraft = $0 }))
+                .textFieldStyle(.roundedBorder)
+                .font(Theme.mono(11))
+                .frame(maxWidth: 320)
+            Button("Apply") {
+                model.setAgentModel(agent.id, model: modelDraft ?? agent.model)
+                modelDraft = nil
+            }
+            .buttonStyle(OutlineButtonStyle())
+            .disabled(modelDraft == nil || modelDraft == agent.model)
+            Spacer()
+        }
+        Text(agent.powerSource == .chariot
+             ? "Model calls run through your Chariot account's metered proxy; the token stays on this Mac. A model change applies from the agent's next start."
+             : "Model calls go to your local server through the app's broker. A model change applies from the agent's next start.")
+            .font(.system(size: 11)).foregroundStyle(Theme.secondary)
     }
 
     private func devicesCard(_ agent: AgentViewState) -> some View {
@@ -551,6 +709,83 @@ struct AgentDetailView: View {
         guard !text.isEmpty else { return }
         draft = ""
         model.sendPrompt(text, to: agentID)
+    }
+}
+
+// MARK: - Chariot account
+
+struct ChariotAccountView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Page(hash: "chariot", title: "Chariot Account") {
+            Card(title: "account",
+                 subtitle: "Powers agents through the Chariot model proxy, metered to your account") {
+                VStack(alignment: .leading, spacing: 10) {
+                    switch model.chariotSignIn {
+                    case .signedOut:
+                        Text("Not signed in. Agents created with the Chariot power source need this account link.")
+                            .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                        Button("Sign in to Chariot") { model.chariotAccountSignIn() }
+                            .buttonStyle(AccentButtonStyle())
+                    case .pending(let approveURL):
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Waiting for browser approval…")
+                                .font(.system(size: 12)).foregroundStyle(Theme.secondary)
+                        }
+                        Text(approveURL)
+                            .font(Theme.mono(10)).foregroundStyle(Theme.green)
+                            .textSelection(.enabled)
+                        HStack {
+                            Button("Reopen approval page") {
+                                if let url = URL(string: approveURL) { NSWorkspace.shared.open(url) }
+                            }
+                            .buttonStyle(OutlineButtonStyle())
+                            Button("Start over") { model.chariotAccountSignIn() }
+                                .buttonStyle(OutlineButtonStyle())
+                        }
+                    case .signedIn(let email):
+                        HStack(spacing: 8) {
+                            Chip(text: "signed in", color: Theme.green)
+                            Text(email ?? "")
+                                .font(Theme.mono(12)).foregroundStyle(Theme.text)
+                            Spacer()
+                            Button("Sign out") { model.chariotAccountSignOut() }
+                                .buttonStyle(OutlineButtonStyle())
+                        }
+                        Text("New chariot-powered agents register under this account; each gets its own metered proxy token, stored only on this Mac.")
+                            .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                    case .failed(let message):
+                        Text(message).font(.system(size: 12)).foregroundStyle(Theme.red)
+                        Button("Try again") { model.chariotAccountSignIn() }
+                            .buttonStyle(AccentButtonStyle())
+                    }
+                }
+            }
+
+            Card(title: "local model defaults",
+                 subtitle: "Used by local-powered agents that don't set their own server or model") {
+                VStack(alignment: .leading, spacing: 8) {
+                    TextField("server URL, e.g. http://127.0.0.1:11434/v1",
+                              text: $model.localModelDefaultBaseURL)
+                        .textFieldStyle(.roundedBorder).font(Theme.mono(11))
+                    TextField("model, e.g. muse-glimmer:30b",
+                              text: $model.localModelDefaultModel)
+                        .textFieldStyle(.roundedBorder).font(Theme.mono(11))
+                    HStack(spacing: 8) {
+                        Button("Save") { model.saveLocalModelDefaults() }
+                            .buttonStyle(AccentButtonStyle())
+                        Button("Test connection") { model.testLocalModelServer() }
+                            .buttonStyle(OutlineButtonStyle())
+                        Spacer()
+                        Text(model.statusLine).font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                    }
+                    Text("Run any OpenAI-compatible server (Ollama, LM Studio, llama-server). It can stay bound to localhost — guests reach it only through the app's vsock broker.")
+                        .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                }
+            }
+        }
     }
 }
 
