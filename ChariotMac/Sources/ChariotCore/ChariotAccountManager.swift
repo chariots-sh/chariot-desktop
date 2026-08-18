@@ -98,6 +98,9 @@ public final class ChariotAccountManager: @unchecked Sendable {
 
     /// Register a chariot-powered desktop agent and persist its proxy token
     /// into the instance directory (0600). Fails fast when signed out.
+    /// Registration runs before the VM instance exists, so the directory is
+    /// created here — losing the token to a missing directory would leak the
+    /// just-minted backend row.
     public func registerAgent(displayName: String, instanceDirectory: URL) async throws -> ChariotAgentCredential {
         guard let credential = credential() else {
             throw ChariotAccountClient.ClientError.notSignedIn
@@ -106,8 +109,26 @@ public final class ChariotAccountManager: @unchecked Sendable {
         // free-form, so register unnamed rather than surprise-failing.
         let name = Self.backendName(from: displayName)
         let agent = try await client.registerExternalAgent(credential: credential, name: name)
-        try agent.save(to: InstancePaths(directory: instanceDirectory).chariotCredential)
+        do {
+            try FileManager.default.createDirectory(at: instanceDirectory,
+                                                    withIntermediateDirectories: true)
+            try agent.save(to: InstancePaths(directory: instanceDirectory).chariotCredential)
+        } catch {
+            // The token is gone if we can't persist it; release the backend
+            // row rather than stranding a registration nothing can use.
+            try? await client.deleteAgent(credential: credential, agentID: agent.agentID)
+            throw error
+        }
         return agent
+    }
+
+    /// Best-effort deregistration for a creation that failed after the
+    /// backend row was minted (e.g. the disk clone threw).
+    public func deregisterAgent(instanceDirectory: URL) async {
+        guard let credential = credential(),
+              let agent = ChariotAgentCredential.load(
+                from: InstancePaths(directory: instanceDirectory).chariotCredential) else { return }
+        try? await client.deleteAgent(credential: credential, agentID: agent.agentID)
     }
 
     /// Mirror a model override onto the backend row (the proxy re-resolves

@@ -308,7 +308,16 @@ public final class ChariotHub: @unchecked Sendable {
         }
         var configuration = pack.configuration(baseImagePath: baseImage)
         configuration.harness = harness.rawValue
-        _ = try await backend.createInstance(configuration: configuration, id: instanceID)
+        do {
+            _ = try await backend.createInstance(configuration: configuration, id: instanceID)
+        } catch {
+            // Creation failed after the backend row was minted: release it
+            // (best-effort) instead of stranding a metered registration.
+            if powerSource == .chariot {
+                await account.deregisterAgent(instanceDirectory: instance.directory)
+            }
+            throw error
+        }
         synchronized {
             agentIndex.append(record)
             contexts[instanceID] = AgentContext(key: instanceID,

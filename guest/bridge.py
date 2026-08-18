@@ -177,6 +177,19 @@ def power_source(cfg=None):
     return cfg.get("power_source", "chatgpt")
 
 
+def configured_model(cfg):
+    """The model string rendered into harness-native configs.
+
+    Chariot power needs no explicit choice: the proxy re-resolves the model
+    per call server-side (agent override → account default → server default),
+    so a placeholder keeps config schemas satisfied without inventing a fake
+    local answer. Local power has no server to defer to."""
+    model = cfg.get("model", "")
+    if model:
+        return model
+    return "chariot-default" if power_source(cfg) == "chariot" else ""
+
+
 def configured_harness_name():
     """The harness this guest runs: the pushed config wins, else the seed's
     /etc/chariot/harness marker, else codex (pre-harness guests)."""
@@ -407,10 +420,12 @@ class Harness:
     # -- readiness / config ------------------------------------------------
     def ready(self, cfg):
         """(ok, reason). API-powered harnesses are ready once configured;
-        chatgpt-codex additionally needs its OAuth credential."""
+        chatgpt-codex additionally needs its OAuth credential. Only local
+        power requires an explicit model — the chariot proxy resolves one
+        server-side per call."""
         if power_source(cfg) == "chatgpt":
             return (False, f"{self.name} does not support ChatGPT sign-in")
-        if not cfg.get("model") and self.name != "codex":
+        if not configured_model(cfg) and self.name != "codex":
             return (False, "no model configured — set one on the Mac")
         return (True, "")
 
@@ -526,7 +541,7 @@ class CodexHarness(Harness):
         if power_source(cfg) == "chatgpt":
             return  # ChatGPT flow: codex manages ~/.codex itself after login.
         wire = "responses"
-        model = cfg.get("model", "")
+        model = configured_model(cfg)
         config_dir = os.path.join(agent_home(), ".codex")
         os.makedirs(config_dir, exist_ok=True)
         chown_to_agent(config_dir)
@@ -725,7 +740,7 @@ fallback = "custom:{base_url}"
 
 [providers.models."custom:{base_url}"]
 api_key = {json.dumps(cfg.get("api_key", "chariot-broker"))}
-model = {json.dumps(cfg.get("model", ""))}
+model = {json.dumps(configured_model(cfg))}
 
 [autonomy]
 level = "full"
@@ -879,7 +894,7 @@ class OpenclawHarness(Harness):
         key doubles as the gateway token, exactly as the backend image uses
         the agent token)."""
         base_url = cfg.get("base_url", BROKER_BASE_URL)
-        model = cfg.get("model", "")
+        model = configured_model(cfg)
         token = cfg.get("api_key", "chariot-broker")
         config = {
             "models": {
@@ -1111,7 +1126,7 @@ class HermesHarness(Harness):
         with open(path, "w") as f:
             f.write("# Rendered by the Chariot bridge from agent.configure.\n"
                     "model:\n"
-                    f"  default: {json.dumps(cfg.get('model', ''))}\n"
+                    f"  default: {json.dumps(configured_model(cfg))}\n"
                     "  provider: custom\n"
                     f"  base_url: {json.dumps(cfg.get('base_url', BROKER_BASE_URL))}\n"
                     "  context_length: 128000\n")
@@ -1130,7 +1145,7 @@ class HermesHarness(Harness):
             extra_env={
                 "CHARIOT_BASE_URL": cfg.get("base_url", BROKER_BASE_URL),
                 "CHARIOT_API_KEY": cfg.get("api_key", "chariot-broker"),
-                "CHARIOT_MODEL": cfg.get("model", ""),
+                "CHARIOT_MODEL": configured_model(cfg),
                 "CHARIOT_HISTORY_FILE": history,
                 **turn_env,
             },
@@ -1198,7 +1213,7 @@ class MuseHarness(Harness):
             # Responses endpoint are surfaced by the M6 matrix (plan risk).
             "--provider", "meta",
             "--base-url", cfg.get("base_url", BROKER_BASE_URL),
-            "--model", cfg.get("model", ""),
+            "--model", configured_model(cfg),
             "--api-key-stdin",
             "--disable-approval",
             "--disable-sandbox",
