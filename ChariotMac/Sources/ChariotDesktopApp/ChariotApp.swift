@@ -71,11 +71,16 @@ struct AgentViewState: Identifiable, Equatable {
     var packDir: String
     var vmState: SandboxState
     var bridgeConnected: Bool
-    var codexInstalled: Bool
-    var codexSignedIn: Bool
-    var codexVersion: String
-    /// Why the guest could not install Codex, when it could not.
-    var codexInstallError: String?
+    var harness: HarnessKind
+    var powerSource: PowerSourceKind
+    /// Per-agent model override ("" = default chain).
+    var model: String
+    var agentInstalled: Bool
+    /// ChatGPT-codex: signed in. API-powered: configured and ready.
+    var agentReady: Bool
+    var agentVersion: String
+    /// Why the guest could not install the harness, when it could not.
+    var agentInstallError: String?
     var devices: [DeviceRow]
 }
 
@@ -116,6 +121,11 @@ final class AppModel: ObservableObject {
     /// Blocks the main UI until the guest base image is on disk.
     @Published var needsBaseImage = false
     @Published var setupPhase: SetupPhase = .idle
+
+    // Chariot account + local model defaults (Settings page).
+    @Published var chariotSignIn: ChariotAccountManager.SignInState = .signedOut
+    @Published var localModelDefaultBaseURL = ""
+    @Published var localModelDefaultModel = ""
 
     private(set) var hub: ChariotHub?
     private(set) var updater: UpdaterController!
@@ -330,22 +340,29 @@ final class AppModel: ObservableObject {
                            packDir: summary.record.packDirectoryName,
                            vmState: summary.vmState,
                            bridgeConnected: summary.bridgeConnected,
-                           codexInstalled: summary.agentStatus?.installed ?? false,
-                           codexSignedIn: summary.agentStatus?.loggedIn ?? false,
-                           codexVersion: summary.agentStatus?.version ?? "",
-                           codexInstallError: summary.agentStatus?.installError,
+                           harness: summary.record.effectiveHarness,
+                           powerSource: summary.record.effectivePowerSource,
+                           model: summary.record.model ?? "",
+                           agentInstalled: summary.agentStatus?.installed ?? false,
+                           agentReady: summary.agentStatus?.loggedIn ?? false,
+                           agentVersion: summary.agentStatus?.version ?? "",
+                           agentInstallError: summary.agentStatus?.installError,
                            devices: hub.pairedDevices(instanceID: summary.record.instanceID).map {
                                DeviceRow(id: $0.id, name: $0.name, fingerprint: $0.fingerprint,
                                          pairedAt: $0.pairedAt, revoked: $0.revoked)
                            })
         }
-        for agent in agents where agent.codexSignedIn {
+        for agent in agents where agent.agentReady {
             signInProgress.remove(agent.id)
         }
         packs = PackLoader.availablePacks(in: hub.paths.packsDirectory).map {
             PackRow(dir: $0.directoryName, packID: $0.manifest.id,
                     name: $0.manifest.name, version: $0.manifest.version)
         }
+        chariotSignIn = hub.account.signInState
+        let localDefaults = hub.account.hostSettings().localModel
+        localModelDefaultBaseURL = localDefaults?.baseURL ?? ""
+        localModelDefaultModel = localDefaults?.model ?? ""
     }
 
     func agent(_ id: String) -> AgentViewState? {
@@ -354,18 +371,98 @@ final class AppModel: ObservableObject {
 
     // MARK: Fleet actions
 
-    func createAgent(fromPack dir: String) {
+    func createAgent(fromPack dir: String,
+                     harness: HarnessKind = .codex,
+                     powerSource: PowerSourceKind = .chatgpt,
+                     model: String? = nil,
+                     localBaseURL: String? = nil) {
         guard let hub else { return }
         statusLine = "Creating agent from \(dir)…"
         Task {
             do {
-                let record = try await hub.createAgent(fromPackDirectory: dir)
+                let record = try await hub.createAgent(fromPackDirectory: dir,
+                                                       harness: harness,
+                                                       powerSource: powerSource,
+                                                       model: model,
+                                                       localBaseURL: localBaseURL)
                 await MainActor.run {
                     self.statusLine = "\(record.displayName) created — press Start to boot it."
                     self.refresh()
                 }
             } catch {
                 await MainActor.run { self.errorMessage = "Create failed: \(error)" }
+            }
+        }
+    }
+
+    func setAgentModel(_ agentID: String, model: String) {
+        guard let hub else { return }
+        let value = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task {
+            do {
+                try await hub.setAgentModel(agentID, model: value.isEmpty ? nil : value)
+                await MainActor.run { self.refresh() }
+            } catch {
+                await MainActor.run { self.errorMessage = "Model change failed: \(error)" }
+            }
+        }
+    }
+
+    // MARK: Chariot account
+
+    func chariotAccountSignIn() {
+        guard let hub else { return }
+        Task {
+            do {
+                let approveURL = try await hub.account.startSignIn()
+                _ = await MainActor.run { NSWorkspace.shared.open(approveURL) }
+                await MainActor.run { self.refresh() }
+            } catch {
+                await MainActor.run { self.errorMessage = "Chariot sign-in failed: \(error)" }
+            }
+        }
+    }
+
+    func chariotAccountSignOut() {
+        hub?.account.signOut()
+        refresh()
+    }
+
+    func saveLocalModelDefaults() {
+        guard let hub else { return }
+        do {
+            let base = localModelDefaultBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            let model = localModelDefaultModel.trimmingCharacters(in: .whitespacesAndNewlines)
+            try hub.account.setLocalModelDefaults(baseURL: base.isEmpty ? nil : base,
+                                                  model: model.isEmpty ? nil : model)
+            statusLine = "Local model defaults saved."
+        } catch {
+            errorMessage = "Could not save local model defaults: \(error)"
+        }
+    }
+
+    /// Probe the configured local server's /models from the host — a quick
+    /// "is Ollama actually up" check for the Settings page.
+    func testLocalModelServer() {
+        let base = localModelDefaultBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: base)?.appendingPathComponent("models") else {
+            errorMessage = "Enter a base URL first (e.g. http://127.0.0.1:11434/v1)."
+            return
+        }
+        statusLine = "Checking \(base)…"
+        Task {
+            do {
+                let (_, response) = try await URLSession.shared.data(from: url)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                await MainActor.run {
+                    self.statusLine = code == 200
+                        ? "Local model server is reachable."
+                        : "Local server answered HTTP \(code)."
+                }
+            } catch {
+                await MainActor.run {
+                    self.statusLine = "Local server unreachable: \(error.localizedDescription)"
+                }
             }
         }
     }
