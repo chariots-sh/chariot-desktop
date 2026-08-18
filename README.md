@@ -147,6 +147,22 @@ guardian.pack/
   sent raw or as raw DEFLATE (`"encoding": "deflate"`); the hub inflates
   before the guest sees the file. This is how the A-LIST locomo Guardian
   keeps `/workspace/data/alist-archive.json` fresh before every turn.
+- **Chat attachments**: `conversation.send` takes an optional
+  `attachments: [String]` — guest paths under `/workspace/data/attachments/`
+  the phone uploaded via `file.write` before the message. The hub drops any
+  path outside `/workspace` (or containing `..`) and forwards the rest; the
+  guest hands image attachments to `codex exec -i` (the model gets pixels)
+  and lists every path in the prompt so the agent can open them with tools.
+- **Phone tool calls** (reverse RPC): a turn can run a tool on the paired
+  phone via the pack's `tools/phone.sh` — the guest bridge forwards the
+  request as a `tool.call` envelope (`{request_id, name, arguments, turn_id,
+  expires_at}`) to the phone that started the turn, and the phone answers
+  with `tool.result` (`{request_id, ok, output, user_visible_summary?,
+  error?}`), which flows back into the still-running turn. `expires_at`
+  (Unix seconds) lets a phone that receives the call late — envelopes are
+  queued durably — drop it instead of executing a stale action; the Mac
+  times out at 25s and answers the guest with an error itself, inside the
+  script's own 30s ceiling.
 - **Replies are deliberate**: a turn's transcript — commands, their output,
   the agent's mid-turn thinking — is `trace`, and stays on the Mac. Only what
   the agent writes through its pack's `tools/reply.sh` is `reply`, and only

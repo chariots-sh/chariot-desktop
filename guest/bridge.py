@@ -81,10 +81,24 @@ OUTBOX_ROOT = os.path.join(WORKSPACE, ".chariot", "outbox")
 MESSAGE_SUFFIX = ".msg"
 OUTBOX_POLL_SECONDS = 0.25
 
+# Drop box for phone tool calls (see packs/*/tools/phone.sh): the agent writes
+# `<id>.req`, the host answers on the phone, and the result comes back as
+# `<id>.res` for the polling script. Same rename-into-place discipline as the
+# outbox. Harness-agnostic — the pump lives in the shared turn runner.
+TOOLCALL_ROOT = os.path.join(WORKSPACE, ".chariot", "toolcalls")
+REQUEST_SUFFIX = ".req"
+RESULT_SUFFIX = ".res"
+
+# Attachment images ride `codex exec -i` so the model gets pixels; anything
+# else is referenced by path in the prompt only. Non-codex harnesses get the
+# prompt listing alone.
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp"}
+
 start_time = time.time()
 state_lock = threading.Lock()
 cancel_procs = {}          # conversation_id -> subprocess.Popen
 conversation_locks = {}    # conversation_id -> threading.Lock
+pending_tool_calls = {}    # request_id -> toolcalls dir awaiting a .res
 login_proc = None
 
 # Sentinel: the resumed session was unusable, so run the turn again fresh.
@@ -244,19 +258,22 @@ def forget_session(conversation_id):
 
 # ------------------------------------------------------------------- Outbox
 
-def outbox_dir(conversation_id):
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", conversation_id or "") or "default"
-    return os.path.join(OUTBOX_ROOT, safe)
-
-
 def safe_conversation_name(conversation_id):
     return re.sub(r"[^A-Za-z0-9._-]", "_", conversation_id or "") or "default"
 
 
-def reset_outbox(path):
-    """Empty drop box owned by the agent user, ready for one turn's replies."""
+def outbox_dir(conversation_id):
+    return os.path.join(OUTBOX_ROOT, safe_conversation_name(conversation_id))
+
+
+def toolcalls_dir(conversation_id):
+    return os.path.join(TOOLCALL_ROOT, safe_conversation_name(conversation_id))
+
+
+def reset_dropbox(path, root):
+    """Empty drop box owned by the agent user, ready for one turn."""
     os.makedirs(path, exist_ok=True)
-    for directory in (os.path.dirname(OUTBOX_ROOT), OUTBOX_ROOT, path):
+    for directory in (os.path.dirname(root), root, path):
         try:
             info = pwd.getpwnam(AGENT_USER)
             os.chown(directory, info.pw_uid, info.pw_gid)
@@ -268,6 +285,11 @@ def reset_outbox(path):
             os.unlink(os.path.join(path, name))
         except OSError:
             pass
+
+
+def reset_outbox(path):
+    """Empty drop box owned by the agent user, ready for one turn's replies."""
+    reset_dropbox(path, OUTBOX_ROOT)
 
 
 def drain_outbox(path):
@@ -289,6 +311,54 @@ def drain_outbox(path):
         if text.strip():
             messages.append(text if text.endswith("\n") else text + "\n")
     return messages
+
+
+# --------------------------------------------------------- Phone tool calls
+
+def write_tool_result(dirpath, call_id, payload):
+    """Answer one phone.sh call: atomic write-then-rename of `<id>.res`, owned
+    by the agent user so the polling script can unlink it."""
+    try:
+        os.makedirs(dirpath, exist_ok=True)
+        part = os.path.join(dirpath, f".{call_id}.part")
+        with open(part, "w") as f:
+            json.dump(payload, f)
+        try:
+            info = pwd.getpwnam(AGENT_USER)
+            os.chown(part, info.pw_uid, info.pw_gid)
+        except (OSError, KeyError):
+            pass
+        os.replace(part, os.path.join(dirpath, call_id + RESULT_SUFFIX))
+    except OSError as e:
+        log(f"could not deliver tool result {call_id}: {e}")
+
+
+def handle_tool_result(request):
+    """Host relayed the phone's answer for one in-flight tool call. Unknown or
+    late ids (the turn already ended, or the host timed out and answered
+    first) are dropped — the script that asked is no longer polling."""
+    request_id = request.get("request_id", "")
+    with state_lock:
+        dirpath = pending_tool_calls.pop(request_id, None)
+    if dirpath is None:
+        log(f"tool.result for unknown request {request_id!r}; dropped")
+        return
+    write_tool_result(dirpath, request_id, {
+        "ok": bool(request.get("ok")),
+        "output": request.get("output") or "",
+        "user_visible_summary": request.get("user_visible_summary"),
+        "error": request.get("error"),
+    })
+
+
+def split_attachments(paths):
+    """The image attachments worth handing to `codex -i`: recognized image
+    extension and actually on disk. Everything else (documents, files whose
+    upload never landed) stays prompt-only — the model can still open a listed
+    path with its own tools, but a missing path on `-i` would fail the turn."""
+    return [p for p in paths
+            if os.path.splitext(p)[1].lower() in IMAGE_EXTENSIONS
+            and os.path.exists(p)]
 
 
 def close_pipes(proc):
@@ -351,13 +421,16 @@ class Harness:
         return False
 
     # -- turns -------------------------------------------------------------
-    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc, outbox):
+    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc,
+                     turn_env, attachments=()):
         """Run one turn. Returns an exit code, or RETRY_FRESH when a resumed
         session was unusable and the turn should re-run fresh. `delta` streams
-        output (trace by default); the generic runner handles the outbox pump
-        and the reply fallback via `self.last_agent_message`. `outbox` must be
-        exported to the harness process as CHARIOT_OUTBOX so packs'
-        tools/reply.sh works identically on every runtime."""
+        output (trace by default); the generic runner handles the outbox and
+        tool-call pumps and the reply fallback via `self.last_agent_message`.
+        `turn_env` (CHARIOT_OUTBOX + CHARIOT_TOOLCALLS) must reach the harness
+        process so packs' tools/reply.sh and tools/phone.sh work identically
+        on every runtime. `attachments` are already framed into the prompt by
+        the runner; codex additionally feeds image pixels via `-i`."""
         raise NotImplementedError
 
     # Set by execute_turn: the text used as a reply when the agent never
@@ -473,16 +546,20 @@ wire_api = {json.dumps(wire)}
 """)
         chown_to_agent(path)
 
-    def argv(self, prompt, session_id):
+    def argv(self, prompt, session_id, images=()):
         """Argv for one turn, resuming `session_id` when we have one.
 
         `--cd/-C` is not a clap *global* in the Codex CLI, so it is rejected
         after the `resume` subcommand and the whole turn dies with a usage
         error. Resumed turns get their working root from the process cwd
         (/workspace) instead, which is the same directory `-C` names fresh.
+        `-i` *is* accepted on both the fresh and resume forms (verified
+        against rust-v0.147.0).
         """
         flags = ["--json", "--skip-git-repo-check",
                  "--dangerously-bypass-approvals-and-sandbox"]
+        for image in images:
+            flags += ["-i", image]
         if session_id:
             return [self.BIN, "exec", "resume", session_id] + flags + [prompt]
         return [self.BIN, "exec"] + flags + ["-C", WORKSPACE, prompt]
@@ -513,16 +590,19 @@ wire_api = {json.dumps(wire)}
             return f"[error: {item.get('message', 'unknown')}]\n"
         return None  # reasoning, todo lists, etc. stay quiet
 
-    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc, outbox):
+    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc,
+                     turn_env, attachments=()):
         """One `codex exec`, streamed. Codex is the only harness that streams
         its transcript as trace deltas; the others collect at the end."""
         self.last_agent_message = None
         session_id = session_for(self.name, conversation_id)
-        extra_env = {"CHARIOT_OUTBOX": outbox}
+        extra_env = dict(turn_env)
         if power_source(cfg) != "chatgpt":
             extra_env["CHARIOT_API_KEY"] = cfg.get("api_key", "chariot-broker")
         try:
-            proc = run_as_agent(self.argv(prompt, session_id), extra_env=extra_env,
+            proc = run_as_agent(self.argv(prompt, session_id,
+                                          images=split_attachments(attachments)),
+                                extra_env=extra_env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except Exception as e:  # noqa: BLE001
             delta(f"[failed to start codex: {e}]\n", CHANNEL_REPLY)
@@ -669,7 +749,8 @@ provider = "duckduckgo"
 """)
         chown_to_agent(path)
 
-    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc, outbox):
+    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc,
+                     turn_env, attachments=()):
         self.last_agent_message = None
         sessions_dir = os.path.join(agent_home(), "chariot", "zeroclaw-sessions")
         os.makedirs(sessions_dir, exist_ok=True)
@@ -686,8 +767,7 @@ provider = "duckduckgo"
              "--config-dir", os.path.join(agent_home(), ".zeroclaw"),
              "--session-state-file", session_file],
             extra_env={"ZEROCLAW_WORKSPACE": WORKSPACE,
-                       "ZEROCLAW_DATA_DIR": agent_home(),
-                       "CHARIOT_OUTBOX": outbox},
+                       "ZEROCLAW_DATA_DIR": agent_home(), **turn_env},
             stdin_text=f"{flattened}\n/exit\n",
             register_proc=register_proc)
         cleaned = self._clean_stdout(stdout)
@@ -736,12 +816,12 @@ class OpenclawHarness(Harness):
         super().__init__()
         self._gateway = None
 
-    def _ensure_gateway(self, outbox):
+    def _ensure_gateway(self, turn_env):
         with state_lock:
             if self._gateway is not None and self._gateway.poll() is None:
                 return
         proc = run_as_agent(["openclaw", "gateway"],
-                            extra_env={"CHARIOT_OUTBOX": outbox},
+                            extra_env=dict(turn_env),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with state_lock:
             self._gateway = proc
@@ -865,13 +945,14 @@ class OpenclawHarness(Harness):
                     return "\n\n".join(texts).strip()
         return ""
 
-    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc, outbox):
+    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc,
+                     turn_env, attachments=()):
         self.last_agent_message = None
-        self._ensure_gateway(outbox)
+        self._ensure_gateway(turn_env)
         session = "chariot-" + safe_conversation_name(conversation_id)
         code, stdout, stderr = self.run_collected(
             ["openclaw", "agent", "--session-id", session, "--message", prompt, "--json"],
-            extra_env={"CHARIOT_OUTBOX": outbox},
+            extra_env=dict(turn_env),
             register_proc=register_proc)
         reply = ""
         if stdout.strip():
@@ -1036,7 +1117,8 @@ class HermesHarness(Harness):
                     "  context_length: 128000\n")
         chown_to_agent(path)
 
-    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc, outbox):
+    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc,
+                     turn_env, attachments=()):
         self.last_agent_message = None
         history_dir = os.path.join(agent_home(), "chariot", "hermes-history")
         os.makedirs(history_dir, exist_ok=True)
@@ -1050,7 +1132,7 @@ class HermesHarness(Harness):
                 "CHARIOT_API_KEY": cfg.get("api_key", "chariot-broker"),
                 "CHARIOT_MODEL": cfg.get("model", ""),
                 "CHARIOT_HISTORY_FILE": history,
-                "CHARIOT_OUTBOX": outbox,
+                **turn_env,
             },
             stdin_text=prompt,
             register_proc=register_proc)
@@ -1144,7 +1226,8 @@ class MuseHarness(Harness):
             text = payload.get("text") if isinstance(payload.get("text"), str) else ""
         return (text or "").strip(), terminal
 
-    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc, outbox):
+    def execute_turn(self, conversation_id, prompt, cfg, delta, register_proc,
+                     turn_env, attachments=()):
         self.last_agent_message = None
         session_id = session_for(self.name, conversation_id)
         resuming = bool(session_id)
@@ -1158,7 +1241,7 @@ class MuseHarness(Harness):
         try:
             code, stdout, stderr = self.run_collected(
                 self.argv(session_id, prompt_path, cfg),
-                extra_env={"CHARIOT_OUTBOX": outbox},
+                extra_env=dict(turn_env),
                 stdin_text=cfg.get("api_key", "chariot-broker") + "\n",
                 register_proc=register_proc)
             if code != 0 and resuming:
@@ -1272,19 +1355,23 @@ def run_agent_turn(conn_file, write_lock, request):
     conversation_id = request.get("conversation_id", "default")
     request_id = request.get("request_id", "")
     prompt = request.get("body", {}).get("text", "")
+    attachments = request.get("body", {}).get("attachments") or []
     adapter = current_adapter()
     cfg = read_config()
 
-    def delta(text, channel=CHANNEL_TRACE):
+    def emit(obj):
         with write_lock:
-            send(conn_file, {
-                "type": "output.delta",
-                "version": PROTOCOL_VERSION,
-                "request_id": request_id,
-                "conversation_id": conversation_id,
-                "channel": channel,
-                "text": text,
-            })
+            send(conn_file, obj)
+
+    def delta(text, channel=CHANNEL_TRACE):
+        emit({
+            "type": "output.delta",
+            "version": PROTOCOL_VERSION,
+            "request_id": request_id,
+            "conversation_id": conversation_id,
+            "channel": channel,
+            "text": text,
+        })
 
     def completed(code):
         with state_lock:
@@ -1317,26 +1404,46 @@ def run_agent_turn(conn_file, write_lock, request):
         return
 
     with conversation_lock(conversation_id):
-        exit_code = execute_turn(adapter, conversation_id, prompt, cfg, delta)
+        exit_code = execute_turn(adapter, conversation_id, prompt, cfg, delta,
+                                 attachments=attachments,
+                                 request_id=request_id, emit=emit)
         if exit_code is RETRY_FRESH:
             log("resume failed; retrying with a fresh session")
             forget_session(conversation_id)
-            exit_code = execute_turn(adapter, conversation_id, prompt, cfg, delta)
+            exit_code = execute_turn(adapter, conversation_id, prompt, cfg, delta,
+                                     attachments=attachments,
+                                     request_id=request_id, emit=emit)
             if exit_code is RETRY_FRESH:  # can only happen with a session id
                 exit_code = 1
     completed(exit_code)
 
 
-def execute_turn(adapter, conversation_id, prompt, cfg, delta):
-    """One harness turn wrapped in the shared reply contract: the outbox is
-    reset and pumped for the duration (replies reach the phone mid-turn), and
-    a turn that never used its reply tool falls back to the harness's last
-    agent message rather than silence."""
+def execute_turn(adapter, conversation_id, prompt, cfg, delta,
+                 attachments=(), request_id="", emit=None):
+    """One harness turn wrapped in the shared reply contract: the outbox and
+    tool-call drop boxes are reset and pumped for the duration (replies reach
+    the phone mid-turn; phone tool calls only make sense mid-turn, while
+    their script still polls), and a turn that never used its reply tool
+    falls back to the harness's last agent message rather than silence.
+    `emit` sends a raw guest→host object (tool.call forwarding); without it,
+    phone tool calls are answered with an immediate failure so the calling
+    script does not sit out its timeout."""
     outbox = outbox_dir(conversation_id)
+    toolcalls = toolcalls_dir(conversation_id)
     try:
         reset_outbox(outbox)
     except OSError as e:
         log(f"outbox unavailable ({e}); falling back to the final agent message")
+    try:
+        reset_dropbox(toolcalls, TOOLCALL_ROOT)
+    except OSError as e:
+        log(f"toolcalls dropbox unavailable ({e}); phone tools disabled this turn")
+
+    if attachments:
+        # The model always gets the paths — codex additionally gets pixels
+        # via -i — so it can re-open any attachment with its own tools.
+        listing = "\n".join(f"- {p}" for p in attachments)
+        prompt = f"{prompt}\n\n[Attached files from your person's phone:\n{listing}\n]"
 
     replies = 0
     stop_pump = threading.Event()
@@ -1347,25 +1454,79 @@ def execute_turn(adapter, conversation_id, prompt, cfg, delta):
             replies += 1
             delta(message, CHANNEL_REPLY)
 
-    def pump_outbox():
+    def flush_toolcalls():
+        # Requests the agent's phone.sh dropped since the last scan. Read and
+        # unlink first: a request must never be forwarded twice.
+        try:
+            names = sorted(n for n in os.listdir(toolcalls)
+                           if n.endswith(REQUEST_SUFFIX))
+        except OSError:
+            return
+        for name in names:
+            full = os.path.join(toolcalls, name)
+            try:
+                with open(full, encoding="utf-8", errors="replace") as f:
+                    raw = f.read()
+                os.unlink(full)
+            except OSError:
+                continue
+            call_id = name[:-len(REQUEST_SUFFIX)]
+            try:
+                call = json.loads(raw)
+                tool_name = call["name"]
+                arguments = call.get("arguments")
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                call_id = call.get("request_id") or call_id
+            except (ValueError, KeyError, TypeError):
+                # Fail the script fast; the filename is the only id we have.
+                write_tool_result(toolcalls, call_id,
+                                  {"ok": False, "output": "",
+                                   "error": "malformed request"})
+                continue
+            if emit is None:
+                write_tool_result(toolcalls, call_id,
+                                  {"ok": False, "output": "",
+                                   "error": "tool channel unavailable"})
+                continue
+            with state_lock:
+                pending_tool_calls[call_id] = toolcalls
+            emit({"type": "tool.call", "version": PROTOCOL_VERSION,
+                  "request_id": call_id, "turn_request_id": request_id,
+                  "conversation_id": conversation_id, "name": tool_name,
+                  "arguments": arguments})
+
+    def pump_dropboxes():
         while not stop_pump.is_set():
             flush_outbox()
+            flush_toolcalls()
             time.sleep(OUTBOX_POLL_SECONDS)
 
-    pump = threading.Thread(target=pump_outbox, daemon=True)
+    pump = threading.Thread(target=pump_dropboxes, daemon=True)
     pump.start()
 
     def register_proc(proc):
         with state_lock:
             cancel_procs[conversation_id] = proc
 
+    turn_env = {"CHARIOT_OUTBOX": outbox, "CHARIOT_TOOLCALLS": toolcalls}
     try:
         exit_code = adapter.execute_turn(conversation_id, prompt, cfg, delta,
-                                         register_proc, outbox)
+                                         register_proc, turn_env,
+                                         attachments=attachments)
     finally:
         stop_pump.set()
         pump.join(timeout=OUTBOX_POLL_SECONDS * 8)
         flush_outbox()
+        # Final sweep: a request written in the turn's last instant still
+        # goes out (its answer will be dropped below, but the phone may act
+        # on it). Then drop the calls nobody is polling for anymore — a
+        # result arriving after this would otherwise write into a dead
+        # dropbox.
+        flush_toolcalls()
+        with state_lock:
+            for rid in [rid for rid, d in pending_tool_calls.items() if d == toolcalls]:
+                pending_tool_calls.pop(rid, None)
 
     if exit_code is RETRY_FRESH:
         return RETRY_FRESH
@@ -1608,6 +1769,10 @@ def handle_agent_connection(conn):
                     # Inline for the same reason: the config must land before
                     # any turn that follows it.
                     handle_agent_configure(conn_file, write_lock, request)
+                elif rtype == "tool.result":
+                    # Inline like file.put: just a dropbox write, and the
+                    # polling script is waiting on it.
+                    handle_tool_result(request)
                 elif rtype == "oauth.start":
                     threading.Thread(target=start_login,
                                      args=(conn_file, write_lock), daemon=True).start()
