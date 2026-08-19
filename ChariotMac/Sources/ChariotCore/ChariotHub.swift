@@ -702,7 +702,15 @@ public final class ChariotHub: @unchecked Sendable {
         guard let tunnel else {
             throw ChariotError.invalidState("could not open the sign-in tunnel into the guest")
         }
-        try tunnel.start()
+        do {
+            try tunnel.start()
+        } catch {
+            // The usual cause is another Codex sign-in server on this Mac
+            // holding the fixed OAuth redirect port; name it, or the user
+            // sees a bare bind error with no way forward.
+            throw ChariotError.invalidState(
+                "the sign-in callback port 1455 is in use by another app — a Codex app or CLI on this Mac? Quit it and try again. (\(error))")
+        }
         try bridge.startLogin()
         event("\(displayName(of: context)): codex sign-in started; waiting for auth URL from guest")
     }
