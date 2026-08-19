@@ -185,7 +185,10 @@ embedded_key="$(plutil -extract SUPublicEDKey raw "$PLIST_PATH" 2>/dev/null || e
 # to a variable rather than piped: `grep -q` closes the pipe on match, and the
 # resulting SIGPIPE trips `set -o pipefail`.
 signature_info="$(codesign -dv "$APP" 2>&1 || true)"
-grep -q "Signature=" <<<"$signature_info" \
+# `codesign -dv` prints "Signature=adhoc" for an ad-hoc bundle but "Signature
+# size=9052" for a real one, so matching "Signature=" alone accepts ad-hoc and
+# rejects Developer ID — backwards, and unnoticed until the first signed build.
+grep -qE '^Signature[= ]' <<<"$signature_info" \
   || { echo "app is not code signed at all; Sparkle would reject updates from it" >&2; exit 1; }
 
 # --- launch smoke test -------------------------------------------------------
