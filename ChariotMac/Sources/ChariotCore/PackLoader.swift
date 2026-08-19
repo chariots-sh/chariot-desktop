@@ -239,6 +239,92 @@ public enum PackLoader {
         return seeded
     }
 
+    /// Scaffold a brand-new pack folder from user-entered content — the
+    /// in-app alternative to hand-assembling a folder in Finder. Writes
+    /// pack.json plus AGENTS.md, and SOUL.md / MEMORY.seed.md when provided,
+    /// then re-loads the folder through the normal validation path so the
+    /// caller gets back exactly what New Agent will offer.
+    ///
+    /// The folder name is a slug of the display name; collisions get a
+    /// numeric suffix rather than failing, since the name is cosmetic.
+    public static func createPack(named name: String,
+                                  instructions: String,
+                                  soul: String? = nil,
+                                  seedMemory: String? = nil,
+                                  in packsDirectory: URL) throws -> Pack {
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !displayName.isEmpty else {
+            throw PackError.manifestInvalid("a pack needs a name")
+        }
+        let body = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else {
+            throw PackError.manifestInvalid("a pack needs instructions (AGENTS.md)")
+        }
+
+        let fm = FileManager.default
+        try fm.createDirectory(at: packsDirectory, withIntermediateDirectories: true)
+        let slug = Self.slug(from: displayName)
+        var folder = packsDirectory.appendingPathComponent("\(slug).pack")
+        var counter = 2
+        while fm.fileExists(atPath: folder.path) {
+            folder = packsDirectory.appendingPathComponent("\(slug)-\(counter).pack")
+            counter += 1
+        }
+
+        var workspace: [PackManifest.WorkspaceEntry] = [
+            .init(src: "AGENTS.md", dest: "/workspace/AGENTS.md")
+        ]
+        var files: [(String, String)] = [("AGENTS.md", body + "\n")]
+        if let soul = soul?.trimmingCharacters(in: .whitespacesAndNewlines), !soul.isEmpty {
+            workspace.append(.init(src: "SOUL.md", dest: "/workspace/SOUL.md"))
+            files.append(("SOUL.md", soul + "\n"))
+        }
+        if let seed = seedMemory?.trimmingCharacters(in: .whitespacesAndNewlines), !seed.isEmpty {
+            workspace.append(.init(src: "MEMORY.seed.md", dest: "/workspace/MEMORY.md", seedOnly: true))
+            files.append(("MEMORY.seed.md", seed + "\n"))
+        }
+        let manifest = PackManifest(id: "local.\(slug)", name: displayName,
+                                    version: "1.0.0", workspace: workspace)
+
+        do {
+            try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try (try encoder.encode(manifest))
+                .write(to: folder.appendingPathComponent("pack.json"))
+            for (path, content) in files {
+                try content.write(to: folder.appendingPathComponent(path),
+                                  atomically: true, encoding: .utf8)
+            }
+            return try load(at: folder)
+        } catch {
+            // Never leave a half-written folder behind — availablePacks would
+            // log it as broken on every refresh forever.
+            try? fm.removeItem(at: folder)
+            throw error
+        }
+    }
+
+    /// "My Health Coach!" → "my-health-coach". Falls back to "agent" when the
+    /// name has no ASCII-safe characters at all.
+    static func slug(from name: String) -> String {
+        let folded = name.folding(options: [.diacriticInsensitive, .caseInsensitive],
+                                  locale: Locale(identifier: "en_US"))
+        let allowed = CharacterSet.lowercaseLetters.union(.decimalDigits)
+        var out = ""
+        var pendingHyphen = false
+        for scalar in folded.lowercased().unicodeScalars {
+            if allowed.contains(scalar) {
+                if pendingHyphen && !out.isEmpty { out.append("-") }
+                pendingHyphen = false
+                out.unicodeScalars.append(scalar)
+            } else {
+                pendingHyphen = true
+            }
+        }
+        return out.isEmpty ? "agent" : out
+    }
+
     /// Every valid pack in the packs directory, sorted by folder name.
     /// Invalid folders are skipped (and logged) so one broken pack never
     /// hides the rest.
