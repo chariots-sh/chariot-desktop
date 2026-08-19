@@ -40,6 +40,15 @@ OUT="$ROOT/build/release"
 # a malicious update. Losing or rotating it strands every install.
 : "${SPARKLE_PUBLIC_ED_KEY:?set SPARKLE_PUBLIC_ED_KEY (see docs/distribution.md); without it updates cannot be verified at all}"
 
+# Non-empty is not enough. Sparkle's public key is base64 of a 32-byte ed25519
+# key; anything else gets far enough to be baked into Info.plist and start the
+# updater, which then dies with "The updater failed to start" in front of the
+# user. `base64 -d` is lenient here (it decodes "signtest-placeholder" to 15
+# bytes rather than failing), so the length is the check that bites.
+key_bytes="$(printf %s "$SPARKLE_PUBLIC_ED_KEY" | base64 -d 2>/dev/null | wc -c | tr -d ' ' || true)"
+[[ "$key_bytes" == "32" ]] \
+  || { echo "SPARKLE_PUBLIC_ED_KEY is not a 32-byte base64 ed25519 key (decoded $key_bytes bytes)" >&2; exit 1; }
+
 if [[ -z "${SIGNING_IDENTITY:-}" ]]; then
   # `|| true`: under `set -o pipefail` a grep miss would abort the script here,
   # swallowing the mode selection below.
