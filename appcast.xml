@@ -3,6 +3,16 @@
     <channel>
         <title>Chariot Desktop</title>
         <item>
+            <title>0.2.0</title>
+            <pubDate>Wed, 19 Aug 2026 23:16:06 +0000</pubDate>
+            <link>https://github.com/chariots-sh/chariot-desktop</link>
+            <sparkle:version>51</sparkle:version>
+            <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/chariots-sh/chariot-desktop/releases/download/v0.2.0/ChariotDesktop-0.2.0.dmg" length="20406297" type="application/octet-stream" sparkle:edSignature="av/59v0Kk+CrMvdXlDGNBfjQTz70uBK86JcdMTmYWLUFNoQ83zINiiWlQwDj7feDTHjG3/hpyACocaIE8BEnBw=="/>
+        </item>
+        <item>
             <title>0.1.5</title>
             <pubDate>Wed, 19 Aug 2026 22:40:46 +0000</pubDate>
             <link>https://github.com/chariots-sh/chariot-desktop</link>
@@ -41,16 +51,6 @@
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <enclosure url="https://github.com/chariots-sh/chariot-desktop/releases/download/v0.1.2/ChariotDesktop-0.1.2.dmg" length="20111808" type="application/octet-stream" sparkle:edSignature="JET08Epih2Dd0ETiftsmLL3Q6ht/u/iKAOAkG6IkyCKZb7kbDHM2w8gHkhvvgTy/pNmojKLIEbvMT+uMhmewAQ=="/>
-        </item>
-        <item>
-            <title>0.1.1</title>
-            <pubDate>Mon, 17 Aug 2026 21:48:03 +0000</pubDate>
-            <link>https://github.com/chariots-sh/chariot-desktop</link>
-            <sparkle:version>29</sparkle:version>
-            <sparkle:shortVersionString>0.1.1</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/chariots-sh/chariot-desktop/releases/download/v0.1.1/ChariotDesktop-0.1.1.dmg" length="20117463" type="application/octet-stream" sparkle:edSignature="CbuHpWPX2F31pkCchkQB7h0UeQk1/cZ7X9L1Ri8sAgLiWGNo1EWTpZifNwG3Rb3KatIqlZIdO6i8J8Ai6gBJAw=="/>
         </item>
     </channel>
 </rss>
