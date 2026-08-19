@@ -48,7 +48,16 @@ final class UpdaterController: NSObject, ObservableObject, @unchecked Sendable {
         let info = Bundle.main.infoDictionary
         let key = info?["SUPublicEDKey"] as? String ?? ""
         let feed = info?["SUFeedURL"] as? String ?? ""
-        return !key.isEmpty && !feed.isEmpty && !feed.hasPrefix("$(")
+        return isUsableEdKey(key) && !feed.isEmpty && !feed.hasPrefix("$(")
+    }
+
+    /// Sparkle's public key is base64 of a 32-byte ed25519 key. Presence alone
+    /// is not enough: a placeholder key is non-empty, so the updater starts and
+    /// then fails with "The updater failed to start" in a dialog the user can do
+    /// nothing about. Staying off is the better failure.
+    static func isUsableEdKey(_ key: String) -> Bool {
+        guard let decoded = Data(base64Encoded: key) else { return false }
+        return decoded.count == 32
     }
 
     @MainActor

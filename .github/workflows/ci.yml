@@ -68,7 +68,7 @@ jobs:
             -configuration Release -destination "generic/platform=macOS" \
             -derivedDataPath build/dd ARCHS=arm64 \
             MARKETING_VERSION=0.0.0 CURRENT_PROJECT_VERSION=1 \
-            SPARKLE_PUBLIC_ED_KEY=ci-placeholder \
+            SPARKLE_PUBLIC_ED_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
             CODE_SIGNING_ALLOWED=NO | tail -5
       # XcodeGen silently drops build phases it does not recognise, which once
       # produced release bundles with no agent-tailnet in them. Assert the
@@ -95,7 +95,11 @@ jobs:
       # builds the ad-hoc bundle the way a release does and runs it.
       - name: Ad-hoc bundle launches
         run: |
-          SPARKLE_PUBLIC_ED_KEY=ci-placeholder VERSION=0.0.0-ci ADHOC=1 \
+          # A real-shaped key (32 zero bytes, base64): release-app.sh rejects
+          # anything that is not 32 bytes, because a malformed key ships an app
+          # whose updater fails to start. Signing, not updating, is what this
+          # job exercises, so the value itself does not matter.
+          SPARKLE_PUBLIC_ED_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= VERSION=0.0.0-ci ADHOC=1 \
             scripts/release-app.sh 2>&1 | tail -20
 
   agent-tailnet:

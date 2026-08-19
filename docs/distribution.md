@@ -18,40 +18,47 @@ themselves afterwards.
 `release-app.sh` picks its mode from whether a Developer ID certificate is in
 the keychain. `ADHOC=1` forces ad-hoc.
 
-## Shipping ad-hoc
+## What ships today
 
-Chariot currently ships ad-hoc, because a **Developer ID Application**
-certificate can only be created by a team's Account Holder and we do not have
-one yet. What that costs, precisely:
+Chariot ships **Developer ID signed, notarized and stapled**: the DMG opens on a
+double click, with no Gatekeeper detour. `spctl --assess` reports
+`source=Notarized Developer ID`.
+
+Releases up to and including v0.1.4 were ad-hoc, because a **Developer ID
+Application** certificate can only be created by a team's Account Holder and we
+did not have one. Those installs are not stranded — Sparkle allows the signing
+identity to change as long as the EdDSA key matches, so they update themselves
+into signed builds. The one thing that must never change is
+`SPARKLE_PRIVATE_KEY`.
+
+### The ad-hoc fallback
+
+`ADHOC=1` still forces ad-hoc, and the release workflow falls back to it if
+`DEVELOPER_ID_CERT_P12` is ever unset. It is worth knowing what that costs,
+since the failure is quiet — a warning in the workflow log, not an error:
 
 - **The first launch is blocked.** macOS says the app "is damaged and can't be
   opened", which is misleading — it is the generic message for an app Gatekeeper
   cannot verify. The user opens **System Settings → Privacy & Security** and
   clicks **Open Anyway** once. `release-app.sh` puts an `INSTALL.txt` in the DMG
   saying so, and the release workflow puts it in the release notes.
-- **`spctl` rejects the DMG.** Expected; the release script prints the real
-  verdict rather than asserting success.
+- **`spctl` rejects the DMG.** Expected in that mode; the release script prints
+  the real verdict rather than asserting success.
 - **The sha256 is the only integrity signal.** Publish it next to the download.
   The script prints it.
 
-What it does *not* cost:
-
-- **Auto-update still works.** Sparkle accepts an app-bundle update on either
-  matching EdDSA keys *or* a matching code-signing identity — the EdDSA key is
-  enough on its own, and Sparkle's own docs say "if no Apple Code Signing
-  certificate is available, adhoc signing can be used at minimum". It also
-  clears quarantine on what it installs, so the Privacy & Security step is
-  **first-install-only**.
-- **Moving to Developer ID later is a supported transition.** Sparkle explicitly
-  allows the code-signing identity to change as long as the EdDSA key matches,
-  so existing ad-hoc installs will update themselves to notarized builds. The
-  one thing that must not change is `SPARKLE_PRIVATE_KEY`.
-
-To switch modes later, add the two certificate secrets; nothing else changes.
+Auto-update survives either way: Sparkle accepts an app-bundle update on either
+matching EdDSA keys *or* a matching code-signing identity — the EdDSA key is
+enough on its own. It also clears quarantine on what it installs, so even in
+ad-hoc mode the Privacy & Security step is **first-install-only**.
 
 ## One-time setup
 
-### 1. Developer ID Application certificate (optional — skip for ad-hoc)
+### 1. Developer ID Application certificate — done
+
+The team has one: *Developer ID Application: Immortal Company (3UGCLFLDJ6)*,
+issued by Apple's G2 sub-CA and valid until **August 2031**. The rest of this
+section is what to do when it expires, or on a machine that does not have it.
 
 An **Apple Development** certificate cannot sign software distributed outside
 the App Store. You need a **Developer ID Application** certificate, and for an
@@ -132,8 +139,8 @@ every installed copy, so settle it before the first release.
 
 ### 5. Repository secrets
 
-Only the last two are needed to ship ad-hoc. Adding the first five switches the
-workflow into Developer ID mode with no other change.
+All seven are set. The last two alone are enough to ship ad-hoc; the first five
+are what put the workflow in Developer ID mode.
 
 | Name | Kind | What |
 |---|---|---|
@@ -183,8 +190,9 @@ which is worth doing once before a real release to confirm signing works.
 Failures here are cheaper than a bad release, so `release-app.sh` refuses to
 continue when:
 
-- `SPARKLE_PUBLIC_ED_KEY` is unset — with no notarization this is the only
-  verification an update gets, so an empty key is never acceptable;
+- `SPARKLE_PUBLIC_ED_KEY` is unset, or is not base64 of 32 bytes — an update's
+  EdDSA signature is verified against this key, and a merely non-empty one ships
+  an app whose updater dies at launch with "The updater failed to start";
 - `com.apple.security.virtualization` is missing from the signed binary (the app
   would launch and then fail to create any VM);
 - the public key did not survive into `Info.plist`;
@@ -262,9 +270,9 @@ override the mirror without a rebuild.
   page should say so — an Intel Mac cannot run this. Sparkle infers
   `sparkle:hardwareRequirements` from the shipped slices, so it will not offer
   updates to Intel hardware.
-- **Ad-hoc builds need a manual first launch**, and macOS describes them as
-  "damaged", which generates support questions. This is the cost of not having a
-  Developer ID certificate, and it goes away entirely once one exists.
+- **The Developer ID certificate expires in August 2031**, and a team may hold
+  only five. Revoking one invalidates builds already shipped under it, so renew
+  by adding a certificate rather than replacing this one.
 - **In Developer ID mode, the DMG is not stapled against future revocation.**
   Notarization tickets can be revoked by Apple; stapling only proves the state at
   signing time.
