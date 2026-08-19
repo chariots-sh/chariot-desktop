@@ -395,6 +395,36 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Scaffold a new pack from the New Pack sheet. Returns its folder name
+    /// (so the New Agent sheet can preselect it), or nil after surfacing the
+    /// error.
+    func createPack(name: String, instructions: String,
+                    soul: String, seedMemory: String) -> String? {
+        guard let hub else { return nil }
+        do {
+            let pack = try PackLoader.createPack(named: name,
+                                                 instructions: instructions,
+                                                 soul: soul,
+                                                 seedMemory: seedMemory,
+                                                 in: hub.paths.packsDirectory)
+            eventLog.append("Created pack \(pack.directoryName)")
+            statusLine = "\(pack.manifest.name) pack created."
+            refresh()
+            return pack.directoryName
+        } catch {
+            errorMessage = "Could not create pack: \(error)"
+            return nil
+        }
+    }
+
+    /// Packs are folders; everything beyond the sheet's markdown (tools/,
+    /// skills/, pack.json tweaks) is a Finder edit.
+    func revealPacksDirectory() {
+        guard let dir = hub?.paths.packsDirectory else { return }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)
+    }
+
     func setAgentModel(_ agentID: String, model: String) {
         guard let hub else { return }
         let value = model.trimmingCharacters(in: .whitespacesAndNewlines)

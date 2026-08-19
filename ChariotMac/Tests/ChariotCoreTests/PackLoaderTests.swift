@@ -183,6 +183,67 @@ final class PackLoaderTests: XCTestCase {
         XCTAssertEqual(packs.map(\.directoryName), ["a-guardian.pack", "b-scribe.pack"])
     }
 
+    // MARK: In-app pack creation
+    //
+    // The GUI's "New Pack" sheet calls createPack; whatever it writes must
+    // round-trip through the same loader that New Agent uses.
+
+    func testCreatePackScaffoldsAValidLoadablePack() throws {
+        let pack = try PackLoader.createPack(named: "My Health Coach!",
+                                             instructions: "# Coach\n\nYou are a coach.",
+                                             soul: "Warm but direct.",
+                                             seedMemory: "## Notes\n- (empty)",
+                                             in: packsDir)
+        XCTAssertEqual(pack.directoryName, "my-health-coach.pack")
+        XCTAssertEqual(pack.manifest.id, "local.my-health-coach")
+        XCTAssertEqual(pack.manifest.name, "My Health Coach!")
+        XCTAssertEqual(pack.manifest.version, "1.0.0")
+
+        let files = try pack.workspaceFiles()
+        XCTAssertEqual(files.map(\.destination),
+                       ["/workspace/AGENTS.md", "/workspace/MEMORY.md", "/workspace/SOUL.md"])
+        let byDest = Dictionary(uniqueKeysWithValues: files.map { ($0.destination, $0) })
+        XCTAssertEqual(byDest["/workspace/MEMORY.md"]?.seedOnly, true)
+        XCTAssertEqual(byDest["/workspace/AGENTS.md"]?.seedOnly, false)
+
+        // And it shows up where the create sheet looks.
+        XCTAssertEqual(PackLoader.availablePacks(in: packsDir).map(\.directoryName),
+                       ["my-health-coach.pack"])
+    }
+
+    func testCreatePackOmitsEmptyOptionalFiles() throws {
+        let pack = try PackLoader.createPack(named: "Mini",
+                                             instructions: "Do things.",
+                                             soul: "   ",
+                                             seedMemory: nil,
+                                             in: packsDir)
+        XCTAssertEqual(try pack.workspaceFiles().map(\.destination), ["/workspace/AGENTS.md"])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: pack.directory.appendingPathComponent("SOUL.md").path))
+    }
+
+    func testCreatePackNameCollisionGetsSuffixNotFailure() throws {
+        let first = try PackLoader.createPack(named: "Twin", instructions: "a", in: packsDir)
+        let second = try PackLoader.createPack(named: "twin", instructions: "b", in: packsDir)
+        XCTAssertEqual(first.directoryName, "twin.pack")
+        XCTAssertEqual(second.directoryName, "twin-2.pack")
+    }
+
+    func testCreatePackRejectsBlankNameOrInstructions() {
+        XCTAssertThrowsError(try PackLoader.createPack(named: "  ",
+                                                       instructions: "x", in: packsDir))
+        XCTAssertThrowsError(try PackLoader.createPack(named: "OK",
+                                                       instructions: "\n  \n", in: packsDir))
+        XCTAssertEqual(PackLoader.availablePacks(in: packsDir).count, 0)
+    }
+
+    func testSlugFallsBackWhenNameHasNoSafeCharacters() throws {
+        XCTAssertEqual(PackLoader.slug(from: "Crème Brûlée 9"), "creme-brulee-9")
+        XCTAssertEqual(PackLoader.slug(from: "!!!"), "agent")
+        let pack = try PackLoader.createPack(named: "日本語", instructions: "x", in: packsDir)
+        XCTAssertEqual(pack.directoryName, "agent.pack")
+    }
+
     // MARK: Seeding bundled packs
     //
     // A downloaded app starts with an empty packs directory; without seeding,

@@ -125,6 +125,12 @@ guardian.pack/
   skills/…  tools/…  directories are pushed recursively
 ```
 
+- **Make your own pack** in the app: **New Pack** (on the Agents page's packs
+  card, or from inside the New Agent sheet) scaffolds a `<slug>.pack` folder
+  from typed-in name, instructions (AGENTS.md), and optional personality
+  (SOUL.md) / seed memory (MEMORY.seed.md → seedOnly MEMORY.md). Anything
+  richer — `tools/`, `skills/`, `vm{}` sizing — is a file edit in that folder
+  (packs card → Reveal in Finder); edits land on the agent's next turn.
 - **Create** an agent from a pack (GUI sidebar → New Agent, or
   `POST /admin/agents`): it gets a fresh **instance UUID** — the durable
   identity and routing key — and its own APFS-cloned VM sized per `vm{}`.

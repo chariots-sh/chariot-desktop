@@ -205,12 +205,18 @@ struct Page<Content: View>: View {
 
 struct FleetHomeView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showPackCreator = false
 
     var body: some View {
-        if model.agents.isEmpty {
-            FirstAgentHero()
-        } else {
-            fleetPage
+        Group {
+            if model.agents.isEmpty {
+                FirstAgentHero()
+            } else {
+                fleetPage
+            }
+        }
+        .sheet(isPresented: $showPackCreator) {
+            CreatePackSheet { _ in model.refresh() }
         }
     }
 
@@ -242,13 +248,35 @@ struct FleetHomeView: View {
                     .padding(.top, 6)
                 }
             }
-            Card(title: "packs directory") {
+            Card(title: "packs") {
                 VStack(alignment: .leading, spacing: 6) {
+                    if model.packs.isEmpty {
+                        Text("No packs yet.").font(Theme.mono(11)).foregroundStyle(Theme.secondary)
+                    } else {
+                        ForEach(model.packs) { pack in
+                            HStack {
+                                Text(pack.name).font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(Theme.text)
+                                Text("v\(pack.version) · \(pack.dir)")
+                                    .font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                                Spacer()
+                            }
+                        }
+                    }
                     Text(model.hub?.paths.packsDirectory.path ?? "—")
                         .font(Theme.mono(11)).foregroundStyle(Theme.green)
                         .textSelection(.enabled)
+                        .padding(.top, 4)
                     Text("A pack is a folder with pack.json, markdown (AGENTS.md, SOUL.md, MEMORY.seed.md), skills/, and tools/. Editing a pack updates its agents on their next turn.")
                         .font(.system(size: 11)).foregroundStyle(Theme.secondary)
+                    HStack(spacing: 8) {
+                        Button("New Pack") { showPackCreator = true }
+                            .buttonStyle(AccentButtonStyle())
+                        Button("Reveal in Finder") { model.revealPacksDirectory() }
+                            .buttonStyle(OutlineButtonStyle())
+                        Spacer()
+                    }
+                    .padding(.top, 6)
                 }
             }
         }
@@ -321,6 +349,7 @@ struct FirstAgentHero: View {
 struct CreateAgentSheet: View {
     @EnvironmentObject var model: AppModel
     @State private var selectedPack: String?
+    @State private var showPackCreator = false
     @State private var harness: HarnessKind = .codex
     @State private var power: PowerSourceKind = .chatgpt
     @State private var modelOverride = ""
@@ -365,10 +394,17 @@ struct CreateAgentSheet: View {
             Text("Create an agent")
                 .font(.system(size: 18, weight: .bold)).foregroundStyle(Theme.text)
             if model.packs.isEmpty {
-                Text("No packs found in\n\(model.hub?.paths.packsDirectory.path ?? "-")\n\nDrop a pack folder (e.g. guardian.pack) there and reopen this sheet.")
+                Text("No packs found in\n\(model.hub?.paths.packsDirectory.path ?? "-")")
                     .font(Theme.mono(11)).foregroundStyle(Theme.secondary)
+                Button("Create a pack") { showPackCreator = true }
+                    .buttonStyle(AccentButtonStyle())
             } else {
-                Text("PACK").font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                HStack {
+                    Text("PACK").font(Theme.mono(10)).foregroundStyle(Theme.secondary)
+                    Spacer()
+                    Button("New Pack…") { showPackCreator = true }
+                        .buttonStyle(OutlineButtonStyle())
+                }
                 ForEach(model.packs) { pack in
                     Button {
                         selectedPack = pack.dir
@@ -458,6 +494,14 @@ struct CreateAgentSheet: View {
         .frame(width: 520)
         .background(Theme.bg)
         .preferredColorScheme(.dark)
+        .sheet(isPresented: $showPackCreator) {
+            // A pack made mid-flow is what the user wants to use: refresh the
+            // list and preselect it.
+            CreatePackSheet { dir in
+                model.refresh()
+                selectedPack = dir
+            }
+        }
     }
 }
 
