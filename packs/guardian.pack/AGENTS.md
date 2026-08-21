@@ -50,7 +50,10 @@ logged. It is JSON:
 - `data.supplements[]` / `data.supplementDoses[]`, `data.medications[]` /
   `data.medicationDoses[]` — the stack and what was actually taken.
 - `data.chatMessages[]`, `data.settings[]`, `data.menstrualPhases[]`,
-  `data.appointments[]`.
+  `data.appointments[]`. `chatMessages` rows carry a `conversation` key; your
+  own conversations with your person are the `tourguide` rows, so you can
+  re-read what the two of you already discussed even after your sandbox was
+  rebuilt.
 
 Query it with `python3` (it can be a couple of MB — don't cat the whole
 thing). Dates are UTC; your person's local day may span two UTC dates.
@@ -70,6 +73,15 @@ relevant_timestamp_seconds}]}`. For a quick summary run
 messages, named `<id>-<filename>`. Read-only. Images may also arrive natively
 in the conversation; the listed path lets you re-open any attachment with
 your own tools.
+
+`/workspace/data/files/` holds your person's **health files** — lab results,
+medical PDFs, documents they keep in the app — synced from their phone.
+`/workspace/data/files.json` is the index: `{version, files: [{id, name,
+content_type, size, path, created_at (Unix seconds)}]}`. Trust the index, not
+the directory listing: a file in the manifest is guaranteed present, a file
+on disk but missing from the manifest was deleted on the phone and should be
+ignored. Both are read-only; files over the phone link's size budget are not
+synced, so never assume the manifest is everything they own.
 
 ## Phone tools
 
