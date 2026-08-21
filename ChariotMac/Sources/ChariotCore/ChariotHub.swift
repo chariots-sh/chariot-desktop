@@ -323,6 +323,38 @@ public final class ChariotHub: @unchecked Sendable {
         return record
     }
 
+    /// Delete an agent permanently: stop its runtime, remove the on-disk
+    /// instance (disk, device registry, credentials), drop its queued mail,
+    /// and forget it in the fleet index. Paired phones lose access the moment
+    /// the context is gone — their next hello resolves to no agent and is
+    /// denied. Chariot-powered agents are unregistered from the backend first
+    /// (best-effort) while the proxy token still exists on disk.
+    public func deleteAgent(_ instanceID: String) async throws {
+        let context = try requireContext(instanceID)
+        guard let record = synchronized({ context.record }) else {
+            throw ChariotError.invalidState("the development sandbox has no agent record to delete")
+        }
+        if record.effectivePowerSource == .chariot {
+            await account.unregisterAgent(
+                instanceDirectory: paths.instanceDirectory(record.instanceID))
+        }
+        synchronized { disconnectRuntime(context) }
+        try await backend.destroy(record.instanceID)
+        // Live phone sessions bound to this agent get cut; onClose does the
+        // session bookkeeping, and any reconnect is denied (context is gone).
+        let connections = synchronized {
+            agentIndex.removeAll { $0.instanceID == record.instanceID }
+            contexts.removeValue(forKey: record.instanceID)
+            return wsSessions.values
+                .filter { $0.contextKey == context.key }
+                .map(\.connection)
+        }
+        persistAgentIndex()
+        mailbox.removeAll(instanceID: record.instanceID)
+        for connection in connections { connection.close() }
+        event("agent \(record.displayName) deleted (instance \(record.instanceID.prefix(8)))")
+    }
+
     /// Update one agent's model override: persist, mirror to the backend for
     /// chariot agents (the proxy re-resolves per call), and re-push the guest
     /// config when the bridge is up so the next turn uses it.
@@ -1850,6 +1882,22 @@ public final class ChariotHub: @unchecked Sendable {
                 return payload
             }
             return .json(["agents": agents])
+        case ("DELETE", "agents") where rest.count == 2:
+            let instanceID = rest[1]
+            guard agentRecords().contains(where: { $0.instanceID == instanceID }) else {
+                return .error(404, "unknown agent")
+            }
+            let result = runBlocking { [weak self] in
+                guard let self else { return "error: hub gone" }
+                do {
+                    try await self.deleteAgent(instanceID)
+                    return "ok"
+                } catch {
+                    return "error: \(error)"
+                }
+            }
+            guard result == "ok" else { return .error(500, result) }
+            return .json(["deleted": instanceID])
         case (_, "agents") where rest.count == 3:
             return routeAgentAdmin(request, instanceID: rest[1], action: rest[2])
         case ("POST", "pairing") where rest.count == 3 && rest[2] == "approve":

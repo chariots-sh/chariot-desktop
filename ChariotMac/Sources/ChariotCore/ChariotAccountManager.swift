@@ -119,6 +119,16 @@ public final class ChariotAccountManager: @unchecked Sendable {
         try? await client.setAgentModel(credential: credential, agentID: agent.agentID, model: model)
     }
 
+    /// Remove a chariot-powered agent's backend registration. Best-effort by
+    /// design: local deletion proceeds regardless, and a stale backend row is
+    /// harmless (its token dies with the instance directory).
+    public func unregisterAgent(instanceDirectory: URL) async {
+        guard let credential = credential(),
+              let agent = ChariotAgentCredential.load(
+                from: InstancePaths(directory: instanceDirectory).chariotCredential) else { return }
+        try? await client.deleteAgent(credential: credential, agentID: agent.agentID)
+    }
+
     /// Lowercase the display name into the backend's DNS-label grammar; nil
     /// when nothing safe remains (registers unnamed).
     static func backendName(from displayName: String) -> String? {

@@ -509,6 +509,14 @@ final class AppModel: ObservableObject {
         lifecycle(id, "Resetting (discarding all guest changes)") { try await $0.resetAgent(id) }
     }
 
+    /// Permanent: VM disk, pairings, and chat transcript all go. The UI has
+    /// already confirmed with the user by the time this runs.
+    func deleteAgent(_ id: String) {
+        chats.removeValue(forKey: id)
+        devAccess.removeValue(forKey: id)
+        lifecycle(id, "Deleting") { try await $0.deleteAgent(id) }
+    }
+
     private func lifecycle(_ id: String, _ label: String,
                            _ operation: @escaping @Sendable (ChariotHub) async throws -> Void) {
         guard let hub else { return }

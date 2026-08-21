@@ -88,6 +88,14 @@ public final class MailboxStore: @unchecked Sendable {
         persistLocked()
     }
 
+    /// Drop every envelope an agent queued (fleet: agent deletion). Envelopes
+    /// stored without an instance (pre-fleet) are left alone.
+    public func removeAll(instanceID: String) {
+        lock.lock(); defer { lock.unlock() }
+        state.envelopes.removeAll { $0.instanceID == instanceID }
+        persistLocked()
+    }
+
     public func expireStale() {
         lock.lock(); defer { lock.unlock() }
         let now = Date()

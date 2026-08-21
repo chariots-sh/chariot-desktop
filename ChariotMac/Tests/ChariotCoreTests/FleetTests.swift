@@ -82,6 +82,44 @@ final class FleetTests: XCTestCase {
         XCTAssertFalse([guardian.instanceID, scribe.instanceID].contains(legacy))
     }
 
+    func testDeleteAgentRemovesInstanceIndexAndAccess() async throws {
+        let guardian = try await hub.createAgent(fromPackDirectory: "guardian.pack")
+        let scribe = try await hub.createAgent(fromPackDirectory: "scribe.pack")
+        try hub.startTransportServer(port: 0, adminPort: 0)
+
+        // Pair a phone to guardian so deletion has a credential to strand.
+        let phone = DeviceIdentity()
+        let payload = try hub.startPairingSession(instanceID: guardian.instanceID)
+        try await pair(identity: phone, payload: payload,
+                       transportBase: "http://127.0.0.1:\(hub.transportPort)")
+
+        try await hub.deleteAgent(guardian.instanceID)
+
+        // Gone from the index and from disk; the other agent is untouched.
+        XCTAssertEqual(hub.agentRecords().map(\.instanceID), [scribe.instanceID])
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: hub.paths.instanceDirectory(guardian.instanceID).path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: hub.paths.instanceDirectory(scribe.instanceID).path))
+
+        // The phone's still-valid signature no longer opens a session: the
+        // deleted agent's endpoint resolves to no context and is denied.
+        let ws = WSProbe(url: "ws://127.0.0.1:\(hub.transportPort)/v2/ws")
+        let denial = try await hello(ws, identity: phone, instanceID: guardian.instanceID)
+        XCTAssertEqual(denial?.type, .denied)
+        ws.close()
+
+        // Deletion is durable across a hub restart.
+        let reloaded = try ChariotHub(paths: hub.paths, displayName: "Test Mac")
+        XCTAssertEqual(reloaded.agentRecords().map(\.instanceID), [scribe.instanceID])
+
+        // A second delete of the same agent fails cleanly as unknown.
+        do {
+            try await hub.deleteAgent(guardian.instanceID)
+            XCTFail("expected instanceNotFound")
+        } catch {}
+    }
+
     // MARK: Per-agent pairing over the real transport
 
     /// Phone-side pairing handshake against the loopback transport, exactly

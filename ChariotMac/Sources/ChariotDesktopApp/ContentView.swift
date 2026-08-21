@@ -121,6 +121,13 @@ struct ContentView: View {
             .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
                 model.refresh()
             }
+            // A deleted agent's detail page must not linger as "not found".
+            .onChange(of: model.agents) { _, agents in
+                if let selected = selection, selected.hasPrefix("agent:"),
+                   !agents.contains(where: { "agent:\($0.id)" == selected }) {
+                    selection = nil
+                }
+            }
         }
     }
 
@@ -515,6 +522,7 @@ struct AgentDetailView: View {
     @State private var selectedWire: WireID = .tailnet
     /// Unsaved model-override edit; nil = showing the persisted value.
     @State private var modelDraft: String?
+    @State private var confirmDelete = false
 
     init(agentID: String, manage: Bool = false, wire: WireID = .tailnet) {
         self.agentID = agentID
@@ -854,9 +862,22 @@ struct AgentDetailView: View {
                 .buttonStyle(AccentButtonStyle(danger: true))
                 .disabled(model.busyAgents.contains(agent.id))
                 .help("Re-clone the disk and repopulate the workspace from the pack")
+            Button("Delete…") { confirmDelete = true }
+                .buttonStyle(AccentButtonStyle(danger: true))
+                .disabled(model.busyAgents.contains(agent.id))
+                .help("Permanently delete this agent, its disk, and its pairings")
         }
         .font(Theme.mono(12))
         .foregroundStyle(Theme.secondary.opacity(0.8))
+        .confirmationDialog("Delete \(agent.name)?",
+                            isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Delete agent and all its data", role: .destructive) {
+                model.deleteAgent(agent.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The VM disk, workspace, and device pairings are deleted permanently. Paired phones lose access to this agent. This cannot be undone.")
+        }
     }
 }
 

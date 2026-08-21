@@ -125,7 +125,12 @@ public final class VirtualMachineBackend: SandboxBackend, @unchecked Sendable {
             try? await controller.stop()
         }
         forgetController(id, dropConfiguration: true)
-        try FileManager.default.removeItem(at: paths.instanceDirectory(id))
+        // Idempotent: a half-deleted instance (directory already gone) must
+        // not block the caller from finishing its own bookkeeping.
+        let directory = paths.instanceDirectory(id)
+        if FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.removeItem(at: directory)
+        }
         ChariotLog.log("instance \(id): destroyed")
     }
 
