@@ -1,0 +1,1011 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mitochondria In Silico — review</title>
+<style>
+:root{
+  --bg:#0e1116; --bg2:#151a21; --bg3:#1b222b; --line:#273140;
+  --fg:#dfe6ef; --fg2:#9aa8ba; --fg3:#6b7a8d;
+  --accent:#e8a13a; --ox:#3fb8a5; --gly:#a97bd6; --pcr:#e0736a;
+  --pass:#4fbf72; --fail:#e05a52; --warn:#e8a13a; --info:#5b91d6;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+}
+@media (prefers-color-scheme: light){
+  :root{--bg:#f7f8fa;--bg2:#fff;--bg3:#eef1f5;--line:#d8dee7;
+        --fg:#151a21;--fg2:#4d5a6b;--fg3:#78879a;}
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+  font-family:var(--sans);font-size:14px;line-height:1.5}
+a{color:var(--info)}
+code,.mono{font-family:var(--mono);font-size:.92em}
+header{border-bottom:1px solid var(--line);background:var(--bg2);
+  position:sticky;top:0;z-index:20}
+.hwrap{max-width:1400px;margin:0 auto;padding:14px 22px;
+  display:flex;gap:20px;align-items:baseline;flex-wrap:wrap}
+h1{font-size:16px;margin:0;font-weight:650;letter-spacing:-.01em}
+h1 span{color:var(--accent)}
+.sub{color:var(--fg3);font-size:12px;font-family:var(--mono)}
+nav{max-width:1400px;margin:0 auto;padding:0 14px;display:flex;gap:2px;
+  overflow-x:auto}
+nav button{background:none;border:none;border-bottom:2px solid transparent;
+  color:var(--fg2);padding:9px 13px;cursor:pointer;font-size:13px;
+  font-family:var(--sans);white-space:nowrap}
+nav button:hover{color:var(--fg)}
+nav button.on{color:var(--fg);border-bottom-color:var(--accent)}
+main{max-width:1400px;margin:0 auto;padding:22px}
+section{display:none}
+section.on{display:block}
+h2{font-size:15px;margin:26px 0 10px;font-weight:650}
+h2:first-child{margin-top:0}
+h3{font-size:13px;margin:18px 0 8px;color:var(--fg2);font-weight:600;
+  text-transform:uppercase;letter-spacing:.06em}
+p{margin:8px 0;max-width:78ch;color:var(--fg2)}
+p.lead{color:var(--fg);font-size:15px}
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:8px;
+  padding:16px 18px;margin:12px 0}
+.grid{display:grid;gap:12px}
+.g2{grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+.g3{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.g4{grid-template-columns:repeat(auto-fit,minmax(165px,1fr))}
+.stat{background:var(--bg2);border:1px solid var(--line);border-radius:8px;
+  padding:12px 14px}
+.stat .k{font-size:11px;color:var(--fg3);text-transform:uppercase;
+  letter-spacing:.06em}
+.stat .v{font-size:23px;font-weight:640;font-family:var(--mono);
+  letter-spacing:-.02em;margin-top:3px;overflow-wrap:anywhere}
+.stat .v.small{font-size:15px;line-height:1.25}
+.stat .n{font-size:11px;color:var(--fg3);margin-top:2px}
+table{border-collapse:collapse;width:100%;font-size:12.5px}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+th{text-align:left;font-weight:600;color:var(--fg3);font-size:11px;
+  text-transform:uppercase;letter-spacing:.05em;padding:7px 10px;
+  border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0;
+  background:var(--bg2)}
+td{padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+tbody tr:hover{background:var(--bg3)}
+td.num,th.num{text-align:right;font-family:var(--mono)}
+.pill{display:inline-block;padding:1px 7px;border-radius:99px;font-size:10.5px;
+  font-weight:600;letter-spacing:.03em;text-transform:uppercase;
+  font-family:var(--mono)}
+.pass{background:color-mix(in srgb,var(--pass) 18%,transparent);color:var(--pass)}
+.fail{background:color-mix(in srgb,var(--fail) 18%,transparent);color:var(--fail)}
+.warn{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.info{background:color-mix(in srgb,var(--info) 18%,transparent);color:var(--info)}
+.muted{color:var(--fg3)}
+.note{border-left:3px solid var(--accent);padding:9px 14px;
+  background:color-mix(in srgb,var(--accent) 7%,transparent);
+  border-radius:0 6px 6px 0;margin:12px 0}
+.note.bad{border-color:var(--fail);
+  background:color-mix(in srgb,var(--fail) 7%,transparent)}
+.note.ok{border-color:var(--pass);
+  background:color-mix(in srgb,var(--pass) 7%,transparent)}
+label{display:block;font-size:11px;color:var(--fg3);text-transform:uppercase;
+  letter-spacing:.05em;margin-bottom:3px}
+select,input[type=number],input[type=text]{width:100%;background:var(--bg3);
+  color:var(--fg);border:1px solid var(--line);border-radius:6px;
+  padding:7px 9px;font-family:var(--mono);font-size:12.5px}
+button.go{background:var(--accent);color:#171104;border:none;border-radius:6px;
+  padding:9px 18px;font-weight:650;cursor:pointer;font-size:13px}
+button.go:disabled{opacity:.5;cursor:progress}
+button.alt{background:var(--bg3);color:var(--fg);border:1px solid var(--line)}
+.bar{height:7px;background:var(--bg3);border-radius:4px;overflow:hidden;
+  position:relative;min-width:120px}
+.bar i{position:absolute;top:0;bottom:0;background:var(--ox);display:block}
+.bandwrap{position:relative;height:22px;min-width:190px}
+.bandwrap .band{position:absolute;top:6px;height:10px;border-radius:3px;
+  background:color-mix(in srgb,var(--pass) 26%,transparent);
+  border:1px solid color-mix(in srgb,var(--pass) 50%,transparent)}
+.bandwrap .ci{position:absolute;top:10px;height:2px;background:var(--fg3)}
+.bandwrap .dot{position:absolute;top:6px;width:3px;height:10px;
+  background:var(--accent);border-radius:1px}
+.bandwrap .dot.out{background:var(--fail)}
+details{border:1px solid var(--line);border-radius:7px;margin:7px 0;
+  background:var(--bg2)}
+summary{cursor:pointer;padding:9px 14px;font-size:13px;font-weight:550}
+details[open] summary{border-bottom:1px solid var(--line)}
+.dbody{padding:12px 14px}
+svg text{font-family:var(--mono);font-size:9.5px;fill:var(--fg3)}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--fg2);
+  margin-top:4px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:2px;
+  margin-right:5px;vertical-align:middle}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 16px;font-size:12.5px}
+.kv dt{color:var(--fg3)}
+.kv dd{margin:0;font-family:var(--mono)}
+.tag{font-family:var(--mono);font-size:10.5px;padding:1px 6px;border-radius:4px;
+  background:var(--bg3);color:var(--fg2);border:1px solid var(--line)}
+.tip{border-bottom:1px dotted var(--fg3);cursor:help;outline:none}
+.tip:focus-visible{outline:2px solid var(--accent);outline-offset:2px;
+  border-radius:2px}
+#tipbox{position:fixed;z-index:100;max-width:360px;background:var(--bg2);
+  border:1px solid var(--line);border-radius:8px;padding:11px 13px;
+  box-shadow:0 8px 28px rgba(0,0,0,.28);font-size:12.5px;line-height:1.48;
+  color:var(--fg);pointer-events:none;opacity:0;transform:translateY(-3px);
+  transition:opacity .09s ease,transform .09s ease}
+#tipbox.on{opacity:1;transform:none}
+#tipbox .t{font-weight:650;margin-bottom:3px}
+#tipbox .u{font-family:var(--mono);font-size:11px;color:var(--fg3);
+  margin-bottom:6px}
+#tipbox .c{color:var(--fg2);margin-top:7px;padding-top:7px;
+  border-top:1px solid var(--line);font-size:11.5px}
+.spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line);
+  border-top-color:var(--accent);border-radius:50%;animation:s .7s linear infinite;
+  vertical-align:-1px}
+@keyframes s{to{transform:rotate(360deg)}}
+.searchrow{display:flex;gap:10px;align-items:center;margin:10px 0}
+.searchrow input{max-width:340px}
+footer{border-top:1px solid var(--line);margin-top:36px;padding:18px 22px;
+  color:var(--fg3);font-size:12px;max-width:1400px;margin-left:auto;
+  margin-right:auto}
+</style>
+</head>
+<body>
+<header>
+  <div class="hwrap">
+    <h1>Mitochondria <span>In Silico</span></h1>
+    <div class="sub" id="verline">loading…</div>
+    <div class="sub" style="margin-left:auto">simulated mechanisms — not measurements</div>
+  </div>
+  <nav id="nav"></nav>
+</header>
+<main>
+  <section id="s-overview" class="on"></section>
+  <section id="s-verify"></section>
+  <section id="s-calib"></section>
+  <section id="s-cohort"></section>
+  <section id="s-sweeps"></section>
+  <section id="s-explore"></section>
+  <section id="s-model"></section>
+  <section id="s-inputs"></section>
+</main>
+<footer>
+  Mitochondria In Silico computes possible skeletal-muscle energy mechanisms
+  consistent with a published physiological model, the supplied observations,
+  and explicitly represented uncertainty. It does not measure anyone's
+  mitochondria. Intended for mechanistic exploration and hypothesis generation;
+  not intended for diagnosis, treatment selection, or autonomous medical advice.
+</footer>
+<script>
+const TABS=[["overview","Overview"],["verify","Verification"],
+  ["calib","Calibration"],["cohort","Virtual cohort"],["sweeps","Input sweeps"],
+  ["explore","Explore scenarios"],["model","Model & registry"],
+  ["inputs","This person"]];
+let META=null, VAL=null, PROF=null;
+
+const $=(s,r=document)=>r.querySelector(s);
+const el=(t,c,h)=>{const e=document.createElement(t);if(c)e.className=c;
+  if(h!==undefined)e.innerHTML=h;return e;};
+const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const nf=(v,d=3)=>v==null||!isFinite(v)?"—":
+  (Math.abs(v)>=1e4?v.toExponential(2):Number(v.toPrecision(d)).toString());
+
+function nav(){const n=$("#nav");TABS.forEach(([id,label],i)=>{
+  const b=el("button",i===0?"on":"",label);b.onclick=()=>{
+    document.querySelectorAll("nav button").forEach(x=>x.classList.remove("on"));
+    b.classList.add("on");
+    document.querySelectorAll("section").forEach(x=>x.classList.remove("on"));
+    $("#s-"+id).classList.add("on");window.scrollTo(0,0);};
+  n.appendChild(b);});}
+
+/* ---------------- tooltips ---------------- */
+/* Positioned against the viewport rather than drawn with a CSS pseudo-element:
+   these labels live inside tables that scroll horizontally, and anything drawn
+   inside that container gets clipped at its edge. */
+let TIPBOX=null;
+function tipbox(){
+  if(!TIPBOX){TIPBOX=el("div");TIPBOX.id="tipbox";document.body.appendChild(TIPBOX);}
+  return TIPBOX;
+}
+function showTip(target){
+  const key=target.getAttribute("data-tip-key");
+  const raw=target.getAttribute("data-tip");
+  let html;
+  if(key){
+    const o=(META.outputs||{})[key];
+    if(!o)return;
+    html=`<div class="t">${esc(o.label)}</div>
+      <div class="u">${esc(o.unit)} · ${esc(o.kind.replace("_"," "))} ·
+        support ${esc(o.support)}</div>
+      <div>${esc(o.meaning||"")}</div>
+      ${o.note?`<div class="c">${esc(o.note)}</div>`:""}`;
+  } else if(raw){ html=raw; } else { return; }
+  const b=tipbox();
+  b.innerHTML=html;
+  b.classList.add("on");
+  const r=target.getBoundingClientRect();
+  const bb=b.getBoundingClientRect();
+  let left=r.left+r.width/2-bb.width/2;
+  left=Math.max(8,Math.min(left,window.innerWidth-bb.width-8));
+  let top=r.bottom+8;
+  if(top+bb.height>window.innerHeight-8) top=Math.max(8,r.top-bb.height-8);
+  b.style.left=left+"px"; b.style.top=top+"px";
+}
+function hideTip(){ if(TIPBOX) TIPBOX.classList.remove("on"); }
+document.addEventListener("mouseover",e=>{
+  const t=e.target.closest?e.target.closest(".tip"):null;
+  if(t) showTip(t);});
+document.addEventListener("mouseout",e=>{
+  if(e.target.closest && e.target.closest(".tip")) hideTip();});
+document.addEventListener("focusin",e=>{
+  const t=e.target.closest?e.target.closest(".tip"):null;
+  if(t) showTip(t);});
+document.addEventListener("focusout",hideTip);
+document.addEventListener("keydown",e=>{if(e.key==="Escape")hideTip();});
+window.addEventListener("scroll",hideTip,true);
+
+/* A hoverable section heading for an output key. */
+function outHeading(key, label, unit){
+  const o=(META.outputs||{})[key];
+  return `<span class="tip" tabindex="0" data-tip-key="${esc(key)}"
+    >${esc(label)}</span> <span class="muted mono"
+    style="font-weight:400">(${esc(unit)})</span>` +
+    (o?"":"");
+}
+
+/* A hoverable label for an output key, described from META.outputs. */
+function outLabel(key){
+  const o=(META.outputs||{})[key];
+  const text=o?o.label:key.replace(/_/g," ");
+  return `<span class="tip" tabindex="0" data-tip-key="${esc(key)}"
+    >${esc(text)}</span>` + (o?`<div class="muted mono"
+    style="font-weight:400;font-size:10px;text-transform:none;letter-spacing:0"
+    >${esc(o.unit)}</div>`:"");
+}
+function tipSpan(text, tip){
+  return `<span class="tip" tabindex="0" data-tip="${esc(tip)}">${esc(text)}</span>`;
+}
+
+/* ---------------- tiny SVG chart helpers ---------------- */
+function lineChart(opts){
+  const W=opts.w||520,H=opts.h||190,P={l:46,r:14,t:12,b:26};
+  const xs=opts.x, series=opts.series;
+  let lo=Infinity,hi=-Infinity;
+  series.forEach(s=>{(s.band?[s.band[0],s.band[1]]:[s.y]).forEach(arr=>
+    arr.forEach(v=>{if(v!=null&&isFinite(v)){lo=Math.min(lo,v);hi=Math.max(hi,v);}}));});
+  if(opts.y0!==undefined) lo=Math.min(lo,opts.y0);
+  if(!isFinite(lo)){lo=0;hi=1;}
+  if(hi-lo<1e-9){hi=lo+1;}
+  const pad=(hi-lo)*0.08;
+  // Do not pad a non-negative series below zero: an axis tick at -0.04 mmol/L
+  // of oxygen invites the reader to think the model produced one.
+  const wasNonNeg = lo >= 0;
+  lo-=pad; hi+=pad;
+  if(wasNonNeg && lo<0) lo=0;
+  const xlo=Math.min(...xs), xhi=Math.max(...xs);
+  const X=v=>P.l+(v-xlo)/((xhi-xlo)||1)*(W-P.l-P.r);
+  const Y=v=>H-P.b-(v-lo)/((hi-lo)||1)*(H-P.t-P.b);
+  let g=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px">`;
+  for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i/4,y=Y(v);
+    g+=`<line x1="${P.l}" x2="${W-P.r}" y1="${y}" y2="${y}" stroke="var(--line)" stroke-width="1"/>`;
+    g+=`<text x="${P.l-6}" y="${y+3}" text-anchor="end">${nf(v,3)}</text>`;}
+  const ticks=5;
+  for(let i=0;i<=ticks;i++){const v=xlo+(xhi-xlo)*i/ticks;
+    g+=`<text x="${X(v)}" y="${H-8}" text-anchor="middle">${nf(v,3)}</text>`;}
+  series.forEach(s=>{
+    if(s.band){let d="";xs.forEach((x,i)=>{d+=(i?"L":"M")+X(x)+","+Y(s.band[1][i]);});
+      for(let i=xs.length-1;i>=0;i--){d+="L"+X(xs[i])+","+Y(s.band[0][i]);}
+      d+="Z";g+=`<path d="${d}" fill="${s.color}" opacity="0.16"/>`;}
+    let d="";s.y.forEach((v,i)=>{if(v==null||!isFinite(v))return;
+      d+=(d?"L":"M")+X(xs[i])+","+Y(v);});
+    g+=`<path d="${d}" fill="none" stroke="${s.color}" stroke-width="1.8"
+        stroke-linejoin="round"/>`;
+    if(s.dots)s.y.forEach((v,i)=>{g+=`<circle cx="${X(xs[i])}" cy="${Y(v)}" r="2.4" fill="${s.color}"/>`;});
+  });
+  g+=`<text x="${P.l}" y="${H-8}" text-anchor="start" opacity="0">.</text>`;
+  g+=`</svg>`;
+  const wrap=el("div");
+  wrap.innerHTML=`<div style="font-size:11.5px;color:var(--fg3);margin-bottom:2px">
+    ${esc(opts.title||"")}${opts.unit?` <span class="mono">(${esc(opts.unit)})</span>`:""}</div>`+g+
+    `<div class="legend">`+series.map(s=>
+      `<span><i style="background:${s.color}"></i>${esc(s.label)}</span>`).join("")+
+    (opts.xlabel?`<span class="muted">x: ${esc(opts.xlabel)}</span>`:"")+`</div>`;
+  return wrap;
+}
+
+/* ---------------- overview ---------------- */
+function renderOverview(){
+  const s=$("#s-overview");
+  const v=VAL&&!VAL.missing?VAL:null;
+  s.innerHTML=`
+  <p class="lead">Given this person's estimated physiological state, what energy
+  pathways could plausibly support this run, which mechanisms become limiting,
+  and how would the answer change under another fuel, workload, or oxygen
+  scenario?</p>
+  <div class="note">Every number this engine produces is a <b>simulated</b>
+  mechanism consistent with a published physiological model, the supplied
+  observations, and explicitly represented uncertainty. The engine does not
+  claim to measure anyone's mitochondria, and it refuses at construction time to
+  emit any of the ${Object.keys(META.forbidden_outputs).length} output types the
+  design forbids — a mitochondrial-health score, respiratory-complex capacity,
+  membrane potential, biological age, a diagnosis, or a treatment
+  recommendation.</div>
+  <div class="grid g4">
+    ${stat("Verification checks", v?`${v.n_passed}/${v.n_checks}`:"—",
+        v?`${v.n_hard_failed} hard failures`:"run mitosim validate")}
+    ${stat("Registered parameters", META.parameters.length,
+        `${META.equations.length} declared equations, all unit-checked`)}
+    ${stat("Network audit", `${META.network_audit.passed}/${META.network_audit.total}`,
+        "carbon, redox, ATP yield, no free-energy cycles")}
+    ${stat("Scenario grid", META.grid.valid.toLocaleString(),
+        `${META.grid.removed.toLocaleString()} of ${META.grid.raw_combinations.toLocaleString()} removed as impossible`)}
+    ${stat("Experimental adapters", META.adapters.filter(a=>a.enabled).length+
+        " / "+META.adapters.length, "the rest are registered but disabled")}
+    ${stat("Muscle phenotype", "2 fibre types",
+        "type I + a lumped faster population, shared capillary blood")}
+  </div>
+  <h2>What the engine does</h2>
+  <div class="grid g2">
+    <div class="card"><h3>Separation of concerns</h3>
+      <p>Whole-body running energetics and intracellular biochemistry are kept
+      strictly apart. A pace is not a reaction rate: the demand model converts
+      pace, gradient, body mass and interval structure into a distribution over
+      ATP demand, and only then does the muscle model decide how that demand is
+      met.</p></div>
+    <div class="card"><h3>Distributions, not guesses</h3>
+      <p>Each scenario is run across hundreds of plausible personal states drawn
+      from posteriors, crossed with draws of the population biochemical
+      constants. Biochemical constants are never fitted to wearable data —
+      that would be unidentifiable — so the engine reports which uncertain
+      parameters drive each conclusion instead.</p></div>
+    <div class="card"><h3>Contrasts are the product</h3>
+      <p>The two arms of a comparison use identical draws of the personal
+      posterior and of every biochemical parameter. Pairing removes the
+      person-level uncertainty common to both arms, so a contrast can be
+      well resolved even when neither absolute number is.</p></div>
+    <div class="card"><h3>Honest refusals</h3>
+      <p>A laboratory value with no defensible mapping to a modelled quantity is
+      recorded and ignored. An adapter without applicable human evidence is
+      registered and disabled. A scenario outside the measured domain of the
+      cost-of-running curve raises rather than extrapolating.</p></div>
+  </div>
+  <h2>What it deliberately does not do</h2>
+  <div class="card scroll"><table><thead><tr><th>Refused output</th><th>Why</th></tr></thead>
+  <tbody>${Object.entries(META.forbidden_outputs).map(([k,v])=>
+    `<tr><td class="mono">${esc(k)}</td><td class="muted">${esc(v)}</td></tr>`)
+    .join("")}</tbody></table></div>`;
+}
+const stat=(k,v,n)=>`<div class="stat"><div class="k">${esc(k)}</div>
+  <div class="v${String(v).length>10?" small":""}">${esc(v)}</div>
+  <div class="n">${esc(n||"")}</div></div>`;
+
+/* ---------------- verification ---------------- */
+function renderVerify(){
+  const s=$("#s-verify");
+  if(!VAL||VAL.missing){
+    s.innerHTML=`<div class="note bad">${esc(VAL?VAL.note:"No validation report loaded.")}</div>`;
+    return;}
+  const fails=VAL.checks.filter(c=>!c.passed);
+  const hard=fails.filter(c=>c.severity==="error");
+  s.innerHTML=`
+  <p class="lead">The verification suite runs the five programmes the engine
+  design specifies: equation and conservation verification, published
+  directional contrasts, virtual-person differentiation, external data
+  contrasts, and falsification. Failures are shown first and are not hidden.</p>
+  <div class="grid g4">
+    ${stat("Checks passed",`${VAL.n_passed}/${VAL.n_checks}`,`in ${VAL.elapsed_s}s`)}
+    ${stat("Hard failures",VAL.n_hard_failed, hard.length?"listed below":"none")}
+    ${stat("Soft failures",fails.length-hard.length,"calibration gaps, flagged")}
+    ${stat("Model version",VAL.model_version,`registry ${VAL.registry_version}`)}
+  </div>
+  ${hard.length?`<div class="note bad"><b>${hard.length} hard failure(s).</b>
+    These are correctness problems, not calibration gaps.</div>`:
+    `<div class="note ok">No hard failures: every conservation, stoichiometry,
+     stability, domain-guard and falsification check passes. The remaining
+     failures below are calibration gaps against measured human bands, and each
+     one names the band it misses.</div>`}
+  <h2>By programme</h2>
+  <div class="grid g3">${Object.entries(VAL.by_section).map(([k,v])=>{
+    const tot=v.passed+v.failed, pct=tot?v.passed/tot*100:0;
+    return `<div class="stat"><div class="k">${esc(k)}</div>
+      <div class="v" style="font-size:18px">${v.passed}/${tot}</div>
+      <div class="bar" style="margin-top:7px"><i style="width:${pct}%;
+        background:${v.failed?'var(--warn)':'var(--pass)'}"></i></div></div>`;
+  }).join("")}</div>
+  ${fails.length?`<h2>Failing checks</h2>`+checkTable(fails,true):""}
+  <h2>Open validation gates</h2>
+  <p>These requirements are <b>not</b> claimed as passed. Each names the
+  evidence that would close it.</p>
+  ${VAL.open_gates.map(g=>`<details><summary>
+    <span class="pill ${g.status.startsWith("OPEN")?"warn":"info"}">${esc(g.status)}</span>
+    &nbsp;${esc(g.gate)}</summary><div class="dbody">
+    <p><b>Requirement.</b> ${esc(g.requirement)}</p>
+    <p><b>Why it is open.</b> ${esc(g.why)}</p>
+    <p><b>Closes when.</b> ${esc(g.closes_when)}</p></div></details>`).join("")}
+  <h2>All checks</h2>
+  <div class="searchrow"><input type="text" id="cfilter"
+    placeholder="filter checks by name, programme or text…">
+    <span class="muted mono" id="ccount"></span></div>
+  <div id="calltable"></div>`;
+  const render=()=>{
+    const q=($("#cfilter").value||"").toLowerCase();
+    const rows=VAL.checks.filter(c=>!q||
+      (c.name+c.section+c.detail+c.evidence).toLowerCase().includes(q));
+    $("#calltable").innerHTML="";
+    $("#calltable").appendChild(checkTableEl(rows));
+    $("#ccount").textContent=`${rows.length} of ${VAL.checks.length}`;
+  };
+  $("#cfilter").oninput=render; render();
+}
+function checkTable(rows,detail){const d=el("div");
+  d.appendChild(checkTableEl(rows,detail));return d.innerHTML;}
+function checkTableEl(rows,detail){
+  const wrap=el("div","card scroll");
+  wrap.innerHTML=`<table><thead><tr>
+    <th style="width:64px">Result</th><th>Check</th>
+    <th class="num">Expected</th><th class="num">Observed</th>
+    <th>What it means</th></tr></thead><tbody>${rows.map(c=>{
+      const cls=c.passed?(c.severity==="warning"?"warn":"pass"):
+        (c.severity==="error"?"fail":"warn");
+      const lab=c.passed?(c.severity==="warning"?"note":"pass"):
+        (c.severity==="error"?"fail":"gap");
+      return `<tr><td><span class="pill ${cls}">${lab}</span></td>
+        <td><div class="mono">${esc(c.name)}</div>
+            <div class="muted" style="font-size:11px">${esc(c.section)}</div></td>
+        <td class="num">${esc(c.expected||"—")}</td>
+        <td class="num">${esc(c.observed||"—")}</td>
+        <td>${esc(c.detail)}${c.evidence?
+          `<div class="muted" style="margin-top:3px;font-size:11px">
+           evidence: ${esc(c.evidence)}</div>`:""}</td></tr>`;}).join("")}
+    </tbody></table>`;
+  return wrap;
+}
+
+/* ---------------- calibration ---------------- */
+function renderCalib(){
+  const s=$("#s-calib");
+  if(!VAL||VAL.missing){s.innerHTML=`<div class="note bad">No validation report loaded.</div>`;return;}
+  const ext=VAL.external||{};
+  const table=ext.table||[];
+  const KEYS=[["pcr_end_fraction","Phosphocreatine at end of run","fraction of resting"],
+    ["blood_lactate_peak","Peak arterial lactate","mmol/L"],
+    ["fat_carbon_fraction","Fat share of oxidised carbon","fraction"],
+    ["glycogen_used","Muscle glycogen consumed in 30 min","mmol/kg wet weight"]];
+  s.innerHTML=`<p class="lead">Where the simulated distribution sits against
+  measured human ranges, at three running intensities. The green band is the
+  measured range; the amber mark is the simulated median; the grey line is the
+  simulated 80% interval. A median outside the band is reported as a failing
+  check, not smoothed over.</p>
+  <div class="note">Indirect calorimetry infers whole-body carbohydrate and fat
+  oxidation from gas exchange. It is useful but has assumptions and is less
+  reliable during non-steady-state, very intense exercise, so the fat-share row
+  is validated against the measurement's actual scope rather than treated as
+  cellular ground truth.</div>
+  ${KEYS.map(([k,label,unit])=>{
+    const rows=table.filter(r=>r[k]);
+    if(!rows.length)return "";
+    let lo=Infinity,hi=-Infinity;
+    rows.forEach(r=>{const d=r[k];lo=Math.min(lo,d.band[0],d.ci80[0]);
+      hi=Math.max(hi,d.band[1],d.ci80[1]);});
+    const sp=hi-lo||1; lo-=sp*.12; hi+=sp*.12;
+    const pos=v=>(v-lo)/(hi-lo)*100;
+    return `<h2>${outHeading(k, label, unit)}</h2>
+    <div class="card scroll"><table><thead><tr>
+      <th>Intensity</th><th>Verdict</th><th class="num">Simulated median</th>
+      <th class="num">80% interval</th><th class="num">Measured band</th>
+      <th style="min-width:220px">Where it sits</th>
+      </tr></thead><tbody>${rows.map(r=>{const d=r[k];
+        return `<tr><td class="mono">${r.intensity_pct_vo2max.toFixed(0)}% VO₂max</td>
+        <td><span class="pill ${d.in_band?"pass":(d.overlaps?"warn":"fail")}">
+          ${d.in_band?"in band":(d.overlaps?"overlaps":"misses")}</span></td>
+        <td class="num">${nf(d.median,3)}</td>
+        <td class="num muted">${nf(d.ci80[0],3)} – ${nf(d.ci80[1],3)}</td>
+        <td class="num muted">${nf(d.band[0],3)} – ${nf(d.band[1],3)}</td>
+        <td><div class="bandwrap">
+          <div class="band" style="left:${pos(d.band[0])}%;
+               width:${pos(d.band[1])-pos(d.band[0])}%"></div>
+          <div class="ci" style="left:${pos(d.ci80[0])}%;
+               width:${Math.max(pos(d.ci80[1])-pos(d.ci80[0]),0.5)}%"></div>
+          <div class="dot ${d.in_band?"":"out"}" style="left:${pos(d.median)}%"></div>
+        </div></td>
+        </tr>`;}).join("")}</tbody></table></div>`;}).join("")}
+  <h2>Cost of transport and oxygen-uptake kinetics</h2>
+  ${checkTable(VAL.checks.filter(c=>c.section==="D. External contrasts" &&
+      !/_at_\d+pct$/.test(c.name)))}`;
+}
+
+/* ---------------- cohort ---------------- */
+function renderCohort(){
+  const s=$("#s-cohort");
+  if(!VAL||VAL.missing){s.innerHTML=`<div class="note bad">No validation report loaded.</div>`;return;}
+  const c=VAL.cohort||{};
+  const rows=c.table||[];
+  const keys=["oxidative_atp_fraction","fat_carbon_fraction","glycogen_used",
+    "blood_lactate_peak","spare_oxidative_capacity","muscle_vo2",
+    "pcr_end_fraction"];
+  const scen=[...new Set(rows.map(r=>r.scenario))];
+  const varies={};(c.people||[]).forEach(p=>{varies[p.tag]=p.varies;});
+  s.innerHTML=`<p class="lead">A preregistered synthetic cohort spanning body
+  and lean mass, aerobic capacity, haemoglobin, training history, glycaemic and
+  lipid phenotype, initial glycogen, altitude and missing data, run through the
+  same standardized scenarios. The test succeeds when relevant differences
+  produce stable attributable differences, irrelevant ones produce none, and
+  conclusions degrade gracefully rather than sharpening as inputs go missing.</p>
+  <div class="grid g3">
+    ${stat("Separation, relevant axes",nf((c.separation||{}).relevant_median,3),
+      "median standardised difference across mechanistically relevant pairs")}
+    ${stat("Separation, controls",nf((c.separation||{}).irrelevant_median,2),
+      "pairs that should not separate at all: should be zero")}
+    ${stat("People × scenarios",`${(c.people||[]).length} × ${scen.length}`,"")}
+  </div>
+  <h2>Separation by axis</h2>
+  <div class="card scroll"><table><thead><tr><th>Contrast</th>
+    <th class="num">${tipSpan("Standardised separation",
+      "How far apart the two people's outputs sit, measured in units of the "+
+      "spread within each of their own ensembles. Below about 0.2 the "+
+      "difference is lost in the uncertainty; above 1 it is unmistakable. The "+
+      "control twins should sit near zero, because they differ only in "+
+      "laboratory values the engine cannot map to anything.")}</th>
+    <th>Scale</th></tr></thead><tbody>
+    ${((c.separation||{}).relevant_pairs||[]).map(p=>{
+      const m=Math.min(p.separation/3,1)*100;
+      return `<tr><td>${esc(p.pair)}</td><td class="num">${nf(p.separation,3)}</td>
+      <td><div class="bar"><i style="width:${m}%"></i></div></td></tr>`;}).join("")}
+    ${(((c.separation||{}).control_pairs)||[]).map(p=>
+      `<tr><td>${esc(p.pair)} ${tipSpan("(control)",
+        "A pair that should NOT separate: "+p.why+". Finding no difference "+
+        "here is the correct result, and is what makes the separation on the "+
+        "relevant axes above meaningful.")}</td>
+       <td class="num">${nf(p.separation,2)}</td>
+       <td><div class="bar"><i style="width:${Math.min(p.separation/3,1)*100}%;
+         background:var(--fg3)"></i></div></td></tr>`).join("")}
+    </tbody></table></div>
+  <h2>Cohort definition</h2>
+  <div class="card scroll"><table><thead><tr><th>Virtual person</th>
+    <th>${tipSpan("What varies",
+      "The one axis this person differs from the reference runner on. Holding "+
+      "everything else fixed is what makes any difference in the outputs "+
+      "attributable to that axis.")}</th></tr></thead><tbody>${(c.people||[]).map(p=>
+    `<tr><td class="mono">${esc(p.tag)}</td><td class="muted">${esc(p.varies)}</td></tr>`)
+    .join("")}</tbody></table></div>
+  <h2>Results</h2>
+  <p class="muted" style="font-size:12px">Hover or tab onto any column heading
+  to see what that output means, its unit, and the caveats that come with it.
+  Person names carry the axis they vary on.</p>
+  ${scen.map(sn=>`<h3>${esc(sn)}</h3><div class="card scroll"><table><thead><tr>
+    <th>Person</th>${keys.map(k=>`<th class="num">${outLabel(k)}</th>`).join("")}
+    </tr></thead><tbody>${rows.filter(r=>r.scenario===sn).map(r=>
+      `<tr><td class="mono">${tipSpan(r.person, varies[r.person]
+         ? "Varies on: "+varies[r.person]
+         : "Virtual person in the preregistered cohort.")}</td>${keys.map(k=>
+        `<td class="num">${nf(r[k],3)}</td>`).join("")}</tr>`).join("")}
+    </tbody></table></div>`).join("")}
+  <h2>Cohort checks</h2>
+  ${checkTable(VAL.checks.filter(c=>c.section==="C. Virtual cohort"))}`;
+}
+
+/* ---------------- sweeps ---------------- */
+function renderSweeps(){
+  const s=$("#s-sweeps");
+  if(!VAL||VAL.missing){s.innerHTML=`<div class="note bad">No validation report loaded.</div>`;return;}
+  const sw=((VAL.falsification||{}).sweeps)||{};
+  s.innerHTML=`<p class="lead">Every scenario input swept across its domain. A
+  discontinuity would need a biological or numerical explanation, so the suite
+  looks for one and fails if it finds an unexplained jump.</p>
+  <div id="sweepgrid" class="grid g2"></div>
+  <h2>Falsification checks</h2>
+  ${checkTable(VAL.checks.filter(c=>c.section==="E. Falsification"))}
+  <h2>Directional contrasts</h2>
+  <p>Robust published contrasts the engine must reproduce, each evaluated as a
+  paired probability that the mechanism moves in the stated direction.</p>
+  ${checkTable(VAL.checks.filter(c=>c.section==="B. Directional contrasts"))}`;
+  const g=$("#sweepgrid");
+  Object.entries(sw).forEach(([axis,d])=>{
+    const card=el("div","card");
+    card.appendChild(lineChart({x:d.x,series:[{y:d.y,label:d.output,
+      color:"var(--accent)",dots:true}],title:axis+" → "+d.output,
+      xlabel:axis,w:520,h:190}));
+    g.appendChild(card);});
+}
+
+/* ---------------- explore ---------------- */
+const SC_FIELDS=`
+  <div class="grid g4">
+    <div><label>Pattern</label><select data-f="pattern">
+      ${["continuous","progression","4x4","10x1","30:30"].map(p=>
+        `<option>${p}</option>`).join("")}</select></div>
+    <div><label>Intensity (% VO₂max)</label>
+      <input type="number" data-f="intensity" value="70" min="40" max="100" step="1"></div>
+    <div><label>Duration (min)</label>
+      <input type="number" data-f="duration_min" value="45" min="5" max="180" step="5"></div>
+    <div><label>Gradient (%)</label>
+      <input type="number" data-f="grade_pct" value="0" min="-40" max="40" step="0.5"></div>
+    <div><label>Hours since meal</label>
+      <input type="number" data-f="hours_since_meal" value="3" min="0.5" max="20" step="0.5"></div>
+    <div><label>Pre-run carbohydrate (g)</label>
+      <input type="number" data-f="pre_run_cho_g" value="0" min="0" max="150" step="5"></div>
+    <div><label>Previous-day carbohydrate</label><select data-f="prev_day_cho">
+      <option>low</option><option selected>mixed</option><option>high</option></select></div>
+    <div><label>Elevation (m)</label>
+      <input type="number" data-f="elevation_m" value="0" min="0" max="5000" step="100"></div>
+    <div><label>Glycogen prior</label><select data-f="glycogen_prior">
+      <option>derived</option><option>low</option><option>moderate</option>
+      <option>high</option></select></div>
+    <div><label>Experimental input</label><select data-f="adapter">
+      <option value="">none</option></select></div>
+    <div><label>Adapter dose</label>
+      <input type="number" data-f="dose" value="0" step="0.5"></div>
+    <div><label>Minutes before run</label>
+      <input type="number" data-f="timing" value="60" step="5"></div>
+  </div>`;
+function scFields(root){
+  const sel=root.querySelector('[data-f="adapter"]');
+  META.adapters.forEach(a=>{const o=el("option",null,
+    a.name+(a.enabled?"":" (disabled)"));o.value=a.name;sel.appendChild(o);});
+}
+function readSc(root){
+  const g=f=>root.querySelector(`[data-f="${f}"]`).value;
+  const sc={pattern:g("pattern"),
+    intensity:{kind:"pct_vo2max",value:parseFloat(g("intensity"))/100},
+    duration_min:parseFloat(g("duration_min")),
+    grade_pct:parseFloat(g("grade_pct")),
+    hours_since_meal:parseFloat(g("hours_since_meal")),
+    pre_run_cho_g:parseFloat(g("pre_run_cho_g")),
+    prev_day_cho:g("prev_day_cho"),
+    glycogen_prior:g("glycogen_prior"),
+    elevation_m:parseFloat(g("elevation_m")),experimental:[]};
+  const ad=g("adapter");
+  if(ad){const spec=META.adapters.find(a=>a.name===ad);
+    sc.experimental=[{adapter:ad,dose:parseFloat(g("dose"))||0,
+      dose_unit:spec?spec.dose_unit:"mg",
+      timing_min_before:parseFloat(g("timing"))||0,
+      days_loaded:ad==="creatine"?7:0}];}
+  return sc;
+}
+function renderExplore(){
+  const s=$("#s-explore");
+  s.innerHTML=`<p class="lead">Run the real engine against the loaded profile.
+  Each run is an ensemble over plausible personal states crossed with draws of
+  the population biochemical constants, so every number comes back as a
+  distribution.</p>
+  <h2>Scenario A</h2><div class="card" id="scA">${SC_FIELDS}</div>
+  <h2>Scenario B <span class="muted" style="font-weight:400;font-size:12px">
+    (for the contrast)</span></h2><div class="card" id="scB">${SC_FIELDS}</div>
+  <div class="card" style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+    <div style="max-width:150px"><label>Ensemble size</label>
+      <input type="number" id="nsamp" value="64" min="16" max="400" step="16"></div>
+    <button class="go" id="runA">Run scenario A</button>
+    <button class="go alt" id="runCmp">Contrast A → B</button>
+    <span id="status" class="muted"></span>
+    <span class="muted" style="font-size:11.5px;flex-basis:100%">
+      A run of 64 members takes roughly 10-20 seconds; a contrast runs both
+      arms, so it takes about twice that. Larger ensembles give a steadier
+      median, which matters most for right-skewed outputs like peak lactate.
+    </span>
+  </div>
+  <div id="result"></div>`;
+  scFields($("#scA"));scFields($("#scB"));
+  const b=$("#scB");
+  b.querySelector('[data-f="hours_since_meal"]').value="14";
+  b.querySelector('[data-f="intensity"]').value="70";
+  $("#runA").onclick=()=>doRun();
+  $("#runCmp").onclick=()=>doCompare();
+}
+async function post(url,body){
+  const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify(body)});
+  return await r.json();
+}
+function busy(on,msg){$("#status").innerHTML=on?
+  `<span class="spin"></span> ${esc(msg||"running…")}`:"";
+  $("#runA").disabled=on;$("#runCmp").disabled=on;}
+async function doRun(){
+  busy(true,"simulating ensemble");
+  const d=await post("/api/run",{scenario:readSc($("#scA")),
+    n:parseInt($("#nsamp").value)||96});
+  busy(false);
+  if(d.error){$("#result").innerHTML=`<div class="note bad">${esc(d.error)}</div>`;return;}
+  $("#result").innerHTML="";$("#result").appendChild(runCard(d));
+}
+function runCard(d){
+  const root=el("div");
+  const est=d.estimates, tr=d.trajectories||{};
+  root.innerHTML=`<h2>Result</h2>
+  <div class="note">${esc(d.scenario.description)} — ensemble of
+   ${d.metadata.n_samples} personal states, input quality
+   <b>${esc(d.metadata.input_quality)}</b>. Every value below is simulated.</div>
+  ${d.mechanism&&d.mechanism.first_limiting_mechanism?`<div class="card">
+    <h3>First limiting mechanism</h3>
+    <div style="font-size:16px;font-weight:600">${esc(d.mechanism.first_limiting_mechanism)}
+      <span class="pill info">p = ${nf(d.mechanism.probability,2)}</span></div>
+    ${(d.mechanism.alternate_feasible_mechanisms||[]).length?
+      `<div class="muted" style="margin-top:6px">Alternate feasible mechanisms where
+       parameters are uncertain: `+d.mechanism.alternate_feasible_mechanisms
+       .map(a=>`${esc(a.mechanism)} (p = ${nf(a.probability,2)})`).join("; ")+
+       `</div>`:""}
+    <div class="muted" style="margin-top:6px">Initial glycogen is compatible with
+      a <b>${esc(d.mechanism.glycogen_band)}</b> store; this is a band, not a
+      biopsy-equivalent concentration.</div></div>`:""}
+  <div id="charts" class="grid g2"></div>
+  <h3>Model-computed outputs</h3><div id="tbl1"></div>
+  <h3>Derived mechanism outputs</h3><div id="tbl2"></div>
+  ${(d.warnings||[]).length?`<h3>Warnings and applicability</h3>
+    <div class="card">${d.warnings.map(w=>
+      `<div style="margin:4px 0">• ${esc(w)}</div>`).join("")}</div>`:""}
+  ${(d.metadata.sensitivity)?`<h3>What drives each conclusion</h3>
+    <div class="card scroll"><table><thead><tr><th>Output</th><th>Parameter</th>
+    <th class="num">Partial rank correlation</th><th>Direction</th><th>Class</th>
+    <th>Support</th></tr></thead><tbody>${
+      Object.entries(d.metadata.sensitivity).flatMap(([k,list])=>
+      list.slice(0,4).map((x,i)=>`<tr><td>${i?"":esc(k.replace(/_/g," "))}</td>
+        <td class="mono">${esc(x.parameter)}</td>
+        <td class="num">${nf(x.prcc,2)}</td><td>${esc(x.direction)}</td>
+        <td><span class="tag">${esc(x.pclass)}</span></td>
+        <td><span class="tag">${esc(x.support)}</span></td></tr>`)).join("")}
+    </tbody></table></div>`:""}`;
+  const C=root.querySelector("#charts");
+  const t=tr.t_min||[];
+  const add=(key,title,unit,color)=>{
+    if(!tr[key])return;
+    const c=el("div","card");
+    c.appendChild(lineChart({x:t,series:[{y:tr[key].median,
+      band:[tr[key].p10,tr[key].p90],
+      label:`median, 10–90% (${tr.n_members||0} members)`,color}],
+      title,unit,xlabel:"minutes",w:520,h:190}));
+    C.appendChild(c);};
+  add("vo2","Whole-body VO₂ equivalent","mL/kg/min","var(--ox)");
+  add("pcr_frac","Phosphocreatine","fraction of resting","var(--pcr)");
+  add("blood_lactate","Arterial lactate","mmol/L","var(--gly)");
+  add("glycogen","Muscle glycogen","mmol glucosyl/kg ww","var(--accent)");
+  add("ph_type2","Type II fibre pH","pH","var(--gly)");
+  add("o2_type2","Type II intracellular oxygen","mmol/L","var(--ox)");
+  const mk=(names,into)=>{
+    const rows=names.filter(n=>est[n]).map(n=>est[n]);
+    root.querySelector(into).innerHTML=`<div class="card scroll"><table><thead><tr>
+      <th>Output</th><th class="num">Median</th><th class="num">80% interval</th>
+      <th class="num">95% interval</th><th>Unit</th><th>Support</th>
+      <th>Drivers</th></tr></thead><tbody>${rows.map(e=>
+      `<tr><td>${esc(e.label)}${e.note?`<div class="muted"
+         style="font-size:11px">${esc(e.note)}</div>`:""}</td>
+       <td class="num">${e.censored_fraction>=0.5?"not reached":nf(e.median,3)}</td>
+       <td class="num muted">${nf(e.ci80[0],3)} – ${nf(e.ci80[1],3)}</td>
+       <td class="num muted">${nf(e.ci95[0],3)} – ${nf(e.ci95[1],3)}</td>
+       <td class="mono muted">${esc(e.unit)}</td>
+       <td><span class="tag">${esc(e.support)}</span></td>
+       <td class="muted mono" style="font-size:11px">${
+         (e.drivers||[]).slice(0,3).map(esc).join(", ")}</td></tr>`).join("")}
+      </tbody></table></div>`;};
+  mk(["atp_demand","atp_coverage","oxidative_atp_fraction",
+      "glycolytic_atp_fraction","pcr_atp_fraction","muscle_vo2",
+      "whole_body_vo2_equiv","carbohydrate_oxidation","fat_oxidation",
+      "ketone_oxidation","fat_carbon_fraction","fat_g_per_min","cho_g_per_min",
+      "glycogen_used","glycogen_remaining","pcr_end_fraction",
+      "pcr_minimum_fraction","lactate_production","blood_lactate_peak",
+      "muscle_ph_min","muscle_ph_type2_min","tca_flux","etc_flux"],"#tbl1");
+  mk(["spare_oxidative_capacity","oxidative_ceiling_workload",
+      "time_to_glycogen_limit","time_to_lactate_pressure","type1_atp_share",
+      "type2_atp_share","atp_per_oxygen","o2_limitation_factor",
+      "free_adp_end","relative_intensity"],"#tbl2");
+  return root;
+}
+async function doCompare(){
+  busy(true,"simulating both arms with paired samples");
+  const d=await post("/api/compare",{a:readSc($("#scA")),b:readSc($("#scB")),
+    n:parseInt($("#nsamp").value)||96});
+  busy(false);
+  if(d.error){$("#result").innerHTML=`<div class="note bad">${esc(d.error)}</div>`;return;}
+  const cs=Object.values(d.contrasts||{});
+  $("#result").innerHTML=`<h2>Contrast</h2>
+  <div class="note">${esc(d.narrative)}</div>
+  <div class="card"><dl class="kv">
+    <dt>A</dt><dd>${esc(d.scenario_a.description)}</dd>
+    <dt>B</dt><dd>${esc(d.scenario_b.description)}</dd>
+    <dt>Inputs that differ</dt><dd>${esc((d.metadata.inputs_that_differ||[]).join("; ")||"none")}</dd>
+    <dt>Conclusion basis</dt><dd>${esc(d.metadata.conclusion_basis)}</dd>
+    <dt>Pairing</dt><dd>${esc(d.metadata.pairing_note)}</dd>
+  </dl></div>
+  <div class="card scroll"><table><thead><tr><th>Output</th>
+    <th class="num">A</th><th class="num">B</th><th class="num">Change</th>
+    <th class="num">80% interval</th><th class="num">95% interval</th>
+    <th class="num">P(direction)</th><th>Verdict</th><th>Could reverse it</th>
+    </tr></thead><tbody>${cs.map(c=>
+    `<tr><td>${esc(c.label)}<div class="muted mono" style="font-size:11px">${esc(c.unit)}</div></td>
+     <td class="num">${nf(c.median_a,3)}</td><td class="num">${nf(c.median_b,3)}</td>
+     <td class="num" style="color:${c.median_change>0?"var(--ox)":"var(--pcr)"}">
+       ${c.median_change>0?"+":""}${nf(c.median_change,3)}
+       ${c.pct_change!=null?`<div class="muted">${c.pct_change>0?"+":""}${nf(c.pct_change,3)}%</div>`:""}</td>
+     <td class="num muted">${nf(c.ci80[0],3)} – ${nf(c.ci80[1],3)}</td>
+     <td class="num muted">${nf(c.ci95[0],3)} – ${nf(c.ci95[1],3)}</td>
+     <td class="num">${nf(c.p_direction,2)}</td>
+     <td><span class="pill ${c.verdict==="unresolved"?"warn":"pass"}">${esc(c.verdict)}</span></td>
+     <td class="muted mono" style="font-size:11px">${
+       (c.reversers||[]).slice(0,2).map(r=>esc(r.parameter)).join(", ")||"—"}</td>
+     </tr>`).join("")}</tbody></table></div>
+  <div id="cmpcharts" class="grid g2"></div>`;
+  const C=$("#cmpcharts");
+  const ta=d.a_trajectories||{},tb=d.b_trajectories||{};
+  const t=ta.t_min||[];
+  [["vo2","Whole-body VO₂ equivalent","mL/kg/min"],
+   ["pcr_frac","Phosphocreatine","fraction of resting"],
+   ["blood_lactate","Arterial lactate","mmol/L"],
+   ["glycogen","Muscle glycogen","mmol glucosyl/kg ww"]].forEach(([k,title,unit])=>{
+     if(!ta[k]||!tb[k])return;
+     const c=el("div","card");
+     c.appendChild(lineChart({x:t,series:[
+       {y:ta[k].median,label:"A",color:"var(--ox)"},
+       {y:tb[k].median,label:"B",color:"var(--accent)"}],
+       title,unit,xlabel:"minutes",w:520,h:190}));
+     C.appendChild(c);});
+}
+
+/* ---------------- model ---------------- */
+function renderModel(){
+  const s=$("#s-model");
+  s.innerHTML=`<p class="lead">Every number the engine uses is registered with a
+  unit, an uncertainty distribution, a parameter class, a source, and a rationale
+  explaining why it is defensible for running muscle. The unit audit is executed,
+  not asserted.</p>
+  <div class="grid g4">
+    ${Object.entries(META.param_class_counts).map(([k,v])=>
+      stat(k+" parameters",v,"")).join("")}
+  </div>
+  <div class="grid g4" style="margin-top:12px">
+    ${Object.entries(META.support_counts).map(([k,v])=>
+      stat(k+" support",v,"")).join("")}
+  </div>
+  <h2>Documented reductions</h2>
+  <p>Every departure from a full mechanistic reimplementation, and why it was
+  made.</p>
+  <div class="card scroll"><table><thead><tr><th>Element</th><th>Change</th>
+    <th>Why</th></tr></thead><tbody>${META.reductions.map(r=>
+    `<tr><td class="mono">${esc(r.item)}</td><td>${esc(r.change)}</td>
+     <td class="muted">${esc(r.why)}</td></tr>`).join("")}</tbody></table></div>
+  <h2>Declared equations</h2>
+  <div class="card scroll"><table><thead><tr><th>Name</th><th>Expression</th>
+    <th>Produces</th><th>Rationale</th><th>Modified from source</th>
+    </tr></thead><tbody>${META.equations.map(e=>
+    `<tr><td class="mono">${esc(e.name)}</td>
+     <td class="mono" style="font-size:11px">${esc(e.expression)}</td>
+     <td class="mono">${esc(e.produces)}</td>
+     <td class="muted">${esc(e.rationale)}</td>
+     <td class="muted">${esc(e.modified_from_source||"—")}</td></tr>`).join("")}
+    </tbody></table></div>
+  <h2>Stoichiometric and feasibility audit</h2>
+  <div class="card"><p>${META.network_audit.passed} of
+    ${META.network_audit.total} checks pass: carbon balance on every
+    carbon-carrying reaction, redox balance across the respiratory chain and
+    shuttles, the accepted ATP yields for a glycosyl unit and for palmitate,
+    the absence of any ATP-generating cycle when every exchange is closed, and
+    the disappearance of ATP synthesis when oxygen and the substrate-level
+    pathways are blocked.</p>
+    ${META.network_audit.failures.length?`<div class="note bad">${
+      META.network_audit.failures.map(f=>esc(f.detail)).join("<br>")}</div>`:""}
+  </div>
+  <h2>Experimental adapters</h2>
+  ${META.adapters.map(a=>`<details><summary>
+    <span class="pill ${a.enabled?"pass":"warn"}">${a.enabled?"enabled":"disabled"}</span>
+    &nbsp;${esc(a.name)} <span class="muted" style="font-weight:400">— ${esc(a.parameter_changed)}</span>
+    </summary><div class="dbody"><dl class="kv">
+      <dt>Effect</dt><dd style="font-family:var(--sans)">${esc(a.effect_summary)}</dd>
+      <dt>Distribution</dt><dd>${esc(a.effect_distribution)}</dd>
+      <dt>Population</dt><dd>${esc(a.population)}</dd>
+      <dt>Tissue</dt><dd>${esc(a.tissue)}</dd>
+      <dt>Dose</dt><dd>${a.dose_range[0]}–${a.dose_range[1]} ${esc(a.dose_unit)}</dd>
+      <dt>Timing</dt><dd>${a.timing_range_min[0]}–${a.timing_range_min[1]} min before</dd>
+      <dt>Confounders</dt><dd style="font-family:var(--sans)">${a.confounders.map(esc).join("; ")||"—"}</dd>
+      <dt>Interactions</dt><dd style="font-family:var(--sans)">${a.interactions.map(esc).join("; ")||"—"}</dd>
+      <dt>Contraindications</dt><dd>${a.contraindications.map(esc).join(", ")||"—"}</dd>
+      <dt>Not estimable when</dt><dd style="font-family:var(--sans)">${a.not_estimable_when.map(esc).join("; ")}</dd>
+      <dt>Evidence</dt><dd>${esc(a.evidence_grade)} / support ${esc(a.support)}</dd>
+      <dt>Source</dt><dd style="font-family:var(--sans)">${esc(a.source_detail.citation)}</dd>
+    </dl></div></details>`).join("")}
+  <h2>Scenario grid</h2>
+  <div class="card"><p>The discrete starter grid contains
+    ${META.grid.raw_combinations.toLocaleString()} raw combinations. The compiler
+    removes ${META.grid.removed.toLocaleString()} that are contradictory or
+    physiologically impossible, leaving
+    <b>${META.grid.valid.toLocaleString()}</b> valid scenarios.</p>
+    <table><thead><tr><th>Rule</th><th class="num">Removed</th>
+      <th>Example</th></tr></thead><tbody>${
+      Object.entries(META.grid.removed_by_rule).map(([k,v])=>
+      `<tr><td class="mono">${esc(k)}</td><td class="num">${v.toLocaleString()}</td>
+       <td class="muted" style="font-size:11.5px">${esc(META.grid.example_per_rule[k]||"")}</td>
+       </tr>`).join("")}</tbody></table></div>
+  <h2>Parameter registry</h2>
+  <div class="searchrow"><input type="text" id="pfilter"
+    placeholder="filter by name, source, rationale…">
+    <span class="muted mono" id="pcount"></span></div>
+  <div id="ptable"></div>`;
+  const draw=()=>{
+    const q=($("#pfilter").value||"").toLowerCase();
+    const rows=META.parameters.filter(p=>!q||
+      (p.name+p.source+p.rationale+p.unit+p.pclass+p.support).toLowerCase().includes(q));
+    $("#pcount").textContent=`${rows.length} of ${META.parameters.length}`;
+    $("#ptable").innerHTML=`<div class="card scroll"><table><thead><tr>
+      <th>Parameter</th><th class="num">Value</th><th>Unit</th><th>Class</th>
+      <th>Support</th><th>Distribution</th><th>Rationale and source</th>
+      </tr></thead><tbody>${rows.map(p=>
+      `<tr><td class="mono">${esc(p.name)}${p.tags.includes("sensitivity_key")?
+         ` <span class="tag">key</span>`:""}</td>
+       <td class="num">${nf(p.value,4)}</td><td class="mono muted">${esc(p.unit)}</td>
+       <td><span class="tag">${esc(p.pclass)}</span></td>
+       <td><span class="tag">${esc(p.support)}</span></td>
+       <td class="mono muted" style="font-size:11px">${p.dist?
+         esc(p.dist.kind+"("+nf(p.dist.a,3)+", "+nf(p.dist.b,3)+")"):"fixed"}</td>
+       <td class="muted">${esc(p.rationale)}
+         <div style="margin-top:4px;font-size:11px">
+         ${p.url?`<a href="${esc(p.url)}" target="_blank" rel="noopener">`:""}
+         ${esc(p.citation)}${p.url?"</a>":""}
+         ${p.population?` — ${esc(p.population)}; ${esc(p.tissue)}`:""}</div>
+       </td></tr>`).join("")}</tbody></table></div>`;};
+  $("#pfilter").oninput=draw;draw();
+}
+
+/* ---------------- this person ---------------- */
+function renderInputs(){
+  const s=$("#s-inputs");
+  if(!PROF){s.innerHTML="loading…";return;}
+  const qc=PROF.qc,p=PROF.profile;
+  s.innerHTML=`<p class="lead">The loaded profile
+  (<span class="mono">${esc(PROF.path)}</span>), and exactly how each input is
+  used. Inputs are observations a person can make; nobody is asked to enter a
+  rate constant.</p>
+  <div class="grid g4">
+    ${stat("Input quality",esc(qcQuality()),"")}
+    ${stat("Runs supplied",p.wearable.runs.length,
+      `${p.calibration_runs.length} standardized calibration runs`)}
+    ${stat("Laboratory values",p.labs?p.labs.values.length:0,
+      `${qc.lab_disposition.filter(l=>l.role==="ignored").length} ignored, no defensible mapping`)}
+    ${stat("Confidence penalty",nf(qc.confidence_penalty,3),
+      "multiplicative widening from QC findings")}
+  </div>
+  <h2>How every laboratory value is used</h2>
+  <div class="card scroll"><table><thead><tr><th>Analyte</th>
+    <th class="num">Value</th><th class="num">Age</th><th>Role</th>
+    <th>Touches</th><th>Strength</th><th>Reason</th></tr></thead><tbody>
+    ${qc.lab_disposition.map(l=>`<tr><td class="mono">${esc(l.analyte)}</td>
+      <td class="num">${nf(l.value,4)} <span class="muted">${esc(l.unit)}</span></td>
+      <td class="num muted">${l.age_days} d</td>
+      <td><span class="pill ${l.role==="constraint"?"pass":
+        (l.role==="prior"?"info":(l.role==="flag"?"warn":"fail"))}">${esc(l.role)}</span></td>
+      <td class="mono muted">${esc(l.target||"—")}</td>
+      <td class="muted">${esc(l.strength)}</td>
+      <td class="muted">${esc(l.reason)}</td></tr>`).join("")}
+    </tbody></table></div>
+  <h2>Input QC findings</h2>
+  <div class="card scroll"><table><thead><tr><th>Severity</th><th>Code</th>
+    <th>Finding</th><th>Affects</th></tr></thead><tbody>${qc.findings.map(f=>
+    `<tr><td><span class="pill ${f.severity==="block"?"fail":
+       (f.severity==="warn"?"warn":(f.severity==="widen"?"info":"info"))}">
+       ${esc(f.severity)}</span></td>
+     <td class="mono">${esc(f.code)}</td><td>${esc(f.message)}</td>
+     <td class="mono muted">${esc(f.affects||"—")}</td></tr>`).join("")}
+    </tbody></table></div>
+  <h2>Signal quality model</h2>
+  <p>Consumer wearable signals are carried with different error models: the
+  living systematic review found stronger agreement for heart rate than for
+  energy expenditure and several sleep outputs, and a wrist cardio-fitness
+  figure is an estimate from heart and motion sensors, not respiratory gas
+  measurement.</p>
+  <div class="card scroll"><table><thead><tr><th>Signal</th><th>Tier</th>
+    </tr></thead><tbody>${Object.entries(qc.signal_quality).map(([k,v])=>
+    `<tr><td class="mono">${esc(k)}</td><td><span class="pill ${
+      v==="good"?"pass":(v==="moderate"?"info":"warn")}">${esc(v)}</span></td>
+     </tr>`).join("")}</tbody></table></div>
+  <h2>Profile as loaded</h2>
+  <details><summary>Raw profile JSON</summary><div class="dbody">
+    <pre class="mono" style="white-space:pre-wrap;font-size:11px;color:var(--fg2)">${
+      esc(JSON.stringify(p,null,1))}</pre></div></details>`;
+}
+function qcQuality(){return "see run metadata";}
+
+/* ---------------- boot ---------------- */
+(async function(){
+  nav();
+  [META,VAL,PROF]=await Promise.all([
+    fetch("/api/meta").then(r=>r.json()),
+    fetch("/api/validation").then(r=>r.json()),
+    fetch("/api/profile").then(r=>r.json())]);
+  $("#verline").textContent=
+    `${META.model_version} · registry ${META.registry_version} · `+
+    `${META.parameters.length} parameters · ${META.tissue}`;
+  renderOverview();renderVerify();renderCalib();renderCohort();
+  renderSweeps();renderExplore();renderModel();renderInputs();
+})();
+</script>
+</body>
+</html>

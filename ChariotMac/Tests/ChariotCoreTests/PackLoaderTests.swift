@@ -307,6 +307,29 @@ final class PackLoaderTests: XCTestCase {
 
     /// A missing bundle directory (dev builds run from the build tree) is not
     /// an error — the app still starts, just without samples.
+    /// The packs shipped in the repo must always load — a broken pack.json
+    /// or a workspace entry pointing at a missing folder would otherwise
+    /// surface only when a user creates an agent from it.
+    func testShippedRepoPacksLoad() throws {
+        let repoPacks = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // ChariotCoreTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // ChariotMac
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent("packs")
+        let packs = PackLoader.availablePacks(in: repoPacks)
+        XCTAssertEqual(packs.map(\.directoryName), ["guardian.pack", "scribe.pack"])
+
+        // Guardian ships the mitochondria simulator: the vendored engine
+        // lands under /workspace/sim and its wrapper stays executable.
+        let guardian = try XCTUnwrap(packs.first { $0.directoryName == "guardian.pack" })
+        let files = try guardian.workspaceFiles()
+        XCTAssertTrue(files.contains { $0.destination == "/workspace/sim/mitosim/cli.py" })
+        XCTAssertTrue(files.contains { $0.destination == "/workspace/sim/examples/runner.json" })
+        let wrapper = try XCTUnwrap(files.first { $0.destination == "/workspace/tools/mitosim.sh" })
+        XCTAssertTrue(wrapper.executable)
+    }
+
     func testSeedingFromMissingDirectoryIsHarmless() {
         let destination = packsDir.appendingPathComponent("data-packs")
         let seeded = PackLoader.seedBundledPacks(

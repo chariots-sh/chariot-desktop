@@ -1,0 +1,6 @@
+{"label":"4x4 interval session at 2200 m",
+ "pattern":"4x4","intensity":{"kind":"pct_vo2max","value":0.90},
+ "duration_min":45,"grade_pct":0,"hours_since_meal":3,"pre_run_cho_g":25,
+ "prev_day_cho":"high","glycogen_prior":"derived","elevation_m":2200,
+ "time_of_day":"09:00","experimental":[{"adapter":"caffeine","dose":3.0,
+   "dose_unit":"mg/kg","timing_min_before":60}]}

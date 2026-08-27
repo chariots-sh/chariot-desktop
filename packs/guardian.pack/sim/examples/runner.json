@@ -1,0 +1,67 @@
+{
+  "subject_id": "example-runner",
+  "as_of": "2026-08-26",
+  "body": {"age_y": 35, "sex_at_birth": "male", "height_cm": 178,
+           "mass_kg": 72, "body_fat_pct": 14, "habitual_elevation_m": 40},
+  "training": {"years_running": 9, "weekly_km": 55, "weekly_hours_total": 6.0,
+               "longest_recent_run_km": 24, "sessions_above_threshold_per_week": 1.5,
+               "self_described_level": "trained"},
+  "clinical": {"medications": [], "diagnoses": [], "soreness_0_10": 2},
+  "wearable": {
+    "vo2max_estimate_ml_kg_min": 54, "vo2max_source": "apple_watch_cardio_fitness",
+    "resting_hr_bpm": 48, "max_hr_bpm_observed": 186, "mean_sleep_h": 7.2,
+    "last_night_sleep_h": 7.0, "hrv_ms": 62, "window_days": 90,
+    "device": "Apple Watch",
+    "runs": [
+      {"start": "2026-08-20T07:05:00", "duration_s": 2700, "distance_km": 9.4,
+       "mean_hr_bpm": 141, "mean_grade_pct": 0.4, "device_quality": "wrist_optical"},
+      {"start": "2026-08-22T06:58:00", "duration_s": 3600, "distance_km": 12.1,
+       "mean_hr_bpm": 138, "mean_grade_pct": 0.2, "device_quality": "wrist_optical"},
+      {"start": "2026-08-24T07:12:00", "duration_s": 5400, "distance_km": 18.6,
+       "mean_hr_bpm": 145, "mean_grade_pct": 0.6, "device_quality": "wrist_optical"}
+    ]
+  },
+  "calibration_runs": [
+    {"protocol_id": "flat-loop-25min", "hours_since_meal": 3,
+     "prev_24h_cho_g": 380, "caffeine_mg": 0, "sleep_h": 7.1,
+     "run": {"start": "2026-08-10T07:00:00", "duration_s": 1500,
+             "distance_km": 5.55, "mean_hr_bpm": 148, "mean_grade_pct": 0.0,
+             "hr_recovery_60s_bpm": 33, "rpe_6_20": 13,
+             "device_quality": "chest_strap"}},
+    {"protocol_id": "flat-loop-25min", "hours_since_meal": 3,
+     "prev_24h_cho_g": 365, "caffeine_mg": 0, "sleep_h": 7.4,
+     "run": {"start": "2026-08-13T07:00:00", "duration_s": 1500,
+             "distance_km": 5.52, "mean_hr_bpm": 150, "mean_grade_pct": 0.0,
+             "hr_recovery_60s_bpm": 31, "rpe_6_20": 13,
+             "device_quality": "chest_strap"}},
+    {"protocol_id": "flat-loop-25min", "hours_since_meal": 3,
+     "prev_24h_cho_g": 390, "caffeine_mg": 0, "sleep_h": 6.9,
+     "run": {"start": "2026-08-17T07:00:00", "duration_s": 1500,
+             "distance_km": 5.58, "mean_hr_bpm": 147, "mean_grade_pct": 0.0,
+             "hr_recovery_60s_bpm": 34, "rpe_6_20": 12,
+             "device_quality": "chest_strap"}}
+  ],
+  "nutrition": {
+    "prev_24h_cho_g": 380, "prev_48h_cho_g": 720, "hours_since_last_meal": 3,
+    "exercise_since_last_high_cho_meal": false, "hard_sessions_last_48h": 0,
+    "meals": [
+      {"timestamp": "2026-08-26T07:30:00", "carbohydrate_g": 62, "fat_g": 18,
+       "protein_g": 31, "fiber_g": 8, "alcohol_g": 0, "caffeine_mg": 80,
+       "estimation_quality": "weighed"}
+    ]
+  },
+  "labs": [
+    {"analyte": "hemoglobin", "value": 15.1, "unit": "g/dL",
+     "collected": "2026-07-02", "fasting": true, "ref_low": 13.5, "ref_high": 17.5},
+    {"analyte": "ferritin", "value": 68, "unit": "ug/L",
+     "collected": "2026-07-02", "fasting": true, "ref_low": 30, "ref_high": 300},
+    {"analyte": "fasting_glucose", "value": 5.0, "unit": "mmol/L",
+     "collected": "2026-07-02", "fasting": true, "ref_low": 3.9, "ref_high": 5.5},
+    {"analyte": "hba1c", "value": 5.2, "unit": "%",
+     "collected": "2026-07-02", "fasting": true, "ref_low": 4.0, "ref_high": 5.6},
+    {"analyte": "hs_crp", "value": 0.6, "unit": "mg/L",
+     "collected": "2026-07-02", "fasting": true, "ref_low": 0.0, "ref_high": 3.0},
+    {"analyte": "vitamin_d", "value": 34, "unit": "ng/mL",
+     "collected": "2026-07-02", "fasting": true, "ref_low": 30, "ref_high": 100}
+  ]
+}
