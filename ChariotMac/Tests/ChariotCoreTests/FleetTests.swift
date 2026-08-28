@@ -82,6 +82,61 @@ final class FleetTests: XCTestCase {
         XCTAssertFalse([guardian.instanceID, scribe.instanceID].contains(legacy))
     }
 
+    func testPackSizingEditReachesExistingInstance() async throws {
+        let guardian = try await hub.createAgent(fromPackDirectory: "guardian.pack")
+        let instance = InstancePaths(directory: hub.paths.instanceDirectory(guardian.instanceID))
+        let diskSize = { try XCTUnwrap(FileManager.default
+            .attributesOfItem(atPath: instance.writableDisk.path)[.size] as? UInt64) }
+        XCTAssertEqual(try diskSize(), 1024 * 1024 * 1024)
+
+        // The user edits pack.json: more of everything. Reset (which also
+        // covers the start path — both call applyPackSizingIfNeeded) must
+        // fold the new sizing into the existing instance.
+        try """
+        { "id": "test.guardian.pack", "name": "guardian", "version": "1.1.0",
+          "vm": { "cpus": 4, "memoryMB": 4096, "diskGB": 2 },
+          "workspace": [ { "src": "AGENTS.md", "dest": "/workspace/AGENTS.md" } ] }
+        """.write(to: hub.paths.packsDirectory
+                    .appendingPathComponent("guardian.pack/pack.json"),
+                  atomically: true, encoding: .utf8)
+        try await hub.resetAgent(guardian.instanceID)
+
+        var config = try JSONDecoder().decode(SandboxConfiguration.self,
+                                              from: Data(contentsOf: instance.configuration))
+        XCTAssertEqual(config.cpuCount, 4)
+        XCTAssertEqual(config.memoryBytes, 4096 * 1024 * 1024)
+        XCTAssertEqual(config.diskBytes, 2 * 1024 * 1024 * 1024)
+        XCTAssertEqual(try diskSize(), 2 * 1024 * 1024 * 1024)
+
+        // Sizing down: cpu and memory follow the pack, the disk never
+        // shrinks — cutting a raw image under a guest filesystem destroys it.
+        try """
+        { "id": "test.guardian.pack", "name": "guardian", "version": "1.2.0",
+          "vm": { "cpus": 2, "memoryMB": 2048, "diskGB": 1 },
+          "workspace": [ { "src": "AGENTS.md", "dest": "/workspace/AGENTS.md" } ] }
+        """.write(to: hub.paths.packsDirectory
+                    .appendingPathComponent("guardian.pack/pack.json"),
+                  atomically: true, encoding: .utf8)
+        XCTAssertTrue(try hub.backend.applySizing(
+            guardian.instanceID,
+            from: SandboxConfiguration(cpuCount: 2, memoryBytes: 2048 * 1024 * 1024,
+                                       diskBytes: 1024 * 1024 * 1024,
+                                       baseImagePath: hub.defaultBaseImagePath!)))
+        config = try JSONDecoder().decode(SandboxConfiguration.self,
+                                          from: Data(contentsOf: instance.configuration))
+        XCTAssertEqual(config.cpuCount, 2)
+        XCTAssertEqual(config.memoryBytes, 2048 * 1024 * 1024)
+        XCTAssertEqual(config.diskBytes, 2 * 1024 * 1024 * 1024)
+        XCTAssertEqual(try diskSize(), 2 * 1024 * 1024 * 1024)
+
+        // Unchanged sizing is a no-op, not a rewrite.
+        XCTAssertFalse(try hub.backend.applySizing(
+            guardian.instanceID,
+            from: SandboxConfiguration(cpuCount: 2, memoryBytes: 2048 * 1024 * 1024,
+                                       diskBytes: 1024 * 1024 * 1024,
+                                       baseImagePath: hub.defaultBaseImagePath!)))
+    }
+
     func testDeleteAgentRemovesInstanceIndexAndAccess() async throws {
         let guardian = try await hub.createAgent(fromPackDirectory: "guardian.pack")
         let scribe = try await hub.createAgent(fromPackDirectory: "scribe.pack")

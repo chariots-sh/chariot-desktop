@@ -1,0 +1,8 @@
+{"label":"Threshold 30 min, matrix NAD pool at 80% of the sampled value",
+ "pattern":"continuous","intensity":{"kind":"pct_vo2max","value":0.80},
+ "duration_min":30,"grade_pct":0,"hours_since_meal":3,"pre_run_cho_g":0,
+ "prev_day_cho":"mixed","glycogen_prior":"derived","elevation_m":0,
+ "time_of_day":"08:00",
+ "mechanisms":[{"mechanism":"mitochondrial_nad_pool","horizon_days":0,
+                "settings":{"pool_scale":0.80}}],
+ "experimental":[]}

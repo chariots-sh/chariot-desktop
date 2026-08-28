@@ -1,0 +1,5 @@
+{"label":"45 min at Zone 2, twelve hours fasted",
+ "pattern":"continuous","intensity":{"kind":"pct_vo2max","value":0.65},
+ "duration_min":45,"grade_pct":0,"hours_since_meal":12,"pre_run_cho_g":0,
+ "prev_day_cho":"mixed","glycogen_prior":"derived","elevation_m":0,
+ "time_of_day":"06:30","experimental":[]}

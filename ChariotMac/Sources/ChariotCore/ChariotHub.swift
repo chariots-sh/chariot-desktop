@@ -434,6 +434,7 @@ public final class ChariotHub: @unchecked Sendable {
 
     private func start(_ context: AgentContext) async throws {
         guard let vm = context.vmInstanceID else { throw ChariotError.invalidState("no instance") }
+        applyPackSizingIfNeeded(context)
         try await backend.start(vm)
         try await connectBridge(context)
         try startBrokerIfNeeded(context)
@@ -502,6 +503,29 @@ public final class ChariotHub: @unchecked Sendable {
             context.packInstalled = [:]  // Full pack replay on the next boot.
         }
         try await backend.reset(vm)
+        // After the stop inside reset the instance is sizable; the re-cloned
+        // disk from reset() was cut at the old size, so apply-then-reset
+        // ordering doesn't work — apply now so the next start boots resized.
+        applyPackSizingIfNeeded(context)
+    }
+
+    /// Fold the pack's current VM sizing into an existing instance whenever
+    /// it is safely stopped (agent start, and after reset). Pack edits are
+    /// the one way users express sizing, and they must not be create-time
+    /// only. Best-effort: a failure here never blocks the boot.
+    private func applyPackSizingIfNeeded(_ context: AgentContext) {
+        guard let record = synchronized({ context.record }),
+              let vm = context.vmInstanceID else { return }
+        do {
+            let pack = try PackLoader.load(
+                at: paths.packsDirectory.appendingPathComponent(record.packDirectoryName))
+            let desired = pack.configuration(baseImagePath: defaultBaseImagePath ?? "")
+            if try backend.applySizing(vm, from: desired) {
+                event("\(record.displayName): VM sizing updated from \(record.packDirectoryName)")
+            }
+        } catch {
+            event("\(record.displayName): VM sizing update skipped: \(error)")
+        }
     }
 
     /// Caller holds the lock.

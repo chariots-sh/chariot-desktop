@@ -75,6 +75,56 @@ public final class VirtualMachineBackend: SandboxBackend, @unchecked Sendable {
         try await controller(for: id).start()
     }
 
+    /// Re-apply VM sizing to an existing instance. Packs are user-editable
+    /// content, so a sizing bump in pack.json should reach the agents that
+    /// already exist, not only ones created after the edit — without this,
+    /// sizing is frozen into configuration.json at create time forever.
+    ///
+    /// CPU count and memory adopt the desired values directly (both are
+    /// plain boot parameters). The disk only ever grows: shrinking a raw
+    /// image under a live guest filesystem destroys it. Growing is a sparse
+    /// truncate of writable.img; the guest partition and filesystem catch up
+    /// on the next boot because cloud-init's growpart/resizefs modules run
+    /// every boot on the Debian genericcloud image.
+    ///
+    /// Returns true when anything changed. A running (or transitioning) VM
+    /// is left alone — sizing lands on a later start when it is stopped.
+    public func applySizing(_ id: SandboxID, from desired: SandboxConfiguration) throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if let controller = controllers[id], controller.state != .stopped {
+            return false
+        }
+        let instance = InstancePaths(directory: paths.instanceDirectory(id))
+        guard let data = try? Data(contentsOf: instance.configuration),
+              let persisted = try? JSONDecoder().decode(SandboxConfiguration.self, from: data) else {
+            throw ChariotError.instanceNotFound(id)
+        }
+        var updated = persisted
+        updated.cpuCount = desired.cpuCount
+        updated.memoryBytes = desired.memoryBytes
+        updated.diskBytes = max(persisted.diskBytes, desired.diskBytes)
+        guard updated.cpuCount != persisted.cpuCount
+                || updated.memoryBytes != persisted.memoryBytes
+                || updated.diskBytes != persisted.diskBytes else { return false }
+
+        if updated.diskBytes > persisted.diskBytes,
+           FileManager.default.fileExists(atPath: instance.writableDisk.path) {
+            let handle = try FileHandle(forWritingTo: instance.writableDisk)
+            defer { try? handle.close() }
+            try handle.truncate(atOffset: updated.diskBytes)
+        }
+        try JSONEncoder().encode(updated).write(to: instance.configuration)
+        // Drop the cached (stopped) controller so the next start rebuilds the
+        // VZ configuration from the new sizing; keep the config cache fresh
+        // for reset().
+        controllers[id] = nil
+        configurations[id] = updated
+        ChariotLog.log("instance \(id): sizing now \(updated.cpuCount) cpus, "
+                       + "\(updated.memoryBytes / (1024 * 1024)) MB, "
+                       + "\(updated.diskBytes / (1024 * 1024 * 1024)) GB disk")
+        return true
+    }
+
     public func stop(_ id: SandboxID) async throws {
         try await controller(for: id).stop()
     }

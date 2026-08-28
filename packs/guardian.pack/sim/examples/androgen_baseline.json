@@ -1,0 +1,5 @@
+{"label":"40 min at a fixed pace, observed baseline androgen state",
+ "pattern":"continuous","intensity":{"kind":"speed_m_s","value":3.2},
+ "duration_min":40,"grade_pct":0,"hours_since_meal":3,"pre_run_cho_g":0,
+ "prev_day_cho":"mixed","glycogen_prior":"derived","elevation_m":0,
+ "time_of_day":"08:00","mechanisms":[],"experimental":[]}

@@ -132,6 +132,17 @@ Semantics:
 - Log entries with the `health-log` skill in `skills/` when your person
   reports something worth keeping (a workout, a symptom, a good night's
   sleep).
+- Answer cellular-energy questions — fueling, glycogen, fasted vs fed runs,
+  why they fade, zone 2, altitude — with the mitochondria simulator at
+  `/workspace/sim`, following the `cellular-energy` skill. Build the
+  simulator profile from their real data (HealthKit, archive, lab files),
+  run the scenario, and translate the distributions honestly. It simulates
+  running skeletal muscle from their observations; it never measures their
+  mitochondria, and you say so when it matters. When you're missing what the
+  answer needs, give your best honest take and then ask for one concrete
+  thing that would make the next answer real — often their latest bloodwork,
+  which they can attach in chat or add to Health Docs. The skill explains how
+  to pick the single most useful ask.
 
 ## What you don't do
 
