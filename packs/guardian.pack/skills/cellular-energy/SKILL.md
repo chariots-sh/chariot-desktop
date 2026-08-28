@@ -74,10 +74,45 @@ data** each time before an important answer:
 intervals instead; that widening is the honest answer. Three fields are the
 exception: the engine refuses to run without `body.age_y`, `body.height_cm`,
 and `body.mass_kg`. Mass is usually in HealthKit; age and height you ask
-your person once and keep in `MEMORY.md`. If you don't have them, answer
-from general physiology, say why it isn't personalized, and ask. `qc` tells
-you which missing input would narrow things most (a single capillary lactate
-measurement usually beats everything else).
+your person once and keep in `MEMORY.md`.
+
+## When you're missing what you need — ask for it
+
+A vague answer they can't act on is worse than a smaller answer plus a
+concrete next step. When their question needs data you don't have, still give
+the best honest answer you can from what you do have (general physiology if
+that's all), then **make exactly one targeted ask** for the input that would
+make the *next* answer real. One ask per reply — never a form to fill out.
+
+Let the engine choose the ask for you. Assemble the profile from whatever you
+have and run `qc /workspace/sim/profile.json`; it names the missing input
+that would tighten this person's answer most. Ask for that, specifically, in
+plain language — not "send me your health data".
+
+- **Bloodwork.** If labs are what's missing, ask them to add their most
+  recent blood panel: they can **attach the PDF or a photo right here in the
+  chat**, or drop it into **Health Docs** in the app — either way it syncs to
+  you (chat files land in `/workspace/data/attachments/`, Health Docs in
+  `/workspace/data/files/`) and you read it on your next turn. Name why it
+  helps and which lines matter most for running energy — hemoglobin and
+  ferritin (oxygen carrying and iron), and glucose / HbA1c for fuel — so they
+  know it's not a fishing expedition. Tell them to black out anything they'd
+  rather you not see; you only need those values.
+- **A same-day capillary lactate** is the single measurement that narrows the
+  hardest contrasts (fasted vs fed depth, fitness at a matched pace) more than
+  anything else. It needs a cheap fingerstick meter, so only raise it when
+  they're clearly invested and the question actually hinges on it — one
+  sentence, not a sell.
+- **No data at all.** Don't stall. Answer from general physiology, say plainly
+  it isn't personalized yet, and ask for the smallest unlock: their age,
+  height, and weight (the three the simulator can't run without), and whether
+  they've done any running your HealthKit sync would have. That alone gets a
+  first real simulation next turn.
+
+Close the loop. Note what you asked for in `MEMORY.md` or `/workspace/log/` so
+you don't ask twice, and when it arrives, use it and acknowledge it landed
+("got your panel — your ferritin's on the low side, which fits…"). If they
+decline, respect it and keep working from what you have.
 
 ## Reading the output back to them
 

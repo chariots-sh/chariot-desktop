@@ -1,7 +1,7 @@
 {
   "id": "com.protocols.guardian",
   "name": "Guardian",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "vm": { "cpus": 4, "memoryMB": 4096, "diskGB": 12 },
   "workspace": [
     { "src": "AGENTS.md", "dest": "/workspace/AGENTS.md" },
