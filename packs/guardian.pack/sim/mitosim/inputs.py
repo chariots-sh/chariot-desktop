@@ -239,6 +239,60 @@ class LabPanel(_Ser):
 
 
 # --------------------------------------------------------------------------
+# Androgen context (baseline observations for the mechanism lab)
+# --------------------------------------------------------------------------
+
+@dataclass
+class AndrogenContext(_Ser):
+    """Observed baseline androgen exposure, and any observed follow-up state.
+
+    This is an *observation* block, like the lab panel: nothing here is a dose,
+    a prescription or a plan.  It exists so that a sustained-androgen-exposure
+    counterfactual has a measured baseline to move away from, because a
+    counterfactual against an invented baseline is not a counterfactual.
+
+    Serum testosterone is not a universal tissue-response coordinate, which is
+    why the collection context travels with the number.  Total testosterone has
+    a strong diurnal rhythm and substantial day-to-day variation, so a single
+    afternoon draw is a much weaker anchor than two morning draws; sex-hormone
+    binding globulin and albumin change the free fraction without changing the
+    total; and an exogenous source makes the concentration a treatment
+    consequence rather than a baseline phenotype.  All of that widens or
+    disqualifies a counterfactual rather than being silently averaged in.
+    """
+    total_testosterone_ng_dL: Optional[float] = None
+    free_testosterone_pg_mL: Optional[float] = None
+    shbg_nmol_L: Optional[float] = None
+    albumin_g_dL: Optional[float] = None
+    collection_time_local: Optional[str] = None     # "07:30"
+    repeat_measurements: int = 0
+    # "endogenous" | "exogenous" | "unknown"
+    exposure_source: str = "unknown"
+    collected: Optional[dt.date] = None
+    # Observed *follow-up* mediators, if the person has them. An observed
+    # follow-up value replaces the modelled target rather than being added to
+    # it: a measurement beats a sampled delta.
+    followup_hemoglobin_g_dL: Optional[float] = None
+    followup_lean_mass_kg: Optional[float] = None
+    followup_total_testosterone_ng_dL: Optional[float] = None
+
+    def observed(self) -> bool:
+        """Is there any measured baseline concentration at all?"""
+        return (self.total_testosterone_ng_dL is not None or
+                self.free_testosterone_pg_mL is not None)
+
+    def morning_draw(self) -> Optional[bool]:
+        """Was the sample taken in the window reference ranges assume?"""
+        if not self.collection_time_local:
+            return None
+        try:
+            hour = int(str(self.collection_time_local).split(":")[0])
+        except (ValueError, IndexError):
+            return None
+        return 7 <= hour <= 11
+
+
+# --------------------------------------------------------------------------
 # Assembly
 # --------------------------------------------------------------------------
 
@@ -251,6 +305,7 @@ class PersonInputs(_Ser):
     nutrition: NutritionState = field(default_factory=NutritionState)
     labs: LabPanel = field(default_factory=LabPanel)
     calibration_runs: List[CalibrationRun] = field(default_factory=list)
+    androgen: AndrogenContext = field(default_factory=AndrogenContext)
     subject_id: str = "anonymous"
     as_of: dt.date = field(default_factory=dt.date.today)
 
@@ -261,5 +316,6 @@ class PersonInputs(_Ser):
 __all__ = [
     "Body", "TrainingHistory", "ClinicalContext", "RunRecord", "CalibrationRun",
     "WearableData", "MealEvent", "NutritionState", "LabValue", "LabPanel",
-    "PersonInputs", "MEAL_QUALITY", "DEVICE_QUALITY", "SIGNAL_TIER",
+    "AndrogenContext", "PersonInputs", "MEAL_QUALITY", "DEVICE_QUALITY",
+    "SIGNAL_TIER",
 ]

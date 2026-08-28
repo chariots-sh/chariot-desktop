@@ -159,6 +159,7 @@ footer{border-top:1px solid var(--line);margin-top:36px;padding:18px 22px;
   <section id="s-cohort"></section>
   <section id="s-sweeps"></section>
   <section id="s-explore"></section>
+  <section id="s-mechlab"></section>
   <section id="s-model"></section>
   <section id="s-inputs"></section>
 </main>
@@ -172,7 +173,8 @@ footer{border-top:1px solid var(--line);margin-top:36px;padding:18px 22px;
 <script>
 const TABS=[["overview","Overview"],["verify","Verification"],
   ["calib","Calibration"],["cohort","Virtual cohort"],["sweeps","Input sweeps"],
-  ["explore","Explore scenarios"],["model","Model & registry"],
+  ["explore","Explore scenarios"],["mechlab","Mechanism Lab"],
+  ["model","Model & registry"],
   ["inputs","This person"]];
 let META=null, VAL=null, PROF=null;
 
@@ -602,8 +604,217 @@ function renderSweeps(){
     g.appendChild(card);});
 }
 
+/* ---------------- mechanism lab ---------------- */
+/* Deliberately its own tab, and deliberately not sharing a form with the
+   experimental-input controls next door. A mechanism sets a hypothetical
+   tissue state; an adapter takes a dose. Putting them in one panel would
+   suggest the step between them is something this engine can make, and it is
+   exactly the step it refuses to make. */
+function mechSettingField(m,st){
+  const id=`ms-${m.name}-${st.name}`;
+  if((st.choices||[]).length)
+    return `<div><label>${esc(st.name)}</label>
+      <select data-ms="${esc(st.name)}" id="${id}">${st.choices.map(c=>
+        `<option>${esc(c)}</option>`).join("")}</select></div>`;
+  /* An unbounded side of a domain arrives as null, and a null min/max would
+     be written into the attribute as the string "null". Leave the attribute
+     off instead. */
+  const dom=st.supported_domain||[null,null];
+  const span=(dom[0]==null||dom[1]==null)?null:dom[1]-dom[0];
+  const step=(span!=null&&span>50)?1:0.05;
+  const bound=(a,v)=>v==null?"":`${a}="${esc(v)}"`;
+  return `<div><label>${esc(st.name)} <span class="muted mono"
+      style="font-weight:400">${esc(st.unit)}</span></label>
+    <input type="number" data-ms="${esc(st.name)}" id="${id}"
+      value="${esc(st.default)}" ${bound("min",dom[0])} ${bound("max",dom[1])}
+      step="${step}"></div>`;
+}
+function mechCard(m){
+  const pill=m.enabled?`<span class="pill ok">enabled</span>`
+    :`<span class="pill warn">gated: ${esc(m.disabled_status)}</span>`;
+  return `<div class="card">
+    <h3 style="margin-bottom:2px">${esc(m.label)} ${pill}</h3>
+    <div class="mono muted" style="font-size:11.5px">${esc(m.name)}</div>
+    <p style="margin:8px 0"><b>Answers:</b> ${esc(m.question)}</p>
+    ${m.enabled?"":`<div class="note bad" style="margin:8px 0">
+      <b>Not available.</b> ${esc(m.disabled_reason)}</div>`}
+    <div class="grid g2">
+      <div><b>Represented in this model</b><ul>${
+        (m.represented_paths||[]).map(x=>`<li>${esc(x)}</li>`).join("")
+        ||"<li class='muted'>nothing</li>"}</ul></div>
+      <div><b>NOT represented</b><ul>${
+        (m.unrepresented_paths||[]).map(x=>`<li>${esc(x)}</li>`).join("")}</ul>
+        <div class="muted" style="font-size:11.5px">A null along any of these
+          is a property of the model. It is not biological evidence.</div></div>
+    </div>
+    ${(m.settings||[]).map(st=>`<div class="muted" style="font-size:12px">
+      <b class="mono">${esc(st.name)}</b> (${esc(st.unit)}): ${esc(st.description)}
+      Supported ${st.supported_domain[0]==null&&st.supported_domain[1]==null
+        ?"any value":nf(st.supported_domain[0],3)+" to "+
+         nf(st.supported_domain[1],3)}${
+        st.prior_range[0]==null?"":`; inside the registered prior
+        ${nf(st.prior_range[0],3)}–${nf(st.prior_range[1],3)}, outside it the
+        run is sensitivity-only`}.</div>`).join("")}
+    ${(m.required_context||[]).length?`<div class="muted" style="font-size:12px">
+      <b>Requires observations:</b> ${m.required_context.map(esc).join(", ")}</div>`:""}
+    <div class="muted" style="font-size:12px;margin-top:6px">
+      <b>Evidence:</b> ${esc(m.evidence.population)} / ${esc(m.evidence.tissue)},
+      ${esc(m.evidence.domain)} — support ${esc(m.evidence.support)},
+      grade ${esc(m.evidence.evidence_grade)}.</div>
+    <div class="note" style="margin-top:8px"><b>Scope.</b> ${esc(m.scope_note)}
+      <br><b>${esc(m.mapping_note)}</b></div>
+  </div>`;
+}
+function renderMechLab(){
+  const s=$("#s-mechlab");
+  const mechs=(META.mechanisms||[]);
+  const usable=mechs.filter(m=>m.enabled);
+  s.innerHTML=`<p class="lead">A mechanism lever asks what this model predicts
+   if a tissue were in a different biological state. It is not an intervention
+   and not a dose: the step from any supplement, drug or behaviour to a tissue
+   state is an uncertain mapping this engine refuses to make, which is why
+   these controls live apart from the experimental inputs in the scenario
+   explorer.</p>
+  <div class="note bad"><b>Nothing here is a treatment recommendation.</b>
+   Both arms of every contrast are simulated tissue states. No result converts
+   a state into a dose, and none of it is a measurement of this person.</div>
+  <h2>Run a counterfactual</h2>
+  <div class="card">
+    <div class="grid g2">
+      <div><label>Mechanism</label><select id="mlPick">${usable.map(m=>
+        `<option value="${esc(m.name)}">${esc(m.label)}</option>`).join("")}
+        </select></div>
+      <div><label>Horizon (days)</label>
+        <input type="number" id="mlHorizon" value="0" min="0" max="730" step="1">
+        <div class="muted" style="font-size:11.5px">Zero for an instantaneous
+         state contrast.</div></div>
+    </div>
+    <div id="mlSettings" class="grid g2" style="margin-top:8px"></div>
+  </div>
+  <h2>Running conditions</h2>
+  <div class="card" id="mlSc">${SC_CORE}</div>
+  <div class="card" style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+    <div style="max-width:150px"><label>Ensemble size</label>
+      <input type="number" id="mlN" value="64" min="16" max="400" step="16"></div>
+    <button class="go" id="mlRun">Contrast against the same run without it</button>
+    <span id="mlStatus" class="muted"></span>
+    <span class="muted" style="font-size:11.5px;flex-basis:100%">
+      Both arms use identical draws of the personal posterior and of every
+      biochemical constant, so the contrast isolates the state change. A
+      neutral setting reproduces the baseline arm exactly.</span>
+  </div>
+  <div id="mlResult"></div>
+  <h2>Registered levers</h2>
+  ${mechs.map(mechCard).join("")}
+  <h2>Interventions that stay disabled</h2>
+  <p class="muted">Registered so the refusal is visible rather than silent.
+   None of them can activate a mechanism transform: they are separate
+   registries and neither reaches into the other.</p>
+  <div class="card scroll"><table><thead><tr><th>Intervention</th>
+    <th>Would change</th><th>Why it is disabled</th></tr></thead><tbody>
+    ${(META.adapters||[]).filter(a=>!a.enabled).map(a=>
+      `<tr><td class="mono">${esc(a.name)}</td>
+        <td class="muted">${esc(a.parameter_changed)}</td>
+        <td>${esc(a.effect_summary)}</td></tr>`).join("")}
+    </tbody></table></div>
+  ${META.androgen_mediators?mediatorTable(META.androgen_mediators):""}`;
+  scFields($("#mlSc"));
+  const pick=$("#mlPick");
+  const fill=()=>{const m=mechs.find(x=>x.name===pick.value);
+    $("#mlSettings").innerHTML=(m.settings||[])
+      .map(st=>mechSettingField(m,st)).join("");};
+  pick.onchange=fill; fill();
+  $("#mlRun").onclick=()=>doMechRun(mechs);
+}
+function mediatorTable(t){
+  return `<h2>Androgen mediator evidence table
+    <span class="muted mono" style="font-weight:400;font-size:12px">${
+      esc(t.version)}</span></h2>
+  <p class="muted">${esc(t.correlation_note)}</p>
+  <div class="card scroll"><table><thead><tr><th>Mediator</th><th>Status</th>
+    <th>Lands on</th><th>Evidence</th><th>Reason, if gated</th></tr></thead>
+    <tbody>${t.mediators.map(m=>`<tr><td>${esc(m.label)}</td>
+      <td>${m.enabled?'<span class="pill ok">active</span>':
+        '<span class="pill warn">gated</span>'}</td>
+      <td class="muted">${esc(m.engine_landing_point)}</td>
+      <td><span class="tag">${esc(m.evidence.evidence_grade)}</span></td>
+      <td class="muted">${esc(m.gate_reason)}</td></tr>`).join("")}
+    </tbody></table></div>`;
+}
+async function doMechRun(mechs){
+  const m=mechs.find(x=>x.name===$("#mlPick").value);
+  const settings={};
+  $("#mlSettings").querySelectorAll("[data-ms]").forEach(inp=>{
+    const v=inp.value;
+    settings[inp.dataset.ms]=(inp.tagName==="SELECT")?v:parseFloat(v);});
+  const base=readSc($("#mlSc"));   /* SC_CORE has no dose fields to read */
+  const target=JSON.parse(JSON.stringify(base));
+  target.mechanisms=[{mechanism:m.name,settings,
+    horizon_days:parseFloat($("#mlHorizon").value)||0}];
+  $("#mlStatus").innerHTML='<span class="spin"></span> running both arms…';
+  $("#mlRun").disabled=true;
+  const d=await post("/api/compare",{a:base,b:target,
+    n:parseInt($("#mlN").value)||64});
+  $("#mlStatus").innerHTML="";$("#mlRun").disabled=false;
+  if(d.error){$("#mlResult").innerHTML=
+    `<div class="note bad">${esc(d.error)}</div>`;return;}
+  $("#mlResult").innerHTML=mechResult(d);
+}
+function statusPill(st){
+  const cls=st==="estimated"?"ok":(st==="negligible_within_model"?"info":"warn");
+  return `<span class="pill ${cls}">${esc(String(st).replace(/_/g," "))}</span>`;
+}
+function mechResult(d){
+  const rep=d.mechanism_report||{};
+  const assumptions=rep.assumptions||[];
+  const cs=Object.values(d.contrasts||{});
+  return `<h2>Result</h2>
+  ${assumptions.map(a=>`<div class="card">
+    <h3>${esc(a.mechanism)} ${statusPill(a.status)}</h3>
+    <div class="mono muted" style="font-size:12px">${
+      Object.entries(a.settings).map(([k,v])=>`${esc(k)} = ${esc(v)}`).join(", ")
+      ||"defaults"}${a.horizon_days?`, horizon ${nf(a.horizon_days,3)} d`:""}</div>
+    <div style="margin-top:6px"><b>Changed:</b> <span class="mono">${
+      (a.changed_parameters||[]).map(esc).join(", ")||"nothing"}</span></div>
+    ${Object.keys(a.mediators||{}).length?`<div class="scroll"
+      style="margin-top:8px"><table><thead><tr><th>Mediator</th><th>Applied</th>
+      <th class="num">Median change</th><th class="num">80% interval</th>
+      <th>Lands on / why not</th></tr></thead><tbody>${
+      Object.entries(a.mediators).map(([k,v])=>`<tr><td>${esc(k)}</td>
+        <td>${v.applied?"yes":"<b>no</b>"}</td>
+        <td class="num">${v.applied?nf(v.delta_median,3)+" "+esc(v.unit||""):"—"}</td>
+        <td class="num muted">${v.applied&&v.delta_ci80?
+          nf(v.delta_ci80[0],3)+" – "+nf(v.delta_ci80[1],3):"—"}</td>
+        <td class="muted">${esc(v.applied?(v.lands_on||""):(v.reason||""))}</td>
+        </tr>`).join("")}</tbody></table></div>`:""}
+    <div class="note" style="margin-top:8px"><b>Scope.</b> ${esc(a.scope_note)}
+      <br><b>${esc(a.mapping_note)}</b></div>
+    <div class="muted" style="margin-top:6px"><b>Not represented:</b>
+      ${(a.unrepresented_paths||[]).map(esc).join("; ")}</div>
+  </div>`).join("")}
+  <div class="card scroll"><table><thead><tr><th>Output</th><th>Status</th>
+    <th class="num">Median change</th><th class="num">95% interval</th>
+    <th class="num">P(direction)</th><th class="num">P(negligible)</th>
+    </tr></thead><tbody>${cs.map(c=>`<tr>
+      <td>${esc(c.label)}</td><td>${statusPill(c.effect_status)}</td>
+      <td class="num">${nf(c.median_change,3)} ${esc(c.unit)}</td>
+      <td class="num muted">${nf(c.ci95[0],3)} – ${nf(c.ci95[1],3)}</td>
+      <td class="num">${c.verdict==="unresolved"?
+        `<span class="muted">${nf(c.p_direction,2)} (unresolved)</span>`:
+        nf(c.p_direction,2)}</td>
+      <td class="num">${nf(c.p_negligible,2)}</td></tr>`).join("")}
+    </tbody></table></div>
+  <div class="note">${esc(rep.negligibility_rule||"")}
+    <br>${esc(rep.not_an_intervention||"")}</div>
+  <div class="card"><h3>Narrative</h3><div>${esc(d.narrative)}</div></div>`;
+}
+
 /* ---------------- explore ---------------- */
-const SC_FIELDS=`
+/* The running conditions, and separately the dose-shaped experimental inputs.
+   They are split so the Mechanism Lab can take the first without the second:
+   showing a dose field beside a state control would suggest the engine can
+   make the step between them, which is the one step it refuses to make. */
+const SC_CORE=`
   <div class="grid g4">
     <div><label>Pattern</label><select data-f="pattern">
       ${["continuous","progression","4x4","10x1","30:30"].map(p=>
@@ -625,6 +836,9 @@ const SC_FIELDS=`
     <div><label>Glycogen prior</label><select data-f="glycogen_prior">
       <option>derived</option><option>low</option><option>moderate</option>
       <option>high</option></select></div>
+  </div>`;
+const SC_ADAPTER=`
+  <div class="grid g4">
     <div><label>Experimental input</label><select data-f="adapter">
       <option value="">none</option></select></div>
     <div><label>Adapter dose</label>
@@ -632,13 +846,16 @@ const SC_FIELDS=`
     <div><label>Minutes before run</label>
       <input type="number" data-f="timing" value="60" step="5"></div>
   </div>`;
+const SC_FIELDS=SC_CORE+SC_ADAPTER;
 function scFields(root){
   const sel=root.querySelector('[data-f="adapter"]');
+  if(!sel)return;                       /* the Mechanism Lab has no dose fields */
   META.adapters.forEach(a=>{const o=el("option",null,
     a.name+(a.enabled?"":" (disabled)"));o.value=a.name;sel.appendChild(o);});
 }
 function readSc(root){
-  const g=f=>root.querySelector(`[data-f="${f}"]`).value;
+  const g=f=>{const e=root.querySelector(`[data-f="${f}"]`);
+    return e?e.value:"";};
   const sc={pattern:g("pattern"),
     intensity:{kind:"pct_vo2max",value:parseFloat(g("intensity"))/100},
     duration_min:parseFloat(g("duration_min")),
@@ -723,6 +940,16 @@ function runCard(d){
   <div id="charts" class="grid g2"></div>
   <h3>Model-computed outputs</h3><div id="tbl1"></div>
   <h3>Derived mechanism outputs</h3><div id="tbl2"></div>
+  ${(d.mechanism_assumptions||[]).length?`<h3>Mechanism counterfactuals</h3>
+    ${d.mechanism_assumptions.map(a=>`<div class="card">
+      <b>${esc(a.mechanism)}</b> ${statusPill(a.status)}
+      <div class="muted" style="font-size:12px">changed ${
+        (a.changed_parameters||[]).map(esc).join(", ")||"nothing"}</div>
+      <div class="note" style="margin-top:6px">${esc(a.scope_note)}
+        <br><b>${esc(a.mapping_note)}</b></div>
+      <div class="muted" style="margin-top:6px"><b>Not represented:</b>
+        ${(a.unrepresented_paths||[]).map(esc).join("; ")}</div>
+      </div>`).join("")}`:""}
   ${(d.warnings||[]).length?`<h3>Warnings and applicability</h3>
     <div class="card">${d.warnings.map(w=>
       `<div style="margin:4px 0">• ${esc(w)}</div>`).join("")}</div>`:""}
@@ -1004,7 +1231,7 @@ function qcQuality(){return "see run metadata";}
     `${META.model_version} · registry ${META.registry_version} · `+
     `${META.parameters.length} parameters · ${META.tissue}`;
   renderOverview();renderVerify();renderCalib();renderCohort();
-  renderSweeps();renderExplore();renderModel();renderInputs();
+  renderSweeps();renderExplore();renderMechLab();renderModel();renderInputs();
 })();
 </script>
 </body>

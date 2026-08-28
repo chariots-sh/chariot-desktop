@@ -12,7 +12,8 @@ from ..ensemble import MODEL_VERSION
 from ..params import REGISTRY_VERSION, R
 from ..scenario import grid_report
 from .common import Check
-from . import gates, directional, cohort, external, falsification
+from . import (gates, directional, cohort, external, falsification,
+               mechanisms)
 
 VALIDATION_VERSION = "0.2.0"
 
@@ -48,6 +49,11 @@ def run_all(quick: bool = False, verbose: bool = True) -> Dict[str, Any]:
     e_checks, e_summary = falsification.run()
     checks += e_checks
     extra["falsification"] = e_summary
+
+    say("F. mechanism levers across people ...")
+    f_checks, f_summary = mechanisms.run(n=12 if quick else 16, quick=quick)
+    checks += f_checks
+    extra["mechanisms"] = f_summary
 
     extra["scenario_grid"] = grid_report()
     extra["open_gates"] = gates.OPEN_GATES

@@ -72,6 +72,37 @@ class ExperimentalUse:
 
 
 @dataclass(frozen=True)
+class MechanismUse:
+    """A requested mechanism counterfactual: a biological *state*, not a dose.
+
+    Deliberately a separate type from ``ExperimentalUse``.  Forcing a state
+    lever into ``dose`` / ``timing_min_before`` / ``days_loaded`` would make the
+    engine's own schema imply that a tissue state is a quantity a person takes,
+    which is exactly the inference this product must not encourage.  A
+    mechanism carries named settings in their own units and a horizon in days
+    (zero for an instantaneous state contrast).
+    """
+    mechanism: str
+    settings: Dict[str, Any] = field(default_factory=dict)
+    horizon_days: float = 0.0
+    label: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"mechanism": self.mechanism,
+                "settings": dict(self.settings),
+                "horizon_days": self.horizon_days,
+                "label": self.label}
+
+    def describe(self) -> str:
+        if self.label:
+            return self.label
+        bits = ", ".join(f"{k}={v}" for k, v in sorted(self.settings.items()))
+        horizon = (f" over {self.horizon_days:.0f} d"
+                   if self.horizon_days else "")
+        return f"{self.mechanism}({bits}){horizon}"
+
+
+@dataclass(frozen=True)
 class Scenario:
     pattern: str = "continuous"
     intensity: Intensity = field(default_factory=lambda: Intensity("pct_vo2max", 0.65))
@@ -83,6 +114,9 @@ class Scenario:
     glycogen_prior: str = "derived"      # "derived" | low | moderate | high
     elevation_m: float = 0.0
     time_of_day: str = "08:00"
+    # State-shaped counterfactuals, kept in their own field so that a
+    # mechanism can never be mistaken for -- or serialised as -- a dose.
+    mechanisms: Tuple[MechanismUse, ...] = ()
     experimental: Tuple[ExperimentalUse, ...] = ()
     label: str = ""
 
@@ -90,6 +124,7 @@ class Scenario:
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["intensity"] = self.intensity.to_dict()
+        d["mechanisms"] = [m.to_dict() for m in self.mechanisms]
         d["experimental"] = [e.to_dict() for e in self.experimental]
         return d
 
@@ -118,6 +153,8 @@ class Scenario:
         bits.append(f"prev-day CHO {self.prev_day_cho}")
         if self.elevation_m:
             bits.append(f"{self.elevation_m:.0f} m elevation")
+        for m in self.mechanisms:
+            bits.append(f"mechanism: {m.describe()}")
         for e in self.experimental:
             bits.append(f"+{e.adapter}")
         return ", ".join(bits)
@@ -196,6 +233,18 @@ def _check(s: Scenario) -> Optional[Tuple[str, str]]:
         return ("double_counted_intake",
                 "a large pre-run carbohydrate dose plus a meal inside the last "
                 "hour double-counts the same intake event")
+
+    # Mechanism levers fail closed: an unregistered mechanism, an unknown
+    # setting, or a setting outside its supported domain removes the scenario
+    # with a stated reason rather than running it without the effect it names.
+    for use in s.mechanisms:
+        # Imported here rather than at module scope: mechanisms.py needs the
+        # MechanismUse type defined above, so a top-level import would be
+        # circular.
+        from .mechanisms import validate_use
+        verdict = validate_use(use)
+        if verdict is not None:
+            return verdict
 
     if s.elevation_m > 5500:
         return ("elevation_out_of_domain",

@@ -30,9 +30,11 @@ import numpy as np
 
 from . import guardrails
 from .adapters import apply_adapters
+from .effects import NO_INTERVENTION_MAPPING, STATUS_MEANINGS, EffectOutcome
 from .demand import build_demand
 from .estimate import build_sampler, band_for_glycogen
 from .inputs import PersonInputs
+from .mechanisms import MECHANISMS, apply_mechanisms
 from .muscle import (MuscleModel, IDX, NSP, I_LACB, free_adp,
                      IntegrationBudgetExceeded)
 from .outputs import Estimate, RunOutputs
@@ -53,6 +55,11 @@ class MemberResult:
     traj: Dict[str, Any] = field(default_factory=dict)
     guard_failures: List[str] = field(default_factory=list)
     error: str = ""
+    # What each requested mechanism did to *this* member. Kept per member
+    # rather than computed once for the ensemble, because a transform can
+    # succeed for one draw of the biochemical priors and be refused for
+    # another, and the report must be able to say how often.
+    mechanisms: List[EffectOutcome] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -135,14 +142,25 @@ atexit.register(shutdown_pool)
 
 
 def _run_member(person: PersonInputs, qc: QCReport, sc: Scenario,
-                sampler, seed: int, keep_traj: bool,
-                audit: bool) -> MemberResult:
+                sampler, seed: int, keep_traj: bool, audit: bool,
+                state_transform: Optional[Any] = None) -> MemberResult:
     rng = np.random.default_rng(seed)
+    mech_out: List[EffectOutcome] = []
     try:
         st = sampler(rng)
         handles, outcomes = apply_adapters(sc.experimental, st, rng, person)
         if "blood_bhb_override" in handles:
             st.blood_bhb = float(handles.pop("blood_bhb_override"))
+        # Mechanism transforms draw from their own stream, seeded off this
+        # member's seed but disjoint from it. That is what makes the neutral
+        # case exact: adding a mechanism to a scenario cannot shift the
+        # personal-state or adapter draws, so a pool_scale of 1.0 reproduces
+        # the no-mechanism run bit for bit rather than merely closely.
+        if sc.mechanisms:
+            mech_rng = np.random.default_rng([seed, 0x4D454348])
+            mech_out = apply_mechanisms(sc.mechanisms, st, mech_rng, person, qc)
+        if state_transform is not None:
+            state_transform(st)
         dp = build_demand(sc, st)
         mm = MuscleModel(st, dp.t, dp.atp_demand, dp.rel_intensity,
                          sc.hours_since_meal, st.insulin_idx, handles)
@@ -150,11 +168,13 @@ def _run_member(person: PersonInputs, qc: QCReport, sc: Scenario,
             return MemberResult(
                 False, error="parameter draw gives a fibre less oxidative "
                              "capacity than its own resting demand; excluded "
-                             "as physiologically incoherent")
+                             "as physiologically incoherent",
+                mechanisms=mech_out)
         dur = sc.duration_min * 60.0
         res = mm.run(dur, n_out=max(40, min(180, int(sc.duration_min * 3))))
         if not res.ok:
-            return MemberResult(False, error=f"integration failed: {res.message}")
+            return MemberResult(False, error=f"integration failed: {res.message}",
+                                mechanisms=mech_out)
 
         v: Dict[str, float] = {}
         cw = st.bp["cell_water_L_per_kg"]
@@ -269,6 +289,24 @@ def _run_member(person: PersonInputs, qc: QCReport, sc: Scenario,
         # Crossover: relative intensity at which carbohydrate carbon exceeds fat
         v["crossover_reached"] = 1.0 if cc > fc else 0.0
 
+        # ---- mitochondrial redox-state diagnostics ----------------------
+        # Reported on every run, not only when a mechanism is requested: the
+        # matrix redox state is what a NAD counterfactual acts through, and a
+        # reader cannot judge such a contrast without seeing where the pool sat
+        # before it. The fractions are of the *recruited* fibres, which is a
+        # model construct -- no measurement can separate them in a person.
+        nadh_series = res.mixed("NADHm")
+        nadh_rest = (f1 * res.y0[IDX["NADHm"]] +
+                     (1 - f1) * res.y0[NSP + IDX["NADHm"]])
+        v["nad_mito_pool"] = mm.nad_m
+        v["matrix_nadh_fraction_rest"] = float(nadh_rest / mm.nad_m)
+        v["matrix_nadh_fraction_max"] = float(np.max(nadh_series) / mm.nad_m)
+        v["matrix_nadh_fraction_min"] = float(np.min(nadh_series) / mm.nad_m)
+        v["rest_polished"] = 1.0 if getattr(mm, "rest_polished", False) else 0.0
+        v["rest_residual"] = float(getattr(mm, "rest_residual", np.nan))
+        v["rest_activation_clipped"] = (
+            1.0 if any(mm.km_adp_clipped.values()) else 0.0)
+
         adp_end = free_adp(float(res.mixed("ATP")[-1]), mm.atp_total, mm.ak_keq)
         v["free_adp_end"] = adp_end
         v["o2_min_type2"] = float(np.min(res.sp("O2", "II")))
@@ -314,11 +352,13 @@ def _run_member(person: PersonInputs, qc: QCReport, sc: Scenario,
                 "rel_intensity": np.interp(res.t[::k], dp.t,
                                            dp.rel_intensity).tolist(),
             }
-        return MemberResult(True, v, params, traj, gf)
+        return MemberResult(True, v, params, traj, gf, mechanisms=mech_out)
     except IntegrationBudgetExceeded as e:
-        return MemberResult(False, error=f"integration budget exceeded: {e}")
+        return MemberResult(False, error=f"integration budget exceeded: {e}",
+                            mechanisms=mech_out)
     except Exception as e:  # keep the ensemble alive, record the failure
-        return MemberResult(False, error=f"{type(e).__name__}: {e}")
+        return MemberResult(False, error=f"{type(e).__name__}: {e}",
+                            mechanisms=mech_out)
 
 
 # --------------------------------------------------------------------------
@@ -461,6 +501,29 @@ EST_DEFS: List[Tuple[str, str, str, str, str, str]] = [
      "derived", "indirect", ""),
     ("blood_lactate_end", "Arterial lactate at end of run", "mmol/L",
      "model_computed", "direct", ""),
+    # ---- mitochondrial redox state ----------------------------------------
+    ("nad_mito_pool", "Mitochondrial NAD pool applied", "mmol/L matrix water",
+     "model_computed", "adjacent",
+     "The matrix NAD pool each ensemble member actually ran with, after any "
+     "mechanism transform. It is a sampled population parameter, not a "
+     "measurement: nothing this product accepts as input can constrain it."),
+    ("matrix_nadh_fraction_rest", "Matrix NADH fraction before the run",
+     "fraction of the matrix NAD pool", "model_computed", "adjacent",
+     "The resting redox state the run actually started from. The engine "
+     "initialises the matrix at the registered resting ratio and then relaxes "
+     "to a fixed point, and the fixed point is set by the balance of "
+     "dehydrogenase and respiratory-chain fluxes rather than by that initial "
+     "value. It generally settles somewhat more reduced than the registered "
+     "ratio, and more so in the faster fibres, whose oxidative capacity is "
+     "lower relative to their resting demand. Compare it against the sampled "
+     "nadh_mito_rest_ratio in the member parameters rather than against the "
+     "measured 20-30% band."),
+    ("matrix_nadh_fraction_max", "Most reduced matrix NADH fraction under load",
+     "fraction of the matrix NAD pool", "derived", "adjacent",
+     "The fibre-level redox state is a model construct: no measurement can "
+     "separate recruited from unrecruited fibres in an intact person."),
+    ("matrix_nadh_fraction_min", "Least reduced matrix NADH fraction under load",
+     "fraction of the matrix NAD pool", "derived", "adjacent", ""),
     ("muscle_lactate_end", "Muscle lactate at end of run", "mmol/L",
      "model_computed", "adjacent", ""),
 ]
@@ -635,6 +698,24 @@ OUTPUT_MEANINGS: Dict[str, str] = {
         "The average effort as a fraction of this person's own aerobic "
         "ceiling, which is what makes the same scenario comparable across "
         "people of different fitness.",
+    "nad_mito_pool":
+        "How much NAD, oxidised and reduced together, the model gave the "
+        "mitochondrial matrix to work with. NAD is the carrier that collects "
+        "electrons from fuel and hands them to the respiratory chain, so the "
+        "size of this pool sets how much traffic the handover can carry at "
+        "once. It is drawn from a population range, not measured.",
+    "matrix_nadh_fraction_rest":
+        "What share of that pool was already carrying electrons -- in the "
+        "reduced NADH form -- when the run started. Resting muscle sits "
+        "around a fifth to a third reduced. Higher means the carriers are "
+        "fuller and less able to accept more.",
+    "matrix_nadh_fraction_max":
+        "The fullest the carriers got during the run. Approaching one means "
+        "the chain could not clear electrons as fast as fuel oxidation "
+        "delivered them, which slows the dehydrogenases feeding it.",
+    "matrix_nadh_fraction_min":
+        "The emptiest the carriers got, which is when the respiratory chain "
+        "was clearing electrons faster than fuel oxidation supplied them.",
 }
 
 
@@ -706,14 +787,180 @@ def _limiting(v: Dict[str, float], duration_min: float) -> str:
 
 
 # --------------------------------------------------------------------------
+# Mechanism reporting
+# --------------------------------------------------------------------------
+
+def _mechanism_assumptions(sc: Scenario,
+                           results: List[MemberResult]) -> List[Dict[str, Any]]:
+    """One machine-readable record per requested mechanism.
+
+    The status is reported per ensemble member and then summarised, because a
+    transform can be applied to most draws and refused for a few -- and a
+    report that showed only the majority status would hide exactly the members
+    whose biochemistry could not accommodate the requested state.
+    """
+    if not sc.mechanisms:
+        return []
+    records: List[Dict[str, Any]] = []
+    for use in sc.mechanisms:
+        spec = MECHANISMS.get(use.mechanism)
+        seen = [o for r in results for o in r.mechanisms
+                if o.name == use.mechanism]
+        counts: Dict[str, int] = {}
+        for o in seen:
+            counts[o.status] = counts.get(o.status, 0) + 1
+        changed: List[str] = []
+        notes: List[str] = []
+        reasons: List[str] = []
+        for o in seen:
+            for k in o.parameter_changes:
+                if k not in changed:
+                    changed.append(k)
+            for n in o.notes:
+                if n not in notes:
+                    notes.append(n)
+            if o.reason and o.reason not in reasons:
+                reasons.append(o.reason)
+        status = (max(counts.items(), key=lambda kv: kv[1])[0]
+                  if counts else "not_estimable")
+        mediators = _summarise_mediators(seen)
+        # A stable subset of the per-member provenance. The version of the
+        # evidence a lever used has to travel with its result -- a number
+        # produced under one extraction of the literature is not the same
+        # claim as the same number produced under the next one.
+        versions = {str(o.provenance["evidence_version"]) for o in seen
+                    if o.provenance.get("evidence_version")}
+        sens = [bool(o.provenance.get("sensitivity_only")) for o in seen
+                if "sensitivity_only" in o.provenance]
+        rec: Dict[str, Any] = {
+            "mechanism": use.mechanism,
+            "settings": dict(use.settings),
+            "horizon_days": use.horizon_days,
+            "status": status,
+            "status_counts": counts,
+            "n_members": len(seen),
+            "changed_parameters": changed,
+            "mediators": mediators,
+            "evidence_version": sorted(versions)[0] if versions else None,
+            "sensitivity_only_fraction": (
+                round(sum(sens) / len(sens), 3) if sens else None),
+            "represented_paths": list(spec.represented_paths) if spec else [],
+            "unrepresented_paths": list(spec.unrepresented_paths) if spec else [],
+            "scope_note": spec.scope_note if spec else "",
+            "mapping_note": (spec.mapping_note if spec
+                             else NO_INTERVENTION_MAPPING),
+            "notes": notes,
+            "reasons": reasons,
+        }
+        if spec is not None:
+            rec["evidence"] = spec.evidence.to_dict()
+            rec["question"] = spec.question
+        records.append(rec)
+    return records
+
+
+def _summarise_mediators(seen: List[EffectOutcome]) -> Dict[str, Any]:
+    """Collapse per-member mediator records into one distribution each.
+
+    A mediator delta is drawn per member, so reporting the raw records would
+    repeat the same sentence with a different number for every draw. What a
+    reader needs is the distribution, plus -- for the mediators that are gated
+    -- the single reason they are, stated once.
+    """
+    out: Dict[str, Any] = {}
+    for outcome in seen:
+        for name, rec in outcome.mediator_changes.items():
+            if not isinstance(rec, dict):
+                continue
+            slot = out.setdefault(name, {"status": rec.get("status"),
+                                         "applied": rec.get("applied", False),
+                                         "deltas": []})
+            for key in ("reason", "unit", "lands_on", "would_land_on",
+                        "evidence_grade", "observed_followup"):
+                if key in rec and key not in slot:
+                    slot[key] = rec[key]
+            if rec.get("applied") and isinstance(rec.get("delta"), (int, float)):
+                slot["deltas"].append(float(rec["delta"]))
+    for name, slot in out.items():
+        deltas = slot.pop("deltas", [])
+        if deltas:
+            a = np.asarray(deltas, dtype=float)
+            slot["delta_median"] = float(np.median(a))
+            slot["delta_ci80"] = [float(np.percentile(a, 10)),
+                                  float(np.percentile(a, 90))]
+            slot["n_members"] = int(a.size)
+    return out
+
+
+def _mechanism_warnings(records: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for rec in records:
+        name = rec["mechanism"]
+        if rec["status"] not in ("estimated",):
+            out.append(
+                f"Mechanism '{name}': {rec['status']}. " +
+                (rec["reasons"][0] if rec["reasons"] else
+                 STATUS_MEANINGS.get(rec["status"], "")))
+        else:
+            out.append(f"Mechanism '{name}' changed "
+                       f"{', '.join(rec['changed_parameters']) or 'nothing'}. "
+                       f"{rec['scope_note']} {rec['mapping_note']}")
+            frac = rec.get("sensitivity_only_fraction")
+            if frac:
+                out.append(
+                    f"In {frac*100:.0f}% of ensemble members the requested "
+                    f"state for '{name}' fell outside the registered "
+                    "physiological prior. Those members are sensitivity-only: "
+                    "they show how the model responds and do not inherit the "
+                    "prior's biological support.")
+            if rec["unrepresented_paths"]:
+                out.append(
+                    f"Not represented in this model for '{name}': " +
+                    "; ".join(rec["unrepresented_paths"]) +
+                    ". A null result along any of those routes is a property "
+                    "of the model, not biological evidence.")
+        for n in rec["notes"]:
+            if n not in out:
+                out.append(n)
+        gated = [m for m, slot in rec.get("mediators", {}).items()
+                 if not slot.get("applied")]
+        if gated:
+            out.append(
+                f"Mediators declared by '{name}' but not applied: " +
+                ", ".join(sorted(gated)) +
+                ". Each is gated in the evidence table with its own reason; "
+                "nothing was changed along those paths, so the result says "
+                "nothing about them.")
+        mixed = {k: v for k, v in rec["status_counts"].items()
+                 if k != rec["status"]}
+        if mixed:
+            out.append(
+                f"Mechanism '{name}' did not reach the same status in every "
+                "ensemble member: " +
+                ", ".join(f"{k} in {v}" for k, v in sorted(mixed.items())) +
+                f" of {rec['n_members']}.")
+    return out
+
+
+# --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
 
 def run_ensemble(person: PersonInputs, sc: Scenario, n: int = 200,
                  seed: int = 20260826, qc: Optional[QCReport] = None,
                  workers: Optional[int] = None, keep_traj: int = 48,
-                 audit: bool = True) -> RunOutputs:
-    """Run one scenario across `n` plausible personal states."""
+                 audit: bool = True,
+                 state_transform: Optional[Any] = None) -> RunOutputs:
+    """Run one scenario across `n` plausible personal states.
+
+    ``state_transform`` is a research seam, not a product control.  It applies
+    a callable to each drawn personal state after any registered mechanism, and
+    exists so that the identifiability study in ``identifiability.py`` can
+    sweep axes the product deliberately does not expose.  Nothing a user can
+    reach -- the CLI, the scenario schema, the web API -- can set it, and a run
+    that uses it stays serial so the transform never has to be shipped to a
+    worker process.
+    """
     t0 = time.time()
     qc = qc or run_qc(person)
     sampler, meta = build_sampler(person, qc, sc)
@@ -726,6 +973,7 @@ def run_ensemble(person: PersonInputs, sc: Scenario, n: int = 200,
             estimates={},
             metadata=_metadata(person, sc, qc, meta, 0, 0.0),
             warnings=["NOT ESTIMABLE for this person: " + " ".join(blockers)],
+            mechanism_assumptions=_mechanism_assumptions(sc, []),
             diagnostics={"blocked": True})
 
     seeds = [seed + i for i in range(n)]
@@ -733,7 +981,8 @@ def run_ensemble(person: PersonInputs, sc: Scenario, n: int = 200,
     workers = workers if workers is not None else min(
         8, max(1, (os.cpu_count() or 2) - 1))
 
-    ex = _get_pool(workers) if (workers > 1 and n >= 8) else None
+    ex = (_get_pool(workers)
+          if (workers > 1 and n >= 8 and state_transform is None) else None)
     if ex is not None:
         try:
             futs = [ex.submit(_run_member_task, person, qc, sc, s,
@@ -752,18 +1001,26 @@ def run_ensemble(person: PersonInputs, sc: Scenario, n: int = 200,
             shutdown_pool()
             results = []
     if not results:
-        results = [_run_member(person, qc, sc, sampler, s, i < keep_traj, audit)
+        results = [_run_member(person, qc, sc, sampler, s, i < keep_traj, audit,
+                               state_transform)
                    for i, s in enumerate(seeds)]
 
     good = [r for r in results if r.ok]
     failed = [r for r in results if not r.ok]
+    # Which ensemble members survived, by position in the seed order. Two arms
+    # of a contrast are seeded identically but need not fail identically, so
+    # the surviving positions are what makes them pairable afterwards.
+    member_index = [i for i, r in enumerate(results) if r.ok]
+    mech_records = _mechanism_assumptions(sc, results)
     if not good:
         return RunOutputs(
             scenario={"description": sc.describe(), **sc.to_dict()},
             estimates={},
             metadata=_metadata(person, sc, qc, meta, 0, time.time() - t0),
             warnings=["Every ensemble member failed to integrate; no output is "
-                      "estimable for this scenario."],
+                      "estimable for this scenario."] +
+                     _mechanism_warnings(mech_records),
+            mechanism_assumptions=mech_records,
             diagnostics={"failures": [r.error for r in failed[:5]]})
 
     keys = sorted(good[0].values)
@@ -825,6 +1082,7 @@ def run_ensemble(person: PersonInputs, sc: Scenario, n: int = 200,
     # "_notes" is an out-of-band list smuggled through the float-valued dict.
     for note in cast(List[str], good[0].values.get("_notes", []) or []):
         warnings.append(note)
+    warnings.extend(_mechanism_warnings(mech_records))
     if sc.experimental:
         rng = np.random.default_rng(seed)
         st = sampler(rng)
@@ -868,14 +1126,40 @@ def run_ensemble(person: PersonInputs, sc: Scenario, n: int = 200,
     md["sensitivity"] = sens
     md["ensemble_failures"] = len(failed)
 
+    # How the resting operating point behaved. A mechanism that moves a pool
+    # forces the resting calibration to be re-solved, so a reader has to be
+    # able to see whether it still held before trusting the contrast.
+    rest_diag = {
+        "polished_fraction": _frac(arr.get("rest_polished")),
+        "activation_clipped_fraction": _frac(arr.get("rest_activation_clipped")),
+        "median_residual": (float(np.nanmedian(arr["rest_residual"]))
+                            if "rest_residual" in arr else None),
+        "note": "The resting state is re-solved for every member. 'Clipped' "
+                "means the solved resting activation fell outside its "
+                "registered plausibility band and was clamped, which is "
+                "recorded rather than hidden.",
+    }
+
     return RunOutputs(
         scenario={"description": sc.describe(), **sc.to_dict()},
         estimates=estimates, metadata=md, mechanism=mechanism,
+        mechanism_assumptions=mech_records,
         diagnostics={"failures": [r.error for r in failed[:10]],
                      "guardrail_failures": guard_fail,
+                     "rest_calibration": rest_diag,
                      "n_ok": len(good), "n_failed": len(failed)},
         warnings=warnings, trajectories=traj_summary,
-        member_params=params, member_values=arr)
+        member_params=params, member_values=arr,
+        member_index=member_index)
+
+
+def _frac(a) -> Optional[float]:
+    """Fraction of finite members whose 0/1 flag is set."""
+    if a is None:
+        return None
+    x = np.asarray(a, dtype=float)
+    x = x[np.isfinite(x)]
+    return float(np.mean(x)) if x.size else None
 
 
 def _summarise_trajectories(trajs: List[Dict[str, Any]]) -> Dict[str, Any]:

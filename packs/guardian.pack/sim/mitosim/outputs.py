@@ -135,11 +135,23 @@ class RunOutputs:
     diagnostics: Dict[str, Any] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     trajectories: Dict[str, Any] = field(default_factory=dict)
+    # One record per requested mechanism counterfactual: what was changed, what
+    # status it reached, which paths carry it, and which plausible paths this
+    # model does not represent. Top level rather than buried in metadata,
+    # because a reader must not be able to see the numbers without it.
+    mechanism_assumptions: List[Dict[str, Any]] = field(default_factory=list)
     # Per-ensemble-member sampled parameters and raw outputs. Kept so that a
     # paired contrast can attribute the difference to specific parameters and
     # find the ones that could reverse it.
     member_params: Dict[str, Any] = field(default_factory=dict, repr=False)
     member_values: Dict[str, Any] = field(default_factory=dict, repr=False)
+    # Which ensemble members these arrays are. Members that fail to integrate
+    # are dropped, and two arms of a contrast do not necessarily fail on the
+    # same ones -- a depleted NAD pool pushes draws into incoherence that the
+    # baseline arm survives. Without the index, position k of one arm is
+    # silently paired with a different personal state in the other, which is
+    # precisely what pairing exists to prevent.
+    member_index: List[int] = field(default_factory=list, repr=False)
 
     def get(self, name: str) -> Optional[Estimate]:
         return self.estimates.get(name)
@@ -153,6 +165,7 @@ class RunOutputs:
             "diagnostics": self.diagnostics,
             "warnings": self.warnings,
             "trajectories": self.trajectories,
+            "mechanism_assumptions": self.mechanism_assumptions,
         }
 
 
@@ -173,6 +186,9 @@ SECTIONS = [
         "crossover_intensity", "time_to_glycogen_limit",
         "time_to_lactate_pressure", "type1_atp_share", "type2_atp_share",
         "atp_per_oxygen", "first_limiting_mechanism_certainty"]),
+    ("Mitochondrial redox state", [
+        "nad_mito_pool", "matrix_nadh_fraction_rest",
+        "matrix_nadh_fraction_max", "matrix_nadh_fraction_min"]),
 ]
 
 
@@ -211,6 +227,51 @@ def render_report(out: RunOutputs, level: float = 0.80) -> str:
         lines.append("-" * 78)
         for k, v in out.mechanism.items():
             lines.append(f"  {k}: {v}")
+        lines.append("")
+    if out.mechanism_assumptions:
+        lines.append("-" * 78)
+        lines.append("Mechanism counterfactuals (hypothetical tissue states)")
+        lines.append("-" * 78)
+        for rec in out.mechanism_assumptions:
+            settings = ", ".join(f"{k}={v}" for k, v in
+                                 sorted(rec["settings"].items())) or "defaults"
+            lines.append(f"  {rec['mechanism']} [{settings}] -> "
+                         f"{rec['status']}")
+            if rec.get("question"):
+                lines.append(f"      answers   : {rec['question']}")
+            if rec["changed_parameters"]:
+                lines.append("      changed   : " +
+                             ", ".join(rec["changed_parameters"]))
+            if rec["represented_paths"]:
+                lines.append("      through   : " +
+                             ", ".join(rec["represented_paths"]))
+            if rec["unrepresented_paths"]:
+                lines.append("      NOT in the model: " +
+                             ", ".join(rec["unrepresented_paths"]))
+            for med, slot in sorted(rec.get("mediators", {}).items()):
+                if slot.get("applied"):
+                    lo, hi = slot.get("delta_ci80", [float("nan")] * 2)
+                    lines.append(
+                        f"      mediator  : {med} "
+                        f"{slot.get('delta_median', float('nan')):+.3g} "
+                        f"{slot.get('unit', '')} "
+                        f"[80% {lo:+.3g} to {hi:+.3g}] -> "
+                        f"{slot.get('lands_on', '')}")
+                else:
+                    lines.append(f"      mediator  : {med} NOT applied "
+                                 f"({slot.get('status')})")
+            if rec.get("evidence_version"):
+                lines.append(f"      evidence  : {rec['evidence_version']}")
+            if rec.get("sensitivity_only_fraction"):
+                lines.append(
+                    f"      sensitivity-only in "
+                    f"{rec['sensitivity_only_fraction']*100:.0f}% of members "
+                    "(outside the registered prior)")
+            if rec["scope_note"]:
+                lines.append(f"      scope     : {rec['scope_note']}")
+            for reason in rec["reasons"][:2]:
+                lines.append(f"      reason    : {reason}")
+            lines.append(f"      {rec['mapping_note']}")
         lines.append("")
     if out.warnings:
         lines.append("-" * 78)

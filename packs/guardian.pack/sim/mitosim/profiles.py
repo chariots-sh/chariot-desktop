@@ -12,10 +12,10 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
-from .inputs import (Body, TrainingHistory, ClinicalContext, WearableData,
-                     RunRecord, CalibrationRun, MealEvent, NutritionState,
-                     LabValue, LabPanel, PersonInputs)
-from .scenario import Scenario, Intensity, ExperimentalUse
+from .inputs import (AndrogenContext, Body, TrainingHistory, ClinicalContext,
+                     WearableData, RunRecord, CalibrationRun, MealEvent,
+                     NutritionState, LabValue, LabPanel, PersonInputs)
+from .scenario import Scenario, Intensity, ExperimentalUse, MechanismUse
 
 
 def _date(v, default=None):
@@ -102,9 +102,16 @@ def person_from_dict(d: Dict[str, Any]) -> PersonInputs:
             **{k: v for k, v in cr.items()
                if k not in ("run", "protocol_id") and
                k in CalibrationRun.__dataclass_fields__}))
+    ac = d.get("androgen_context", d.get("androgen", {})) or {}
+    androgen = AndrogenContext(
+        **{k: v for k, v in ac.items()
+           if k in AndrogenContext.__dataclass_fields__ and k != "collected"})
+    if ac.get("collected"):
+        androgen.collected = _date(ac["collected"])
     return PersonInputs(
         body=body, training=training, clinical=clinical, wearable=wearable,
         nutrition=nutrition, labs=labs, calibration_runs=cals,
+        androgen=androgen,
         subject_id=d.get("subject_id", "anonymous"),
         as_of=_date(d.get("as_of"), dt.date.today()))
 
@@ -116,6 +123,12 @@ def scenario_from_dict(d: Dict[str, Any]) -> Scenario:
     else:
         intensity = Intensity(i.get("kind", "pct_vo2max"),
                               float(i.get("value", 0.65)))
+    mech = tuple(MechanismUse(
+        mechanism=m["mechanism"],
+        settings=dict(m.get("settings", {})),
+        horizon_days=float(m.get("horizon_days", 0.0)),
+        label=m.get("label", ""))
+        for m in d.get("mechanisms", []))
     exp = tuple(ExperimentalUse(
         adapter=e["adapter"], dose=float(e.get("dose", 0.0)),
         dose_unit=e.get("dose_unit", "mg"),
@@ -132,7 +145,7 @@ def scenario_from_dict(d: Dict[str, Any]) -> Scenario:
         glycogen_prior=d.get("glycogen_prior", "derived"),
         elevation_m=float(d.get("elevation_m", 0.0)),
         time_of_day=d.get("time_of_day", "08:00"),
-        experimental=exp, label=d.get("label", ""))
+        mechanisms=mech, experimental=exp, label=d.get("label", ""))
 
 
 def load_person(path: str) -> PersonInputs:

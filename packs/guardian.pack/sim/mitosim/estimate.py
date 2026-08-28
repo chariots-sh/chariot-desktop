@@ -289,6 +289,13 @@ class PersonalState:
     glucose_appearance: float
     blood_volume_L: float
     glucose_space_L: float
+    # Body composition and the oxygen-environment mapping this member used.
+    # Carried so that a mediator mechanism can move haemoglobin or lean mass
+    # against the member's own baseline, on the member's own mapping, rather
+    # than against a population average.
+    lean_mass_kg: float = 0.0
+    nonmuscle_o2_frac: float = 0.0
+    oxygen: Optional[OxygenEnvironment] = None
     # sampled biochemical parameters
     bp: Dict[str, float] = field(default_factory=dict)
     # bookkeeping
@@ -296,12 +303,43 @@ class PersonalState:
     notes: List[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class OxygenEnvironment:
+    """How haemoglobin and elevation moved this member's aerobic ceiling.
+
+    Returned as an object rather than a bare number because a mechanism that
+    changes haemoglobin has to reproduce the *same* mapping the baseline used,
+    down to the sampled exponent.  Redrawing the exponent in the target arm
+    would inject noise into a paired contrast, and only the pieces are enough
+    to avoid that.
+    """
+    vo2max_env: float               # mL/kg/min after haemoglobin and altitude
+    vo2max_sea: float               # mL/kg/min before either
+    hb_g_dL: Optional[float]        # observed haemoglobin, if there is one
+    hb_exponent: float              # the sampled exponent actually used
+    hb_factor: float                # the multiplier haemoglobin contributed
+    altitude_factor: float          # the multiplier altitude contributed
+    notes: List[str] = field(default_factory=list)
+
+    HB_FACTOR_LO = 0.72
+    HB_FACTOR_HI = 1.20
+
+    def hb_factor_for(self, hb: float) -> float:
+        """The oxygen-ceiling multiplier this member would give another
+        haemoglobin, on the same clipped mapping and the same exponent."""
+        ref = R.value("hb_reference_g_dL")
+        rel = (hb / ref) ** self.hb_exponent
+        return float(np.clip(rel, self.HB_FACTOR_LO, self.HB_FACTOR_HI))
+
+
 def _oxygen_environment(p: PersonInputs, sc: Scenario, vo2max_sea: float,
                         rng, qc: QCReport,
-                        median: bool = False) -> Tuple[float, List[str]]:
+                        median: bool = False) -> OxygenEnvironment:
     """Apply haemoglobin and elevation to the aerobic ceiling (spec 2.5)."""
     notes: List[str] = []
     v = vo2max_sea
+    hb_factor = 1.0
+    exponent = float(R.P("hb_vo2max_exponent").value)
 
     hb = qc.constraints.get("oxygen_capacity")
     if hb is not None:
@@ -309,8 +347,10 @@ def _oxygen_environment(p: PersonInputs, sc: Scenario, vo2max_sea: float,
         exp_p = R.P("hb_vo2max_exponent")
         exponent = float(exp_p.value if median else exp_p.sample(rng))
         rel = (hb / ref) ** exponent
-        rel = float(np.clip(rel, 0.72, 1.20))
+        rel = float(np.clip(rel, OxygenEnvironment.HB_FACTOR_LO,
+                            OxygenEnvironment.HB_FACTOR_HI))
         v *= rel
+        hb_factor = rel
         notes.append(
             f"Haemoglobin {hb:.1f} g/dL scales the oxygen ceiling by "
             f"{rel:.3f} (exponent {exponent:.2f}). Arterial oxygen content is "
@@ -335,9 +375,15 @@ def _oxygen_environment(p: PersonInputs, sc: Scenario, vo2max_sea: float,
                 f"{acc*100:.0f}% of the acute altitude decrement is offset.")
         dec = float(np.clip(dec, 0.0, 0.55))
         v *= (1.0 - dec)
+        alt_factor = 1.0 - dec
         notes.append(f"Elevation {elev:.0f} m lowers the estimated aerobic "
                      f"ceiling by {dec*100:.1f}%.")
-    return v, notes
+    else:
+        alt_factor = 1.0
+    return OxygenEnvironment(vo2max_env=v, vo2max_sea=vo2max_sea,
+                             hb_g_dL=hb, hb_exponent=exponent,
+                             hb_factor=hb_factor, altitude_factor=alt_factor,
+                             notes=notes)
 
 
 def build_sampler(p: PersonInputs, qc: QCReport, sc: Scenario):
@@ -393,8 +439,8 @@ def build_sampler(p: PersonInputs, qc: QCReport, sc: Scenario):
 
         vo2max_sea = float(vo2_med * np.exp(rng.normal(0, math.log(vo2_gsd))))
         vo2max_sea = float(np.clip(vo2max_sea, 15.0, 90.0))
-        vo2max_env, env_notes = _oxygen_environment(p, sc, vo2max_sea, rng, qc,
-                                                   median)
+        oxygen = _oxygen_environment(p, sc, vo2max_sea, rng, qc, median)
+        vo2max_env = oxygen.vo2max_env
 
         act_frac = _P("active_muscle_frac_of_lean")
         active_kg = lean * act_frac
@@ -473,7 +519,8 @@ def build_sampler(p: PersonInputs, qc: QCReport, sc: Scenario):
             glucose_appearance=g_app,
             blood_volume_L=p.body.mass_kg * _P("blood_volume_frac"),
             glucose_space_L=p.body.mass_kg * _P("glucose_space_frac"),
-            bp=bp, notes=list(static_notes) + env_notes)
+            lean_mass_kg=lean, nonmuscle_o2_frac=nonmuscle, oxygen=oxygen,
+            bp=bp, notes=list(static_notes) + oxygen.notes)
         return st
 
     meta = {

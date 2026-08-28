@@ -20,9 +20,12 @@ from urllib.parse import urlparse, parse_qs
 
 from . import guardrails
 from .adapters import catalogue
+from .levers.androgen_evidence import table as androgen_table
+from .mechanisms import catalogue as mechanism_catalogue
 from .compare import compare
 from .ensemble import (run_ensemble, EST_DEFS, OUTPUT_MEANINGS, MODEL_VERSION,
                        TISSUE, ACTIVITY)
+from .effects import STATUS_MEANINGS
 from .muscle import reductions
 from .outputs import FORBIDDEN_OUTPUTS
 from .params import R, REGISTRY_VERSION
@@ -67,6 +70,9 @@ def _build_meta() -> Dict[str, Any]:
         "equations": eqs,
         "reductions": reductions(),
         "adapters": catalogue(),
+        "mechanisms": mechanism_catalogue(),
+        "androgen_mediators": androgen_table(),
+        "effect_statuses": {k: v for k, v in STATUS_MEANINGS.items()},
         "grid": grid_report(),
         "network_audit": guardrails.summarise(guardrails.audit_network()),
         "forbidden_outputs": FORBIDDEN_OUTPUTS,

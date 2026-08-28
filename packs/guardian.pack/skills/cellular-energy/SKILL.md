@@ -32,6 +32,25 @@ after that it starts instantly. Useful subcommands:
 - `validate`, `audit`, `registry`, `adapters` — the engine's own checks and
   catalogues, when you need to explain where a number comes from.
 
+## Mechanism levers (counterfactuals)
+
+The engine can also answer "what if one internal mechanism were different"
+— a counterfactual on a mediator, not on a treatment. `mechanisms` lists the
+available levers, each with its scope, what it does and does **not** model,
+and whether it's enabled or gated. Apply one with `--mechanism SPEC` on `run`
+or `compare`, e.g. `--mechanism 'mitochondrial_nad_pool:pool_scale=1.3'`.
+`identifiability` reports which levers are currently distinguishable.
+
+Use these only for genuine mechanism questions ("how would a bigger
+mitochondrial NAD pool change my energy under load?"), and honour the hard
+line the engine draws: a lever models what happens **if a mediator changed**,
+never what a drug, supplement, dose, or therapy would do to your person, and
+never whether they should take one. That's treatment advice — out of bounds
+for you (see AGENTS.md). Pass through the engine's own scope and
+"NOT modelled" caveats; when a chunk of the ensemble goes "sensitivity-only"
+(outside the registered prior), say the result shows model behaviour, not
+biological support.
+
 Keep interactive replies snappy: pass `-n 80` (samples) for chat-turn
 answers; only use the default 200 when precision genuinely matters and you
 warned them it takes a while.

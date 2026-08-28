@@ -4,7 +4,7 @@ Mitochondria In Silico — possible skeletal-muscle energy mechanisms during
 running, as distributions with explicit uncertainty.
 
 - Source: https://github.com/Immortal-Protocols/mitosim
-- Vendored from commit `ef695a9a942c7a0890abe12080c2f362e9a5ca0d` (v0.2.0)
+- Vendored from commit `a78621319685717b3b6e337b26fa5e8cd141515c` (v0.2.0)
 - Contents: the `mitosim/` package (including `validation/` and `web/`) and
   `examples/`. Tests, docs, and CI are deliberately not shipped to the guest.
 
