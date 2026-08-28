@@ -1443,7 +1443,7 @@ def execute_turn(adapter, conversation_id, prompt, cfg, delta,
         # The model always gets the paths — codex additionally gets pixels
         # via -i — so it can re-open any attachment with its own tools.
         listing = "\n".join(f"- {p}" for p in attachments)
-        prompt = f"{prompt}\n\n[Attached files from your person's phone:\n{listing}\n]"
+        prompt = f"{prompt}\n\n[Attached files from your person:\n{listing}\n]"
 
     replies = 0
     stop_pump = threading.Event()

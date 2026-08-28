@@ -53,6 +53,16 @@ struct ChatLine: Identifiable {
     let id = UUID()
     var role: String  // "user" | "agent" | "system"
     var text: String
+    /// Display names of files sent with this message (user lines only).
+    var attachments: [String] = []
+}
+
+/// A file picked (or dropped) into the chat, waiting to be sent with the
+/// next message.
+struct PendingAttachment: Identifiable, Equatable {
+    let id = UUID()
+    let url: URL
+    var name: String { url.lastPathComponent }
 }
 
 struct DeviceRow: Identifiable, Equatable {
@@ -104,6 +114,7 @@ final class AppModel: ObservableObject {
     @Published var agents: [AgentViewState] = []
     @Published var packs: [PackRow] = []
     @Published var chats: [String: [ChatLine]] = [:]      // agent id → transcript
+    @Published var pendingAttachments: [String: [PendingAttachment]] = [:]  // agent id → staged files
     @Published var streamingAgents: Set<String> = []
     @Published var busyAgents: Set<String> = []
     @Published var signInProgress: Set<String> = []
@@ -537,31 +548,102 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Chat attachments
+
+    /// Base64 inflates 4/3 and the guest bridge caps a JSON line at 64 MB;
+    /// 32 MB raw keeps a file.put comfortably inside that.
+    static let maxAttachmentBytes = 32 * 1024 * 1024
+
+    func attachFilesViaPanel(to agentID: String) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.message = "Files are copied into the agent's sandbox with your next message."
+        if panel.runModal() == .OK {
+            addAttachments(panel.urls, to: agentID)
+        }
+    }
+
+    func addAttachments(_ urls: [URL], to agentID: String) {
+        for url in urls {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { continue }
+            if isDirectory.boolValue {
+                errorMessage = "\(url.lastPathComponent) is a folder — attach individual files."
+                continue
+            }
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+            if size > Self.maxAttachmentBytes {
+                errorMessage = "\(url.lastPathComponent) is larger than 32 MB — too big to send to the sandbox."
+                continue
+            }
+            if pendingAttachments[agentID, default: []].contains(where: { $0.url == url }) { continue }
+            pendingAttachments[agentID, default: []].append(PendingAttachment(url: url))
+        }
+    }
+
+    func removeAttachment(_ id: UUID, from agentID: String) {
+        pendingAttachments[agentID]?.removeAll { $0.id == id }
+    }
+
     func sendPrompt(_ text: String, to agentID: String) {
         guard let hub else { return }
-        chats[agentID, default: []].append(ChatLine(role: "user", text: text))
+        let attachments = pendingAttachments[agentID] ?? []
+        guard !text.isEmpty || !attachments.isEmpty else { return }
+        pendingAttachments[agentID] = []
+        chats[agentID, default: []].append(ChatLine(role: "user", text: text,
+                                                    attachments: attachments.map(\.name)))
         chats[agentID, default: []].append(ChatLine(role: "agent", text: ""))
         let agentLineIndex = chats[agentID]!.count - 1
         streamingAgents.insert(agentID)
-        do {
-            try hub.sendLocalPrompt(text, instanceID: agentID, onDelta: { [weak self] delta in
-                Task { @MainActor in
-                    guard let self, self.chats[agentID]?.indices.contains(agentLineIndex) == true else { return }
-                    self.chats[agentID]![agentLineIndex].text += delta
-                }
-            }, onCompleted: { [weak self] code in
-                Task { @MainActor in
-                    guard let self else { return }
-                    self.streamingAgents.remove(agentID)
-                    if code != 0, self.chats[agentID]?.indices.contains(agentLineIndex) == true {
-                        self.chats[agentID]![agentLineIndex].text += "\n[exit code \(code)]"
+
+        let fail: (String) -> Void = { [weak self] message in
+            guard let self else { return }
+            if self.chats[agentID]?.indices.contains(agentLineIndex) == true {
+                self.chats[agentID]![agentLineIndex] = ChatLine(role: "system", text: message)
+            }
+            self.streamingAgents.remove(agentID)
+        }
+
+        Task {
+            // Uploads land before the prompt that cites them; any failure
+            // cancels the turn rather than sending paths that do not exist.
+            var guestPaths: [String] = []
+            for attachment in attachments {
+                do {
+                    let data = try Data(contentsOf: attachment.url)
+                    guard data.count <= Self.maxAttachmentBytes else {
+                        fail("\(attachment.name) is larger than 32 MB — message not sent.")
+                        return
                     }
+                    guestPaths.append(try await hub.uploadAttachment(data,
+                                                                     filename: attachment.name,
+                                                                     instanceID: agentID))
+                } catch {
+                    fail("Could not send \(attachment.name): \(error)")
+                    return
                 }
-            })
-        } catch {
-            chats[agentID]![agentLineIndex] = ChatLine(role: "system",
-                                                       text: "Sandbox not running: press Start first.")
-            streamingAgents.remove(agentID)
+            }
+            do {
+                try hub.sendLocalPrompt(text, instanceID: agentID, attachments: guestPaths,
+                                        onDelta: { [weak self] delta in
+                    Task { @MainActor in
+                        guard let self, self.chats[agentID]?.indices.contains(agentLineIndex) == true else { return }
+                        self.chats[agentID]![agentLineIndex].text += delta
+                    }
+                }, onCompleted: { [weak self] code in
+                    Task { @MainActor in
+                        guard let self else { return }
+                        self.streamingAgents.remove(agentID)
+                        if code != 0, self.chats[agentID]?.indices.contains(agentLineIndex) == true {
+                            self.chats[agentID]![agentLineIndex].text += "\n[exit code \(code)]"
+                        }
+                    }
+                })
+            } catch {
+                fail("Sandbox not running: press Start first.")
+            }
         }
     }
 

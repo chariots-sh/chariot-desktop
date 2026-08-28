@@ -86,7 +86,9 @@ node (one browser login; the identity persists). The sidebar lists your
 agents — **New Agent** creates one from a pack (see [Agent packs](#agent-packs));
 each agent's page has **Start** (first boot ~40 s while cloud-init provisions
 the bridge), a per-agent chat (prefix a message with `!` to run a shell
-command inside that agent's guest), **Show pairing QR**, Codex sign-in,
+command inside that agent's guest; attach files with the paperclip or by
+dropping them onto the chat — they are copied into the sandbox at
+`/workspace/data/attachments/`), **Show pairing QR**, Codex sign-in,
 developer access, and **Reset**. Approval of pairing requests is interactive
 in the GUI.
 
@@ -155,7 +157,8 @@ guardian.pack/
   keeps `/workspace/data/alist-archive.json` fresh before every turn.
 - **Chat attachments**: `conversation.send` takes an optional
   `attachments: [String]` — guest paths under `/workspace/data/attachments/`
-  the phone uploaded via `file.write` before the message. The hub drops any
+  the sender uploaded before the message (the phone via `file.write`
+  envelopes, the Mac chat via the bridge's `file.put`). The hub drops any
   path outside `/workspace` (or containing `..`) and forwards the rest; the
   guest hands image attachments to `codex exec -i` (the model gets pixels)
   and lists every path in the prompt so the agent can open them with tools.
