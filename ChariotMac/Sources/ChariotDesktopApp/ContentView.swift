@@ -518,6 +518,7 @@ struct AgentDetailView: View {
     @EnvironmentObject var model: AppModel
     let agentID: String
     @State private var draft = ""
+    @State private var dropTargeted = false
     @State private var showControls = false
     @State private var selectedWire: WireID = .tailnet
     /// Unsaved model-override edit; nil = showing the persisted value.
@@ -607,16 +608,26 @@ struct AgentDetailView: View {
                         ForEach(model.chats[agent.id] ?? []) { line in
                             HStack(alignment: .top) {
                                 if line.role == "user" { Spacer(minLength: 80) }
-                                Text(line.text.isEmpty ? "…" : line.text)
-                                    .textSelection(.enabled)
-                                    .font(line.role == "agent" ? Theme.mono(12) : .system(size: 13))
-                                    .foregroundStyle(Theme.text)
-                                    .padding(10)
-                                    .background(line.role == "user" ? Theme.accent.opacity(0.18) : Theme.card)
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                    .overlay(RoundedRectangle(cornerRadius: 8)
-                                        .stroke(line.role == "user" ? Theme.accent.opacity(0.4) : Theme.border,
-                                                lineWidth: 1))
+                                VStack(alignment: .leading, spacing: 6) {
+                                    if !line.text.isEmpty || line.attachments.isEmpty {
+                                        Text(line.text.isEmpty ? "…" : line.text)
+                                            .textSelection(.enabled)
+                                            .font(line.role == "agent" ? Theme.mono(12) : .system(size: 13))
+                                            .foregroundStyle(Theme.text)
+                                    }
+                                    ForEach(line.attachments, id: \.self) { name in
+                                        Label(name, systemImage: "paperclip")
+                                            .font(Theme.mono(10.5))
+                                            .foregroundStyle(Theme.secondary)
+                                            .lineLimit(1)
+                                    }
+                                }
+                                .padding(10)
+                                .background(line.role == "user" ? Theme.accent.opacity(0.18) : Theme.card)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8)
+                                    .stroke(line.role == "user" ? Theme.accent.opacity(0.4) : Theme.border,
+                                            lineWidth: 1))
                                 if line.role != "user" { Spacer(minLength: 80) }
                             }
                             .id(line.id)
@@ -636,28 +647,75 @@ struct AgentDetailView: View {
                     .frame(maxWidth: .infinity)
                     .padding(.bottom, 10)
             }
-            HStack(spacing: 10) {
-                TextField(chatReady ? "Message \(agent.name) — ! runs a raw command"
-                                    : "Finish wiring to start chatting…",
-                          text: $draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(Theme.mono(12))
-                    .foregroundStyle(Theme.text)
-                    .onSubmit(send)
-                    .disabled(!chatReady)
-                Button {
-                    send()
-                } label: {
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.white)
-                        .frame(width: 28, height: 28)
-                        .background(chatReady && !draft.isEmpty ? Theme.accent : Color(red: 0.165, green: 0.165, blue: 0.2))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+            let pending = model.pendingAttachments[agent.id] ?? []
+            let sendable = !draft.isEmpty || !pending.isEmpty
+            VStack(spacing: 8) {
+                if !pending.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(pending) { attachment in
+                                HStack(spacing: 5) {
+                                    Image(systemName: "paperclip")
+                                        .font(.system(size: 9, weight: .semibold))
+                                        .foregroundStyle(Theme.secondary)
+                                    Text(attachment.name)
+                                        .font(Theme.mono(10.5))
+                                        .foregroundStyle(Theme.text)
+                                        .lineLimit(1)
+                                    Button {
+                                        model.removeAttachment(attachment.id, from: agent.id)
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: 8, weight: .bold))
+                                            .foregroundStyle(Theme.secondary)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .background(Theme.bg)
+                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                                .overlay(RoundedRectangle(cornerRadius: 6)
+                                    .stroke(Theme.border, lineWidth: 1))
+                            }
+                        }
+                    }
                 }
-                .buttonStyle(.plain)
-                .keyboardShortcut(.return, modifiers: .command)
-                .disabled(!chatReady || draft.isEmpty || model.streamingAgents.contains(agent.id))
+                HStack(spacing: 10) {
+                    Button {
+                        model.attachFilesViaPanel(to: agent.id)
+                    } label: {
+                        Image(systemName: "paperclip")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(chatReady ? Theme.secondary : Theme.secondary.opacity(0.4))
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!chatReady)
+                    .help("Attach files — or drop them anywhere in the chat")
+                    TextField(chatReady ? "Message \(agent.name) — ! runs a raw command"
+                                        : "Finish wiring to start chatting…",
+                              text: $draft, axis: .vertical)
+                        .textFieldStyle(.plain)
+                        .font(Theme.mono(12))
+                        .foregroundStyle(Theme.text)
+                        .onSubmit(send)
+                        .disabled(!chatReady)
+                    Button {
+                        send()
+                    } label: {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .frame(width: 28, height: 28)
+                            .background(chatReady && sendable ? Theme.accent : Color(red: 0.165, green: 0.165, blue: 0.2))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(!chatReady || !sendable || model.streamingAgents.contains(agent.id))
+                }
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 11)
@@ -667,11 +725,32 @@ struct AgentDetailView: View {
             .padding(.horizontal, 30)
             .padding(.bottom, 24)
         }
+        .overlay {
+            if dropTargeted {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Theme.accent, style: StrokeStyle(lineWidth: 2, dash: [6]))
+                    .background(Theme.accent.opacity(0.06))
+                    .overlay {
+                        Label("Drop files to attach", systemImage: "paperclip")
+                            .font(Theme.mono(13, weight: .semibold))
+                            .foregroundStyle(Theme.text)
+                    }
+                    .padding(.horizontal, 30)
+                    .padding(.bottom, 24)
+                    .allowsHitTesting(false)
+            }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard chatReady else { return false }
+            model.addAttachments(urls, to: agent.id)
+            return true
+        } isTargeted: { dropTargeted = $0 }
     }
 
     private func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let hasAttachments = !(model.pendingAttachments[agentID] ?? []).isEmpty
+        guard !text.isEmpty || hasAttachments else { return }
         draft = ""
         model.sendPrompt(text, to: agentID)
     }

@@ -424,7 +424,7 @@ class AttachmentTests(BridgeTestCase):
         self.assertEqual(argv.count("-i"), 1)
         prompt = argv[-1]
         self.assertIn("what do you see?", prompt)
-        self.assertIn("[Attached files from your person's phone:", prompt)
+        self.assertIn("[Attached files from your person:", prompt)
         # Every attachment is listed by path, images included, so the model
         # can re-open them with tools.
         self.assertIn(present, prompt)

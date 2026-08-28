@@ -827,8 +827,45 @@ public final class ChariotHub: @unchecked Sendable {
 
     // MARK: Local conversation (Mac UI → agent)
 
+    /// Where chat attachments land inside the guest — the same directory the
+    /// protocol reserves for phone `file.write` uploads (AgentLinkProtocol),
+    /// so packs and agents treat both senders identically.
+    public static let attachmentsGuestDirectory = "/workspace/data/attachments"
+
+    /// Upload one chat attachment into the guest and return the guest path to
+    /// cite in the accompanying `conversation.send`.
+    public func uploadAttachment(_ contents: Data, filename: String,
+                                 instanceID: String? = nil) async throws -> String {
+        let context = try requireContext(instanceID)
+        guard let bridge = synchronized({ context.bridge }) else {
+            throw ChariotError.bridgeUnavailable("not connected")
+        }
+        let path = Self.attachmentGuestPath(for: filename)
+        _ = try await bridge.putFile(path: path, contents: contents)
+        event("\(displayName(of: context)): attachment \(path) (\(contents.count) bytes)")
+        return path
+    }
+
+    /// A guest path that is safe (single component, no traversal) and unique
+    /// (random prefix keeps two uploads of "notes.txt" from clobbering each
+    /// other). Only the filename's last path component survives, with
+    /// anything outside [A-Za-z0-9._-] replaced.
+    static func attachmentGuestPath(for filename: String) -> String {
+        var name = String((filename as NSString).lastPathComponent.map {
+            $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "_" || $0 == "-")
+                ? $0 : "_"
+        })
+        // Keep the tail: it holds the extension, which decides whether the
+        // guest hands the file to the model as pixels (split_attachments).
+        if name.count > 80 { name = String(name.suffix(80)) }
+        if name.trimmingCharacters(in: CharacterSet(charactersIn: "._")).isEmpty { name = "file" }
+        let prefix = UUID().uuidString.prefix(8).lowercased()
+        return "\(attachmentsGuestDirectory)/\(prefix)-\(name)"
+    }
+
     public func sendLocalPrompt(_ text: String, instanceID: String? = nil,
                                 conversationID: String = "local",
+                                attachments: [String] = [],
                                 onDelta: @escaping @Sendable (String) -> Void,
                                 onCompleted: @escaping @Sendable (Int) -> Void) throws {
         let context = try requireContext(instanceID)
@@ -841,7 +878,7 @@ public final class ChariotHub: @unchecked Sendable {
         localStreams[requestID] = (onDelta, onCompleted)
         lock.unlock()
         dispatchTurn(context, requestID: requestID, conversationID: conversationID,
-                     text: text) { [weak self] message in
+                     text: text, attachments: attachments) { [weak self] message in
             guard let self else { return }
             self.lock.lock()
             let handlers = self.localStreams.removeValue(forKey: requestID)
